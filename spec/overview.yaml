@@ -119,6 +119,21 @@ operations:
       workspace is over budget, ingest PAUSES and resumes next day rather than tripping
       replies — and a large FIRST sync runs under its own bound so day-one indexing
       can't starve the chat budget (see budget.ingest_daily_usd).
+    budget_lanes: >-
+      Budgets are three explicit lanes, never one fuzzy pool:
+        - generative/chat: replies, proactive posts, reflection; can trip read_only.
+        - ingest: embedding/sync; can pause and resume later.
+        - safety: moderation classifiers/vision; has its own daily USD/call cap and can
+          enter safety_hold/media_hold_mode, but never silently allows unscanned content.
+      Safety does not borrow from chat, and chat exhaustion does not stop safety. Owner
+      status names the lane that failed.
+    safety_exhaustion_behavior: >-
+      If safety_daily_usd or media_scan_daily_cap is exhausted, the owner sees
+      "media safety scanning unavailable; media temporarily held" and the workspace
+      records workspace_runtime_state.mode=safety_hold/media_hold_mode. For media this
+      means unscanned media is held or silently deleted according to config; for text it
+      means the bot does not treat the message as clean or reply to it. This is an
+      availability degradation, not a safety bypass.
     multi_channel_note: >-
       The budget is per WORKSPACE, not per channel — a workspace binding several
       channels shares one daily budget (one noisy channel can throttle the rest; this
@@ -181,6 +196,15 @@ operations:
       account_survival. Both still go through the one outbox (idempotency unchanged).
   retention:
     rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning), AND prunes event_journal rows older than observability.journal_retention_days; owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
+    data_layers: >-
+      Privacy and traceability are separated into three layers:
+        - audit skeleton: event name, time, workspaceId, correlationId, causationId,
+          reason codes, and non-user operational status; retained for traceability.
+        - user payload digest: redacted human-readable summaries in event_journal and
+          proposal payloads; retention-bound and /forget-redactable.
+        - raw message: messages.text / sender display strings; shortest retention and
+          purged by /forget.
+      /trace must remain explainable after /forget, but without readable user content.
     disclosure: >-
       Because the bot retains member messages, a workspace with privacy.member_notice
       on posts a one-time + pinned disclosure (an assistant operates here, retention
@@ -285,6 +309,19 @@ operations:
       - no_mass_dm: DMs (funnel) are the single highest ban risk on a user account; they stay governance-gated (L1) AND additionally bounded by a low per-day account DM cap, never bulk.
     why: a banned owner account is the one unrecoverable failure; no feature is worth it.
 
+  minimum_launch_profile:
+    rule: >-
+      Default launch is intentionally boring and low-risk. The product starts with core
+      receive/reply/moderation/visibility, while evolution, funnel, cross-promotion, and
+      relationship memory default OFF. Proactive output is low-frequency, polls are off
+      until participant density is real, and every high-risk action remains owner-ramped.
+      This avoids launching chat, marketing, activities, experiments, DMs, and memory all
+      at once under one real personal account.
+    ramp: >-
+      The owner may enable features one at a time after digest/trace evidence shows stable
+      behavior. Enabling a high-risk feature is a config/control-plane decision, never an
+      automatic consequence of implementation being present.
+
 # Build order. Implement strictly top-to-bottom; each step independently verifiable.
 # Cross-cutting infra (operations above) is folded into the steps that first need it.
 build_order:
@@ -323,7 +360,9 @@ invariants:
   - The bot never talks to an empty room or to itself: proactive behavior is gated by community lifecycle phase, and consecutive bot messages are capped.
   - Retrieved content AND member-derived text (usernames, display names, quoted/replyTo text) are DATA, never instructions: neither can change identity, boundaries, or trigger an action (indirect-injection + untrusted-input defense).
   - LLM outputs are advisory typed data only. Deterministic policy wrappers own all authority: event emission, adapter calls, config/db mutation, autonomy decisions, and approval creation never come directly from model text.
+  - Telegram adapter evidence is layered; local contract simulator covers every update/callback/edit/access edge, a small secret-gated live smoke runs before Step 2 is claimed, and exhaustive live E2E lives only in nightly/production readiness.
   - LLM spend is hard-bounded per workspace/day; over budget trips to read-only, never unbounded. The breaker bounds GENERATIVE output only — moderation/safety (incl. media vision) and receive never stop, so budget pressure can never loosen the black floor.
+  - Budget lanes are explicit; generative can be read-only, ingest can pause, safety/media has its own cap and enters safety_hold/media_hold_mode on exhaustion; no lane silently borrows from another or silently opens the black floor.
   - The bot never re-replies to an already-handled message across crashes (idempotent by correlationId/dedupeKey via the outbox); stale triggers are dropped; a mid-flight crash neither double-sends nor silently loses a send.
   - A message from a channel bound to NO workspace is dropped at the router: no moderation, no LLM call, no DB write, zero spend. The bot operates only in configured channels.
   - Config identity is unambiguous at load/reload: workspace ids, source ids, owner control sender, and (platform, channel_id) bindings are unique; content source references must resolve; reserved `__system__` cannot be configured as a workspace.
@@ -333,6 +372,9 @@ invariants:
   - A reply-pipeline stage that errors or times out aborts that reply cleanly; it never emits a half-built, un-enriched, or un-humanized draft.
   - Scheduled owner-facing jobs (digest/reflection/retention) fire in each workspace's own timezone, not server-local time.
   - The system is fully observable, not a black box: every bus emission is journaled (envelope incl. causationId + redacted payload) to the append-only event_journal, and non-emitting decisions/lifecycle moments are traced too, so the complete ordered story of any correlationId — including why something deliberately did NOT happen — is reconstructable by a human via trace/tail/inspect and /trace, /why, /status. No session string / token / key / flagged-media bytes ever enter the journal or logs.
+  - Observability and erasure use three data layers; audit skeleton is retained for traceability, user payload digest is retention-/forget-redactable, raw messages have the shortest retention and are purged by /forget.
+  - Persona brand safety protects the owner; high-risk topics deflect lightly, heated/argument posture observes by default, marketing is suppressed during complaints/support contexts, and /why explains any risky reply that was allowed.
+  - Member suppression is first-class; do-not-reply, do-not-DM, and do-not-remember requests, owner mute-for-user, complaints, negative reactions, and no-response signals suppress future replies/DMs/memory and can auto-quiet the workspace.
   - Member message retention is disclosed (member notice); owner /forget purges a user's raw messages, while the opt-out keyword stops relationship memory.
   - User data is retention-bounded and erasable on demand (owner /forget, user opt-out); relationship memory is opt-in and never recalls an opted-out user.
   - Owner /pause and /quiet override every proactive and reactive path (kill switch cannot be bypassed).
@@ -347,6 +389,10 @@ invariants:
   - Every reply-pipeline correlationId is tracked by an in-flight supervisor with a deadline; a draft that neither emits its next event nor aborts (a hang, not a throw) is force-aborted and surfaced, never silently lost.
   - Mute and ban are owner-confirmed (L1) because they are socially/punitively high-impact even though the CONTROL BOT executes them; only low-risk delete-spam is policy-auto (L2).
   - Approval timeouts are per-type and deterministic: every pending item has an explicit safe default, applied idempotently at proposal.ttl; no approval type may silently default to approve.
+  - Safety holds are bounded and quiet; held messages do not produce member-facing explanations, repeated failures collapse into owner-visible incidents, each hold has a TTL and safe default, and media hold is reported as media-safety unavailable rather than generic budget failure.
+  - Knowledge answers rank by trust and freshness as well as similarity; stale/low-trust sources are downgraded and surfaced as content gaps when they are the only apparent answer.
+  - DM funnel is opt-in and explicit-interest-only; engagement alone goes to digest, every DM is one-shot owner-approved, no-response/rejection/complaint creates long-lived suppression.
+  - Minimum launch profile is conservative; evolution/funnel/cross-promotion/relationship-memory default OFF and proactive behavior starts low-frequency until the owner deliberately ramps it.
 
 # Automated quality gates. CI runs these; a change is not "done" until green.
 # These turn the invariants above into executable checks (the AGENTS.md "gates").
@@ -422,6 +468,21 @@ quality_gates:
         leakage. A direct automation question returns only the approved one-line
         member-notice-aligned disclosure, without technical detail, markdown, or any
         privileged action.
+    - id: telegram_adapter_evidence_ladder
+      enforces: telegram-realism-without-local-blockage
+      check: >-
+        Step 2 has two suites: (1) a deterministic adapter contract simulator using real
+        GramJS/grammY-shaped fixtures for inbound messages, callbacks, edits, media fetch,
+        access states, and FLOOD_WAIT; it runs in `just verify-step 2`; (2) a secret-gated
+        `just verify-real step-2` smoke that proves live login, send/receive, callback,
+        edit, and verifyAccess once with redacted evidence. Full live multi-scenario E2E
+        is excluded from the local loop and covered by production_readiness.telegram_real_e2e.
+    - id: persona_brand_safety
+      enforces: owner-brand-safety
+      check: >-
+        Red-team fixtures for legal/medical/financial/political/refund/support/argument
+        contexts assert light deflection or observe-only, no strong advice/stance, no
+        marketing, and a decision.reply/no_reply trace reason that /why can render.
     - id: command_conversation_separation
       enforces: action-provenance
       check: >-
@@ -449,6 +510,13 @@ quality_gates:
       check: >-
         With budget exhausted (seeded llm_usage), the next generative call is refused and the
         workspace is read-only (moderation still runs); owner is notified; resets next day.
+    - id: safety_budget_media_hold
+      enforces: safety-budget-lane
+      check: >-
+        Exhaust generative, ingest, and safety/media lanes independently. Generative trips
+        read_only only for output; ingest pauses sync; safety/media exhaustion creates
+        workspace_runtime_state safety/media hold, writes safety_holds, blocks/silent-deletes
+        unscanned media per config, and owner status names media safety unavailability.
     - id: idempotent_delivery
       enforces: idempotency
       check: >-
@@ -469,6 +537,13 @@ quality_gates:
         assert the message is HELD or treated as a violation candidate (NOT emitted as
         message.clean) and the failure is logged. Assert that hitting media_scan_daily_cap
         holds further unscanned media rather than allowing it (for new AND established users).
+    - id: safety_hold_queue
+      enforces: safety-hold-queue
+      check: >-
+        Classifier outage and media-cap fixtures write safety_holds rows with collapsed_key,
+        TTL, default_action, and redacted details; member-facing output is silent; /status
+        and digest summarize counts/oldest age; expiry applies expire_drop/silent_delete
+        exactly once without emitting message.clean.
     - id: pipeline_watchdog
       enforces: pipeline-watchdog
       check: >-
@@ -514,6 +589,19 @@ quality_gates:
         leads, moderation target ids where legally safe, and event_journal payload digests (full
         erasure without destroying the audit skeleton); recall on an opted-out user returns null.
         With privacy.member_notice on, a one-time + pinned notice is posted.
+    - id: journal_privacy_layers
+      enforces: privacy-observability-split
+      check: >-
+        Seed a trace with user text, run /forget, and assert raw messages are gone, event_journal
+        payload_digest/reason carrying user text is redacted, and the audit skeleton
+        (event name/time/correlationId/causationId/reason code) still reconstructs why the
+        system acted or did not act.
+    - id: suppression_complaint_loop
+      enforces: complaint-suppression-loop
+      check: >-
+        Phrases for reply/dm/memory opt-out create member_suppression rows and stop the
+        matching behavior; owner mute/unmute works through the control plane; repeated
+        complaint/negative-reaction signals set quiet posture and appear in /status/digest.
     - id: owner_pause_overrides
       enforces: kill-switch
       check: >-
@@ -526,6 +614,20 @@ quality_gates:
         the implementation table. Expiry applies it exactly once across restarts; punitive,
         cost-bearing, cross-promo, and lead-DM items reject; evolution tuning holds;
         onboarding confirm cancels; no type can default approve.
+    - id: dm_funnel_safety
+      enforces: dm-funnel-safety
+      check: >-
+        With funnel enabled, high engagement alone never emits lead.identified; only explicit
+        interest plus supporting evidence can propose a one-shot DM. Owner preview includes
+        evidence and exact draft. Rejection/no-response/complaint/opt-out writes long-lived
+        suppression and prevents repeat proposals; a late opt-out before send cancels the DM.
+    - id: minimum_launch_profile
+      enforces: conservative-launch
+      check: >-
+        The sample/default config and loader reject a minimum launch that starts with
+        evolution, funnel, cross_promotion, or user_memory on; proactive limits are low,
+        polls are off, and high-risk autonomy remains L1/L0. Owner-ramped changes must be
+        explicit config/control-plane decisions.
     - id: unbound_channel_drop
       enforces: unbound-channel
       check: >-
@@ -548,6 +650,13 @@ quality_gates:
         methods, config writers, raw db mutators, or autonomy setters except through the
         deterministic policy wrappers that own those decisions. Malformed model JSON fails
         closed and emits no authority-bearing event.
+    - id: knowledge_freshness_trust
+      enforces: knowledge-quality-ranking
+      check: >-
+        Retrieval fixtures with equal semantic score prove owned/fresh/high-priority sources
+        outrank stale RSS/crawl/user-file sources; stale-only hits are marked in the prompt
+        and emit content_gap.detected(stale_source_hit=true); /why shows canonicalUrl,
+        updatedAt/freshnessAt, sourceTrust, contentType, and workspacePriority.
     - id: media_black_floor
       enforces: media-floor
       check: >-
@@ -606,17 +715,17 @@ quality_gates:
   # the authoritative capability checklist + evidence that `just verify-step N` enforces.
   # If the two ever diverge, acceptance.yaml wins and this summary must be updated.
   per_step:   # the gate that proves each build_order step is independently done
-    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + config_uniqueness + hot-reload swaps a workspace; lifecycle callable; declared_events_only + llm_output_isolation + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
-    - { step: 2, gate: "Round-trip across BOTH adapters: inbound on the userbot (real test USER account or mock) -> message.received (ONLY from userbot) with DETERMINISTIC correlationId from platform_message_id (idempotent_delivery green); a reply goes out via the userbot under account_survival (FLOOD_WAIT honored, per-account ceiling, warm-up; account_survival green); a moderation.violation executes via the CONTROL BOT; an owner DM goes via the control bot with inline buttons; outbound routes by audience + message.received single-source (dual_identity_routing green); an edit arrives as isEdit=true; verifyAccess per adapter (userbot_access green, no privacy-mode)." }
-    - { step: 3, gate: "content_isolation + indirect_injection + untrusted_input green; ctx.knowledge is the only retrieval path; unbound-source query returns zero rows; unbound_channel_drop green; incremental sync dedups by content_hash; a low-score query emits content_gap.detected." }
-    - { step: 4, gate: "reply.ready -> reply.generated: no markdown / no enumerations / persona_transparency_boundary green; coherent with the Context Manager window; pipeline_failure_abort green (a seeded Persona error aborts, never half-sends); pipeline_watchdog green (a seeded hang is force-aborted, not lost)." }
-    - { step: 5, gate: "Spam/flood -> auto delete-spam (executed by control bot) + mute proposed; black-tier (text AND media) -> delete (auto, control bot) + ban (owner-confirmed L1, control bot) + escalate; gray-tier under permissive -> untouched; clean -> message.clean; ALL admin actions executed by the control bot, never the userbot (dual_identity_routing green); all silent; classifier error/timeout -> fail CLOSED (moderation_failclosed green); hard_floor_immutable + media_black_floor + edited_remoderation green." }
-    - { step: 6, gate: "Intent fixtures classify deterministically; command_conversation_separation green (member commands -> silent, logged); cost pre-filter skips the LLM on obvious cases; per-user mention-flood cap holds; reply_probability + active_hours is the SINGLE reactive-reply decision point." }
-    - { step: 7, gate: "Approval round-trips on the CONTROL BOT (inline ✅/❌/📝 buttons + callback, matched to item; only owner user_id accepted; a member messaging the control bot does nothing); approval_safe_defaults green; mute/ban L1 proposals approved here execute via the control bot; owner_pause_overrides green (/pause silences all, /quiet stops proactive only, owner DMs still delivered via control bot); /status + digest delivered via outbound→control bot; member notice posted by userbot; no_self_escalation green; retention sweep + /forget full-purge run (retention_and_erasure green)." }
+    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + config_uniqueness + minimum_launch_profile + hot-reload swaps a workspace; lifecycle callable; declared_events_only + llm_output_isolation + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + safety_budget_media_hold + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_privacy_layers + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
+    - { step: 2, gate: "Telegram adapter evidence ladder green: local contract simulator covers userbot/control message/callback/edit/access/media/FLOOD_WAIT edges; a secret-gated live smoke proves login, send/receive, callback, edit, and verifyAccess; message.received single-source + audience routing + userbot_access + account_survival green." }
+    - { step: 3, gate: "content_isolation + indirect_injection + untrusted_input + knowledge_freshness_trust green; ctx.knowledge is the only retrieval path; unbound-source query returns zero rows; unbound_channel_drop green; incremental sync dedups by content_hash; a low-score/stale-only query emits content_gap.detected." }
+    - { step: 4, gate: "reply.ready -> reply.generated: no markdown / no enumerations / persona_transparency_boundary + persona_brand_safety green; coherent with the Context Manager window; pipeline_failure_abort green (a seeded Persona error aborts, never half-sends); pipeline_watchdog green (a seeded hang is force-aborted, not lost)." }
+    - { step: 5, gate: "Spam/flood -> auto delete-spam (executed by control bot) + mute proposed; black-tier (text AND media) -> delete (auto, control bot) + ban (owner-confirmed L1, control bot) + escalate; gray-tier under permissive -> untouched; clean -> message.clean; ALL admin actions executed by the control bot, never the userbot (dual_identity_routing green); all silent; classifier error/timeout -> fail CLOSED with safety_hold_queue green; hard_floor_immutable + media_black_floor + edited_remoderation green." }
+    - { step: 6, gate: "Intent fixtures classify deterministically; command_conversation_separation + suppression_complaint_loop green (member commands -> silent, logged; opt-out phrases set suppression); cost pre-filter skips the LLM on obvious cases; per-user mention-flood cap holds; reply_probability + active_hours is the SINGLE reactive-reply decision point." }
+    - { step: 7, gate: "Approval round-trips on the CONTROL BOT (inline ✅/❌/📝 buttons + callback, matched to item; only owner user_id accepted; a member messaging the control bot does nothing); approval_safe_defaults + suppression_complaint_loop green; mute/ban L1 proposals approved here execute via the control bot; owner_pause_overrides green (/pause silences all, /quiet stops proactive only, owner DMs still delivered via control bot); /status + digest delivered via outbound→control bot; member notice posted by userbot; no_self_escalation green; retention sweep + /forget full-purge run (retention_and_erasure + journal_privacy_layers green)." }
     - { step: 8, gate: "Marketing limits survive restart; cold_start_no_cringe green; atmosphere cold-trigger fires once per cooldown and sends via outbound.requested (suppressed under stay_silent); evolution keeps ONE active experiment per dimension (Thompson-allocated Beta posteriors), promotes a challenger ONLY when P(challenger>champion)>=promote_prob AND min_exposure met AND no guardrail regressed (peek-safe), queues underpowered arms, and auto-rolls-back a seeded regression." }
     - { step: 9, gate: "With CrossPromotion unregistered, reply.enriched passes through to reply.ready unchanged (pipeline_passthrough)." }
     - { step: 10, gate: "relationship memory: recall weaves a prior topic naturally; retention_and_erasure green (opt-out + /forget erase; opted-out recall returns null)." }
     - { step: 11, gate: "repeated unanswered question increments content_gaps.asked_count and surfaces in the digest; stored question carries no asker identity." }
-    - { step: 12, gate: "a high-intent signal emits lead.identified -> owner approval required before any DM (governance autonomy L1); no DM without approval." }
+    - { step: 12, gate: "dm_funnel_safety green: explicit interest only, high-engagement digest-only, owner evidence preview, one-shot approval, long-lived suppression after rejection/no-response/complaint/opt-out; no DM without approval." }
     - { step: 13, gate: "an experiment on dimension != style (timing/activity/marketing_angle) runs through the SAME champion/challenger gate + rollback." }
     - { step: 14, gate: "onboarding wizard interviews the owner via DM, emits a valid persona + sources config that passes the Zod schema, shows a diff, and writes atomically only after owner confirm." }

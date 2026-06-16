@@ -327,6 +327,16 @@ interfaces:
       interface SocialContext {
         assess(channelId: string): Promise<RoomRead>;
       }
+      // Suppression is a cross-cutting read-model owned by infra, not by a feature module.
+      // It is updated from explicit member phrases ("别回复我", "别私信我", "不要记住我"),
+      // owner control commands, and complaint/no-response signals. Modules READ it before
+      // replying, remembering, or proposing DMs; they do not share mutable state with each other.
+      interface SuppressionService {
+        isSuppressed(workspaceId: string, userId: string, scope: 'reply' | 'dm' | 'memory' | 'all'): Promise<boolean>;
+        suppress(input: { workspaceId: string; userId: string; scope: 'reply' | 'dm' | 'memory' | 'all'; reason: string; expiresAt?: Date }): Promise<void>;
+        clear(workspaceId: string, userId: string, scope?: 'reply' | 'dm' | 'memory' | 'all'): Promise<void>;
+        recordNegativeSignal(workspaceId: string, channelId: string, userId: string, signal: 'complaint' | 'negative_reaction' | 'no_response' | 'owner_mute'): Promise<void>;
+      }
       interface RoomRead {
         phase: 'seed' | 'spark' | 'grow' | 'mature';        // community lifecycle
         temperature: 'silent' | 'calm' | 'lively' | 'heated' | 'argument';
@@ -379,11 +389,16 @@ interfaces:
         title: string;
         content: string;
         url?: string;
+        canonicalUrl?: string;
         tags?: string[];
         language?: string;
+        contentType?: 'article' | 'docs' | 'faq' | 'product' | 'changelog' | 'rss' | 'crawl' | 'note';
+        sourceTrust?: 'owned' | 'partner' | 'rss' | 'crawl' | 'user_file';
+        workspacePriority?: number;
         metadata?: Record<string, unknown>;
         createdAt: Date;
         updatedAt: Date;
+        freshnessAt?: Date;
       }
   KnowledgeChunk:
     desc: A retrieved, isolation-filtered slice of source content. Returned by RAG.
@@ -395,6 +410,12 @@ interfaces:
         text: string;
         url?: string;
         score: number;           // similarity
+        canonicalUrl?: string;
+        contentType?: string;
+        sourceTrust: 'owned' | 'partner' | 'rss' | 'crawl' | 'user_file';
+        updatedAt: Date;
+        freshnessAt?: Date;
+        workspacePriority: number;
       }
   MemberEvent:
     desc: Member join/leave, normalized by the adapter.

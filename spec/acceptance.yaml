@@ -24,6 +24,13 @@ discipline:
     replays, adversarial corpora), NOT by asking a human "does this look done?".
     Human approval is reserved ONLY for items explicitly flagged `subjective: true`,
     and those are minimized to a small sample — never the default gate.
+  real_evidence_layering: >-
+    Real integrations that need credentials or interactive platform state are split into
+    deterministic local contract evidence plus a small required real smoke, with the full
+    real end-to-end path moved to the production/nightly track. This keeps local iteration
+    unblocked without weakening reality: a step may not claim real coverage from mocks, but
+    `just verify-step N` should run the simulator/contract suite fast, while `just verify-real
+    step-N` records the credential-gated smoke evidence when secrets are available.
   split_ok_narrow_forbidden: >-
     You MAY split a step into sub-steps (N.1, N.2, ...) freely — step COUNT does not
     matter. You MAY NOT drop, shrink, or soften any capability to make a step pass.
@@ -52,7 +59,9 @@ evidence_types:
   unit:            pure-logic unit test
   property:        randomized property test (e.g. isolation never leaks across random corpora)
   integration:     in-memory bus + mock PlatformAdapter + fixtures; assert event order / passthrough
+  adapter_contract: simulator over normalized Telegram update/callback/edit/access fixtures using the real GramJS/grammY type boundary, no credentials
   real_runtime:    against the real dependency (live test bot / real process kill / real LLM); NOT mockable away
+  real_smoke:      minimal credential-gated live path proving login, send/receive, callback, edit, and access preflight once per environment
   llm_fixture:     golden inputs + structural assertions (no markdown, tier correct, ...); temperature=0 for repeatability
   redteam:         adversarial corpus; assert ZERO violations (the strongest safety evidence — AI as attacker)
   crash_injection: kill the process at a chosen point; restart; assert exactly-once / no-loss
@@ -79,30 +88,41 @@ steps:
       - { id: llm_output_isolation,must: "LLM gateway returns advisory typed data only; parsed outputs cannot emit bus events, mutate config/db, call adapters, or choose autonomy except through policy wrappers", ev: static, gate: llm_output_isolation }
       - { id: config_hot_reload,   must: "editing a workspace swaps it live without restart; a bad reload is rejected, prior config stays", ev: integration }
       - { id: lifecycle,           must: "engine register/start/stop + module healthCheck callable", ev: unit }
-      - { id: cost_breaker,        must: "budget exhausted => next generative call refused, read-only, owner notified, resets next day; safety still runs", ev: unit, gate: cost_circuit_breaker }
+      - { id: minimum_launch_profile, must: "default config launches in conservative mode: evolution/funnel/cross_promotion/user_memory off, proactive frequency low, high-risk capabilities owner-ramped", ev: unit, gate: minimum_launch_profile }
+      - { id: cost_breaker,        must: "budget exhausted => next generative call refused, read-only, owner notified, resets next day; safety still runs in its own lane", ev: unit, gate: cost_circuit_breaker }
+      - { id: safety_budget_lane,  must: "chat/generative, ingest, and safety/media budgets are independent; media safety exhaustion enters media_hold_mode and owner-visible status instead of silently allowing media", ev: unit, gate: safety_budget_media_hold }
       - { id: cost_reserve,        must: "N concurrent generative calls atomically reserve against daily_budget_state; a budget with room for ~1 call cannot be overshot by N read-then-call races; actual usage reconciles to llm_usage", ev: integration, gate: cost_breaker_reserve }
       - { id: idempotent_outbox,   must: "same inbound correlationId after crash => exactly one reply; stale trigger => none", ev: crash_injection, gate: outbox_crash_safety, real: true }
       - { id: unified_outbound,    must: "no module references an adapter send method; outbound.requested dedups via outbox", ev: static, gate: unified_outbound }
       - { id: scheduler_tz,        must: "two workspaces in different tz each get their tick at workspace-local cron time; missed tick catches up once", ev: unit, gate: scheduler_timezone }
       - { id: event_journal,       must: "the journaling bus middleware writes ONE event_journal row per emission with correlationId + a correct causation_id chain; `trace <correlationId>` reconstructs the full ordered story; `tail` sees a live emission; `inspect` returns an entity's recent rows", ev: integration, gate: observability_trace }
       - { id: structured_logging,  must: "every log line carries correlationId + workspaceId + module; output is newline-JSON to data/logs/ and tail/grep-able", ev: unit, gate: observability_trace }
+      - { id: journal_privacy_layers, must: "event_journal preserves audit skeleton while /forget redacts user payload digests and raw messages are deleted by retention; trace remains explainable without user text", ev: privacy_data, gate: journal_privacy_layers }
       - { id: journal_redaction,   must: "session string / bot token / API key / flagged-media bytes NEVER appear in event_journal or the log file (only correlationId/causationId/name do); journal is batched off the critical path and pruned by the retention sweep", ev: integration, gate: journal_no_secrets, real: true }
     verify: just verify-step 1
 
   - step: 2
     name: Telegram Dual Adapter (userbot + control bot)
+    evidence_ladder: >-
+      Local development runs the adapter contract simulator: synthetic MTProto/Bot API
+      updates/callbacks/edits/access results through the real normalized boundary. Step
+      evidence also includes a small `just verify-real step-2` live smoke using dev-secret.
+      The exhaustive live Telegram E2E matrix is a production/nightly gate, not the hot
+      local loop.
     capabilities:
-      - { id: roundtrip,        must: "real inbound on the USERBOT (MTProto/GramJS, session-string auth) → UnifiedMessage → message.received; reply sent and visible in-channel AS the owner (no bot badge)", ev: real_runtime, real: true }
+      - { id: contract_simulator, must: "synthetic GramJS/grammY message, callback, edit, media, FLOOD_WAIT, and access fixtures map through the normalized adapter boundary with no credentials", ev: adapter_contract, gate: telegram_adapter_evidence_ladder }
+      - { id: roundtrip,        must: "simulated inbound on the USERBOT boundary → UnifiedMessage → message.received; reply routes to userbot and is shaped as an owner-account message (no bot-badge assumptions in core)", ev: adapter_contract, gate: telegram_adapter_evidence_ladder }
       - { id: single_ingest,    must: "message.received is emitted ONLY by the userbot; the control bot (a group admin able to read) never re-ingests → a message is processed exactly once", ev: integration, gate: dual_identity_routing }
-      - { id: control_executes, must: "moderation.violation is executed by the CONTROL BOT (group admin); the userbot adapter exposes no admin send path", ev: integration, gate: dual_identity_routing, real: true }
-      - { id: owner_remote,     must: "an owner-facing send goes via the control bot as a DM with inline ✅/❌/📝 buttons; a button callback from the owner is received and re-emitted as control.owner_action (owner-authenticated; a non-owner callback is dropped before emit)", ev: real_runtime, real: true }
+      - { id: control_executes, must: "moderation.violation is executed by the CONTROL BOT (group admin); the userbot adapter exposes no admin send path", ev: integration, gate: dual_identity_routing }
+      - { id: owner_remote,     must: "an owner-facing send goes via the control bot as a DM with inline ✅/❌/📝 buttons; a simulated owner callback is re-emitted as control.owner_action (owner-authenticated; a non-owner callback is dropped before emit)", ev: adapter_contract, gate: telegram_adapter_evidence_ladder }
       - { id: audience_routing, must: "outbound.requested routes by via: owner→control bot, community/lead→userbot; an owner-recipient kind tagged via:'userbot' is rejected", ev: integration, gate: dual_identity_routing }
-      - { id: deterministic_corr, must: "correlationId is derived from platform_message_id (not a fresh uuid); a replayed update after reconnect yields the same correlationId → outbox dedup → exactly one reply", ev: crash_injection, gate: idempotent_delivery, real: true }
+      - { id: deterministic_corr, must: "correlationId is derived from platform_message_id (not a fresh uuid); a replayed update after reconnect yields the same correlationId → outbox dedup → exactly one reply", ev: crash_injection, gate: idempotent_delivery }
       - { id: outbound_path,    must: "BOTH reply.generated and outbound.requested go out via the one outbox (no module calls an adapter send method)", ev: integration, gate: unified_outbound }
       - { id: flood_wait,       must: "on the userbot an MTProto FLOOD_WAIT is honored in full (no early retry); recurring FLOOD_WAITs trip RETREAT (posture==stay_silent) + out-of-band owner alert via the control bot", ev: integration, gate: account_survival }
       - { id: account_ceiling,  must: "the per-account global ceiling holds across multiple channels+DMs; a freshly configured account ramps under the warm-up curve; the userbot performs NO admin action", ev: integration, gate: account_survival }
-      - { id: edit_delivery,    must: "an edited message arrives as UnifiedMessage{isEdit:true, editOf}", ev: real_runtime, real: true }
-      - { id: verify_access,    must: "verifyAccess per adapter: userbot isMember (hard stop if not), control bot isAdmin+delete+restrict (hard stop if missing); NO privacy-mode; invalid userbot session -> out-of-band alert via control bot; invalid control-bot token -> unhealthy process + redacted log/CLI health error; no crash loop", ev: real_runtime, gate: userbot_access, real: true }
+      - { id: edit_delivery,    must: "an edited update fixture arrives as UnifiedMessage{isEdit:true, editOf}; replay of the same edit revision is deduped, a later edit revision re-moderates", ev: adapter_contract, gate: telegram_adapter_evidence_ladder }
+      - { id: verify_access,    must: "verifyAccess per adapter: userbot isMember (hard stop if not), control bot isAdmin+delete+restrict (hard stop if missing); NO privacy-mode; invalid userbot session -> out-of-band alert via control bot; invalid control-bot token -> unhealthy process + redacted log/CLI health error; no crash loop", ev: adapter_contract, gate: userbot_access }
+      - { id: live_smoke,       must: "credential-gated smoke proves real userbot login, real send/receive, real control-bot callback, real edit delivery, and real verifyAccess once; output is recorded in .evidence without secrets", ev: real_smoke, gate: telegram_adapter_evidence_ladder, real: true }
       - { id: media_fetch,      must: "fetchMedia returns bytes for moderation; bytes not persisted by the adapter", ev: integration }
       - { id: degrade,          must: "unsupported capabilities (poll/pin) auto-degrade silently", ev: unit }
     verify: just verify-step 2
@@ -120,6 +140,7 @@ steps:
       - { id: incremental_sync,  must: "re-sync dedups by content_hash; only changed items re-embed", ev: unit }
       - { id: sync_cursor,       must: "source_sync_state persists cursor/since checkpoints; a restart resumes paginated sync without skipping or duplicating items", ev: integration }
       - { id: embedding_compat,  must: "embedding model/dimension mismatch marks sources full_reembed_required and blocks stale vectors from query until re-embedded under ingest budget", ev: integration }
+      - { id: freshness_trust,   must: "retrieval ranking and answer grounding use sourceTrust, freshness/updatedAt, contentType, canonicalUrl, and workspacePriority; stale or low-trust hits are downgraded or surfaced as gaps", ev: unit, gate: knowledge_freshness_trust }
       - { id: content_gap,       must: "a query with top score < min_score emits content_gap.detected (no asker identity)", ev: unit }
     verify: just verify-step 3
 
@@ -131,6 +152,7 @@ steps:
       - { id: direct_automation_question, must: "a direct 'are you automated' question gets only the approved one-line natural disclosure aligned with the member notice; no model/system/vendor detail and no privileged action", ev: llm_fixture, gate: persona_transparency_boundary }
       - { id: coherent,         must: "reply stays coherent with the Context Manager window across multi-party chatter", ev: llm_fixture }
       - { id: register_match,   must: "the posture/register hint from directives is reflected; STYLE flexes, boundaries do not", ev: llm_fixture }
+      - { id: brand_safety,     must: "high-risk/brand-sensitive topics deflect lightly, heated/argument posture observes, marketing is suppressed during complaints, and /why can explain why the reply was allowed", ev: redteam, gate: persona_brand_safety }
       - { id: style_arm,        must: "Persona sets ReplyDraft.styleVariant from ctx.styling.assign(workspaceId, correlationId); with NO running STYLE experiment it returns 'champion' + the live STYLE prompt, deterministically per correlationId (the experiment/Thompson behavior itself is step 8)", ev: unit }
       - { id: sounds_human,     must: "replies read like a real person, not a bot", ev: subjective_sample, subjective: true }
       - { id: pipeline_abort,   must: "a seeded Persona throw/timeout aborts the reply for that correlationId — no out-event, no half-built draft, logged; NOT silent passthrough", ev: integration, gate: pipeline_failure_abort }
@@ -151,6 +173,7 @@ steps:
       - { id: silent_actions,   must: "every admin action is silent (nothing posted in-channel)", ev: integration }
       - { id: audit_log,        must: "every action writes a moderation_actions row (tier+reason, no media bytes)", ev: integration }
       - { id: media_failsafe,   must: "over media_scan_daily_cap, ALL unscanned media (new AND established users) is held, never silently allowed", ev: unit, gate: moderation_failclosed }
+      - { id: safety_hold_queue,must: "classifier outage/media cap holds are silent to members, deduped by user/reason, summarized in owner digest/status, have a TTL, and expire to the declared safe default without noisy proposals", ev: integration, gate: safety_hold_queue }
     verify: just verify-step 5
 
   - step: 6
@@ -161,6 +184,7 @@ steps:
       - { id: benign_deflect,   must: "a BENIGN out-of-scope question (real customer asking refund/support) => with on_out_of_scope='deflect', ONE natural in-character deflection (no privileged action, no refund answer, no AI-leak); with 'silent', no reply; distinguished from injection by intent not topic", ev: llm_fixture }
       - { id: cost_prefilter,   must: "obvious non-reply cases are decided with NO LLM call (rule pre-filter); classifier only on survivors", ev: integration }
       - { id: mention_flood,    must: "a sender past reply_rate.per_user_max gets no reply within the window", ev: unit }
+      - { id: member_suppression, must: "phrases like '别回复我/别私信我/别记我' set reply/dm/memory suppression scopes, stop future matching behavior, and are visible to /why without replying to malicious commands", ev: integration, gate: suppression_complaint_loop }
       - { id: single_gate,      must: "reply_probability + active_hours is the ONLY reactive-reply decision point; edits never reply", ev: unit }
       - { id: decision_trace,   must: "when the router DECLINES to reply it writes a decision.no_reply journal trace naming the winning branch (posture/flood-cap/active_hours/seed/command_attempt/probability), so `/why` and `just trace` explain the non-reply", ev: integration, gate: observability_trace }
     verify: just verify-step 6
@@ -176,6 +200,7 @@ steps:
       - { id: status_why,         must: "/status + /why answer from logs (moderation_actions, outbox, command_attempts)", ev: integration }
       - { id: member_notice,      must: "with member_notice on, a one-time + pinned disclosure is posted", ev: integration }
       - { id: retention_forget,   must: "retention sweep deletes past-retention rows AND prunes terminal outbox rows past outbox_prune_after_days (without breaking the idempotency window); /forget emits user.forget -> User Memory erases note+opt-out AND the Database service purges/anonymizes user-scoped raw records it owns (messages, command_attempts, leads, moderation target ids where legally safe, event_journal payload digests/reasons for that subject); opt-out keyword stops memory only", ev: privacy_data, gate: retention_and_erasure }
+      - { id: suppression_controls, must: "owner /mute-bot-for-user and /unmute-bot-for-user set/clear suppression scopes; multi-user negative reaction automatically triggers quiet posture and is explained in /status", ev: integration, gate: suppression_complaint_loop }
       - { id: timeout_default,    must: "an undecided item auto-resolves at proposal.ttl using the declared safe-default table: punitive/cost/DM/cross-promo rejected, tuning held, onboarding cancelled, low-risk activity dropped", ev: unit, gate: approval_safe_defaults }
     verify: just verify-step 7
 
@@ -183,6 +208,7 @@ steps:
     name: Marketing / Atmosphere / Activity / Evolution
     capabilities:
       - { id: marketing_limits,  must: "max_mentions_per_day + min_gap_hours survive a restart; never mention during complaint/argument", ev: integration }
+      - { id: suppression_quiet, must: "repeated complaints/negative reactions from multiple users automatically reduce reply/proactive frequency or set quiet posture before evolution can optimize engagement", ev: integration, gate: suppression_complaint_loop }
       - { id: cold_start,        must: "seed phase: broadcast only, no reactive chat, no poll below min_participants; consecutive bot messages capped", ev: integration, gate: cold_start_no_cringe }
       - { id: cold_revival,      must: "atmosphere cold-trigger fires once per cooldown and sends via outbound (suppressed under stay_silent)", ev: integration }
       - { id: periodic_activity, must: "periodic activity types (topic_day/quiz) are triggered by the activity.due scheduler tick in the workspace timezone; activity.rejected returns the proposal to the planner (dropped/rescheduled, not left pending)", ev: integration }
@@ -221,9 +247,9 @@ steps:
   - step: 12
     name: DM Funnel
     capabilities:
-      - { id: lead_signal,   must: "a high-intent signal emits lead.identified", ev: integration }
+      - { id: lead_signal,   must: "only explicit interest plus supporting engagement emits lead.identified; high engagement alone goes to digest, not DM proposal", ev: integration, gate: dm_funnel_safety }
       - { id: approval_gate, must: "no DM is sent without owner approval on the control bot (autonomy L1); approved => outbound dm via:'userbot' to the lead, within the account_survival dm_per_day cap", ev: integration }
-      - { id: lead_suppression, must: "a rejection, no-response, complaint, or prior DM suppresses repeat lead proposals for that user until the configured cooldown expires", ev: unit }
+      - { id: lead_suppression, must: "a rejection, no-response, complaint, opt-out, or prior DM suppresses repeat lead proposals for that user; no-response/rejection create long-lived downgrade, not immediate retry", ev: unit, gate: dm_funnel_safety }
       - { id: never_member,  must: "a member asking can never trigger a DM (provenance)", ev: redteam, gate: command_conversation_separation }
     verify: just verify-step 12
 

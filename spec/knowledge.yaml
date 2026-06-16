@@ -19,10 +19,13 @@ content_provider_protocol:
             "summary": "...",
             "content": "完整正文...",
             "url": "https://mysite.com/blog/gpt5",
+            "canonical_url": "https://mysite.com/blog/gpt5",
             "tags": ["gpt","openai"],
             "language": "zh",
+            "content_type": "article",
             "created_at": "2026-06-13T10:00:00Z",
             "updated_at": "2026-06-13T10:00:00Z",
+            "freshness_at": "2026-06-13T10:00:00Z",
             "metadata": {}
           }],
           "has_more": false,
@@ -84,6 +87,21 @@ retrieval_recall:
     out-ranked by workspace B's vectors. Assert A's query still returns A's relevant
     chunks in its top-K (recall preserved), not just "no B chunks" (safety). A post-KNN
     filter implementation fails this; a pre-KNN partition/filter passes.
+
+source_quality:
+  rule: >-
+    Retrieval ranking is not similarity-only. Each source declares trust, freshness
+    tolerance, content_type, canonical URL behavior, and workspacePriority in config.
+    KnowledgeService carries these fields through knowledge_items, chunks, and returned
+    KnowledgeChunk values so Persona can ground answers in current, trustworthy sources.
+  ranking_contract:
+    - vector score is the candidate generator, not the final authority.
+    - owned/partner sources outrank rss/crawl when semantic scores are close.
+    - stale chunks beyond source.freshness_max_days are downgraded and marked in the prompt;
+      if every good hit is stale, emit content_gap.detected(stale_source_hit=true).
+    - canonicalUrl is preserved for /why and digest so the owner sees which source backed a reply.
+    - workspacePriority lets the owner prefer official docs over a broad feed without breaking isolation.
+  gate: knowledge_freshness_trust (overview quality_gates) — fixtures prove stale/low-trust sources do not outrank fresh authoritative sources at equal relevance, and stale-only answers surface as gaps.
 
 embedding_compatibility:
   rule: >-

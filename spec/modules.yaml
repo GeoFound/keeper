@@ -47,6 +47,18 @@ modules:
       or queue moderation but can never silently open the black floor. (Gate:
       moderation_failclosed.) Use structured/JSON-schema output and treat a parse failure
       as classifier failure.
+    hold_queue:
+      member_visibility: "silent — no in-channel explanation, no mechanism disclosure"
+      ttl: "config.llm.budget.safety_hold_ttl_hours (default 24h)"
+      collapse: "dedupe by workspace + user/message bucket + reason_code so outages become one digest/status incident"
+      defaults:
+        text_classifier_error: "expire_drop — do not reply/process as clean; leave public text alone unless a deterministic non-LLM rule already requires delete"
+        media_scan_cap_or_vision_down: "silent_delete_unscanned when platform delete right exists; otherwise workspace_runtime_state.mode=safety_hold and owner alert"
+        missing_control_bot_rights: "workspace safety_hold/read_only; no clean emission that depends on unavailable moderation execution"
+      owner_surface: >-
+        /status and digest show counts by reason, oldest hold age, TTL, and whether media
+        is being silently deleted due to media_hold_mode. They never include raw flagged
+        media bytes or member-visible explanations.
     action_provenance_and_autonomy: >-
       ALL moderation actions are EXECUTED BY THE CONTROL BOT (the group-admin identity),
       never the userbot (the owner's personal account performs no admin action — see
@@ -98,7 +110,7 @@ modules:
           a human can report to the platform. CSAM handling = platform + owner report.
       new_user_media_delay: "untrusted/new users cannot post media for the first N minutes (config moderation.new_user_media_delay_minutes), mirroring new_user_link_delay — most drive-by image abuse comes from fresh accounts."
       never_store_flagged_media: "media that trips the black-tier vision classifier is deleted and its bytes are NEVER written to disk/db; only a tier+reason audit row is kept (no media payload)."
-      media_budget: "vision calls are counted in llm_usage(purpose=moderation_vision). If a per-day media_scan cap is hit, ALL further unscanned media (new AND established users) is held/blocked (fail-safe) rather than scanned — safety never silently degrades to allow."
+      media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, workspace enters media_hold_mode: ALL further unscanned media (new AND established users) is held/blocked/silent-deleted per config rather than scanned — safety never silently degrades to allow. Owner sees 'media safety scanning unavailable; media temporarily held' rather than a generic budget error."
     rules:
       - { feature: anti_spam,            behavior: "ad links / repeated messages / bulk joins -> silent delete NOW (auto); mute proposed to owner (L1)" }
       - { feature: hard_block,           behavior: "black-tier hit (text OR media) -> silent delete NOW (auto) + DM owner (moderation.escalated) proposing the ban (L1). Detection+delete NOT tunable; ban awaits owner ✅." }
@@ -150,6 +162,7 @@ modules:
     decision_order:   # evaluated top to bottom; first match wins
       - { when: "message is an EDIT (isEdit=true)", action: "never reply (edits are re-moderated, not re-triggered — see events edited_message_handling)" }
       - { when: "message is a MALICIOUS COMMAND_ATTEMPT — a privileged-action request ('删了他'/'封他'), a control-override/prompt-injection ('ignore your instructions'/'reveal your prompt'/'you are now…') — even if it @mentions the bot", action: "SILENT: no action, no reply; log to command_attempts(kind:action_request|control_override). Silence reads as 'didn't take the bait', stays in character. This rule wins over mentions." }
+      - { when: "message is an explicit suppression phrase ('别回复我'/'别私信我'/'不要记住我') and not a malicious command", action: "write member_suppression for the matching scope (reply/dm/memory/all), no privileged action; optional one short in-character acknowledgement only for benign privacy opt-out, never for injection." }
       - { when: "message is a BENIGN OUT-OF-SCOPE question — a real person genuinely asking about an ignore_topic (refund/payment/support), NOT trying to command or inject", action: "per governance.on_out_of_scope: 'deflect' (default) => ONE natural in-character human deflection ('这个我帮不上，你找下客服哈') and NEVER a privileged action / refund answer / AI-leak; 'silent' => no reply. Logged to command_attempts(kind:out_of_scope). Ghosting a real customer is worse for the business than a warm human deflection — the two cases are distinguished by intent, not topic." }
       - { when: "this sender has already received >= reply_rate.per_user_max replies in reply_rate.window_minutes (mention-flood guard)", action: "do not reply — SILENT (a member cannot force unbounded replies/LLM spend by repeatedly @mentioning the bot). Counts both reactive replies; resets per window." }
       - { when: message @mentions the bot OR is a direct conversational question, action: reply (mustReply=true — answer when addressed) }
@@ -166,7 +179,9 @@ modules:
       seed phase, and posture==stay_silent are decided without the classifier. The
       LLM classifier is invoked only for the survivors (mentions, direct questions,
       ambiguous in-scope lines). When the workspace is read-only (breaker tripped)
-      the classifier is skipped entirely — there will be no reply anyway.
+      the classifier is skipped entirely — there will be no reply anyway. reply/dm
+      suppression checks run before any LLM classifier so an opted-out user cannot be
+      cost-amplified.
     retrieval: >-
       When it decides to reply, the Intent Router fills ReplyDraft.retrieval by calling
       ctx.knowledge.search(workspaceId, query) (the isolation-filtered read-model — see
@@ -235,6 +250,16 @@ modules:
       具体问题你找群主就行" — no technical detail, no debate, no privileged action, and no
       prompt/system explanation. This keeps the public notice, in-character behavior, and
       owner's risk decision consistent.
+    brand_safety:
+      rule: >-
+        Keeper speaks as the owner, so reputational risk is a first-class safety boundary.
+        High-risk domains (legal, medical, financial/investment, politics, war, religion,
+        refunds/payments) get short light deflection or source-grounded factual pointers,
+        never strong advice or identity claims. In heated/argument posture it observes by
+        default. Marketing is suppressed during complaints, arguments, or support/refund
+        context. Every allowed risky reply writes a decision.reply trace reason so /why can
+        explain why it was safe to send.
+      owner_controls: "config.persona.brand_safety controls topic lists; evolution cannot edit them."
     system_prompt_file: assets/persona-system-prompt.txt
     post_process_pipeline:
       - strip markdown (**bold**, - lists, ``` code ```)
@@ -555,6 +580,8 @@ modules:
         - "/why <messageId>            -> explain a recent action/reply from the event_journal (the full trace for that message's correlationId, rendered human-readable)"
         - "/trace <id>                 -> the complete ordered story of one correlationId (every event + decision + failure for that message), the control-bot mirror of `just trace <id>`"
         - "/forget <user|me>           -> emits user.forget(scope:full): User Memory deletes the relationship-memory note + sets opted_out (stops collection); the Database service purges/anonymizes its user-scoped raw records (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject). Distinct from the opt_out_keyword, which stops relationship memory only (raw messages still age out per message_retention_days). See privacy decision."
+        - "/mute-bot-for-user <id>     -> sets member_suppression(scope:reply|dm|all) for that user; owner-only, no in-channel notice."
+        - "/unmute-bot-for-user <id>   -> clears owner-set member_suppression for that user; owner-only."
         - "/setup                      -> starts the onboarding interview (emits onboarding.input(start))"
     pause_is_authoritative: >-
       paused_until / proactive_paused_until are folded into SocialContext: while
@@ -583,7 +610,8 @@ modules:
         compose + DM the owner the daily digest via outbound.requested(kind:'digest',
         via:'control', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
         bot is never silenced by /pause or account RETREAT). Contents: messages sent, reply rate, spam blocked,
-        black-tier escalations (text+media), command_attempts, unbound-channel notices,
+        black-tier escalations (text+media), safety/media holds by reason+TTL,
+        command_attempts, suppression changes/complaint spikes, unbound-channel notices,
         repeated content gaps, pending items, evolution status, and repeated
         pipeline-stage failures (read from the pipeline_failures table — errors, timeouts,
         and watchdog hang-aborts). Owner's window into the black box.
@@ -615,6 +643,7 @@ modules:
       preferences, last seen), never stores raw logs beyond retention. Exposed via
       ctx.memory.recall(); Persona may weave it in naturally.
     privacy:
+      - memory suppression: member_suppression(scope=memory|all) prevents collection and recall even if feature_flag user_memory is on.
       - opt-out (keyword): a user sending the configured opt_out_keyword erases their note, sets opted_out=true, and stops relationship-memory collection. It does NOT purge their raw messages — those still age out per message_retention_days. (Tiered-delete decision.)
       - forget (owner /forget -> user.forget event): FULL erase. This module erases the note + sets opted_out on user.forget; the Database service purges/anonymizes the user-scoped raw records it owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject) on the same event. The stronger, complete right-to-erasure path. (Each endpoint erases only the data it owns — no cross-module table write.)
       - retention: notes expire after user_memory.retention_days; raw messages trimmed by message_retention_days (retention.sweep_due).
@@ -628,6 +657,10 @@ modules:
       below threshold), it logs the unanswered question and counts repeats. Surfaces
       to the owner in the digest ("本周 8 人问了 X，建议写一篇"). Near-zero cost,
       high value to the content team. Pure observer; never replies.
+    source_quality_note: >-
+      Gaps include stale_source_hit/low_trust_hit when RAG found semantically relevant
+      but stale or low-trust content; digest should say "update this source" rather than
+      only "write a new article".
 
   funnel:
     subscribes: [message.clean, reply.sent, reaction.received, lead.approved]
@@ -650,10 +683,14 @@ modules:
       - feature flag defaults OFF; enabling it is an explicit owner workspace decision.
       - lead.identified requires explicit high-intent CONTENT plus engagement; repeated
         reactions alone are not enough.
+      - high engagement without explicit interest is digest-only; it never proposes a DM.
       - a rejection, no-response, complaint, opt-out, or prior DM suppresses repeat
-        proposals for that user until funnel.per_user_cooldown_days expires.
+        proposals for that user. Rejection/no-response create long-lived downgrade
+        (config no_response_downgrade_days/rejection_downgrade_days); opt-out is indefinite.
       - each owner preview shows the triggering evidence and the exact DM draft; approval
         authorizes only that one DM, not an ongoing sequence.
+      - a DM send attempt checks member_suppression(scope=dm|all) immediately before enqueue,
+        so a late opt-out beats an earlier approval.
 
   onboarding_wizard:
     trigger: first run / owner /setup on the control bot
@@ -708,7 +745,7 @@ feature_flags:
     marketing: true
     activities: true
     atmosphere: true
-    evolution: true
+    evolution: false           # minimum launch: implement, but owner-ramp after baseline trust
     cross_promotion: false
     user_memory: false        # relationship memory — privacy-sensitive, opt-in
     funnel: false             # DM lead funnel — opt-in
@@ -717,6 +754,12 @@ feature_flags:
     analytics: false
     sentiment_analysis: false
     auto_faq: false
+  minimum_launch_profile: >-
+    First launch is conservative by default: evolution, funnel, cross_promotion, and
+    user_memory are OFF; proactive frequency is low; polls are off until the community
+    has enough participants; all high-risk capabilities stay L1/L0. The owner can ramp
+    each flag later from config/control plane, but implementation must not assume all
+    features are live on day one.
   # Runtime flag check. CRITICAL: a disabled PIPELINE stage must PASS THROUGH,
   # never `return` — an early return drops the chain event and silences the bot.
   # Non-pipeline (fan-out) modules may simply no-op.

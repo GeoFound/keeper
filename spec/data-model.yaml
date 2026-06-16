@@ -173,7 +173,7 @@ data_model:
         source_event_id TEXT,
         source_correlation_id TEXT,
         status TEXT DEFAULT 'pending',             -- pending|approved|rejected|amended|expired|cancelled
-        safe_default TEXT NOT NULL,                -- reject|hold|drop
+        safe_default TEXT NOT NULL,                -- reject|hold|drop|cancel|no_decision
         payload_json TEXT NOT NULL,                -- redacted proposal payload, no secrets/media bytes
         approval_message_id TEXT,                  -- control-bot DM message id
         owner_response TEXT,
@@ -242,6 +242,28 @@ data_model:
         until DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+    safety_holds: |
+      -- Bounded fail-closed queue for classifier outages, media scan cap exhaustion,
+      -- missing required safety rights, and other conditions where passing as clean would
+      -- be unsafe. Holds are silent to members and summarized to the owner by /status/digest.
+      CREATE TABLE safety_holds (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT,
+        target_user_id TEXT,
+        platform_message_id TEXT,
+        modality TEXT,                           -- text|media|mixed
+        reason_code TEXT NOT NULL,               -- classifier_timeout|parse_error|media_cap|missing_rights|provider_outage
+        collapsed_key TEXT NOT NULL,             -- workspace:user/reason/modality bucket for dedupe
+        status TEXT DEFAULT 'held',              -- held|released|expired|silent_deleted
+        default_action TEXT NOT NULL,            -- expire_drop|silent_delete_unscanned|owner_review
+        expires_at DATETIME NOT NULL,
+        owner_notified_at DATETIME,
+        details_json TEXT,                       -- redacted; no raw media bytes/secrets
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_safety_holds_open ON safety_holds (workspace_id, status, expires_at);
     knowledge_items: |
       CREATE TABLE knowledge_items (
         id TEXT PRIMARY KEY,
@@ -249,12 +271,17 @@ data_model:
         type TEXT,
         title TEXT,
         url TEXT,
+        canonical_url TEXT,
         tags TEXT,
         language TEXT,
+        content_type TEXT,
+        source_trust TEXT DEFAULT 'owned',       -- owned|partner|rss|crawl|user_file
+        workspace_priority REAL DEFAULT 1.0,
         chunk_count INTEGER,
         content_hash TEXT,
         created_at DATETIME,
         updated_at DATETIME,
+        freshness_at DATETIME,
         synced_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     source_sync_state: |
@@ -267,6 +294,8 @@ data_model:
         since DATETIME,
         last_success_at DATETIME,
         last_error TEXT,
+        last_item_updated_at DATETIME,
+        stale_after DATETIME,
         embedding_model TEXT,
         embedding_dim INTEGER,
         full_reembed_required BOOLEAN DEFAULT FALSE,
@@ -283,9 +312,14 @@ data_model:
         title TEXT,
         text TEXT NOT NULL,
         url TEXT,
+        canonical_url TEXT,
+        content_type TEXT,
+        source_trust TEXT DEFAULT 'owned',
+        workspace_priority REAL DEFAULT 1.0,
         content_hash TEXT NOT NULL,
         embedding_model TEXT NOT NULL,
         embedding_dim INTEGER NOT NULL,
+        freshness_at DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(source_id, item_id, chunk_index, content_hash)
       );
@@ -320,13 +354,17 @@ data_model:
         day TEXT NOT NULL,                         -- YYYY-MM-DD in workspace timezone
         generative_budget_usd REAL NOT NULL,
         ingest_budget_usd REAL NOT NULL,
+        safety_budget_usd REAL NOT NULL,
         media_scan_cap INTEGER NOT NULL,
         generative_reserved_usd REAL DEFAULT 0,
         generative_actual_usd REAL DEFAULT 0,
         ingest_reserved_usd REAL DEFAULT 0,
         ingest_actual_usd REAL DEFAULT 0,
+        safety_reserved_usd REAL DEFAULT 0,
+        safety_actual_usd REAL DEFAULT 0,
         media_scans_reserved INTEGER DEFAULT 0,
         media_scans_used INTEGER DEFAULT 0,
+        media_hold_until DATETIME,
         read_only_until DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (workspace_id, day)
@@ -361,6 +399,23 @@ data_model:
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (workspace_id, user_id)
       );
+    member_suppression: |
+      -- Cross-feature suppression: reply, DM, memory, or all. Written by explicit member
+      -- phrases, owner control commands, and complaint/no-response signals. Read by Intent
+      -- Router, Funnel, User Memory, and SocialContext; never by ad hoc module state.
+      CREATE TABLE member_suppression (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        scope TEXT NOT NULL,                      -- reply|dm|memory|all
+        reason TEXT NOT NULL,                     -- phrase|owner_mute|complaint|negative_reaction|no_response|rejected_dm|opt_out
+        source_correlation_id TEXT,
+        expires_at DATETIME,                      -- NULL = indefinite
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (workspace_id, user_id, scope)
+      );
+      CREATE INDEX ix_member_suppression_active
+        ON member_suppression (workspace_id, scope, expires_at);
     content_gaps: |
       -- Community -> content reverse signal. Paraphrased question, no asker identity.
       CREATE TABLE content_gaps (
@@ -370,6 +425,9 @@ data_model:
         asked_count INTEGER DEFAULT 1,
         top_score REAL,                          -- best RAG score (below threshold)
         suggested_source_id TEXT,
+        stale_source_hit BOOLEAN DEFAULT FALSE,
+        low_trust_hit BOOLEAN DEFAULT FALSE,
+        canonical_url TEXT,
         first_asked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         last_asked_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
@@ -382,6 +440,11 @@ data_model:
         user_id TEXT NOT NULL,
         stage TEXT DEFAULT 'identified',         -- identified|proposed|dm_sent|converted|dropped
         signal TEXT,
+        evidence_json TEXT,                      -- why this is a lead; shown to owner
+        suppression_reason TEXT,
+        suppression_until DATETIME,
+        last_owner_decision TEXT,                -- approved|rejected|ignored|amended
+        no_response_at DATETIME,
         approval_message_id TEXT,                -- owner approval of the DM (autonomy L1)
         dm_sent_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -466,7 +529,10 @@ data_model:
       -- graph the envelope models. payload_digest is REDACTED + size-capped: it NEVER contains
       -- the session string, bot token, API keys, or flagged-media bytes (gate: journal_no_secrets).
       -- If user-scoped text appears, subject_user_id/channel/message metadata is set so /forget
-      -- can redact payload_digest/reason while preserving the trace skeleton.
+      -- can redact payload_digest/reason while preserving the trace skeleton. The privacy
+      -- model is three-tiered: audit skeleton (event name/time/correlation/reason code) is
+      -- retained for traceability, user payload digest is retention-/forget-bound, and raw
+      -- message text lives in messages only with the shortest retention.
       -- Written via a BATCHED async buffer off the receive/send critical path (better-sqlite3
       -- is synchronous — see tech_stack.database); pruned by retention.sweep_due past
       -- observability.journal_retention_days.
@@ -480,6 +546,7 @@ data_model:
         channel_id TEXT,
         platform_message_id TEXT,
         contains_user_text BOOLEAN DEFAULT FALSE,
+        privacy_tier TEXT DEFAULT 'audit_skeleton', -- audit_skeleton|user_payload_digest
         name TEXT NOT NULL,                      -- event name, OR a trace name (decision.no_reply, lifecycle.posture, pipeline.abort, ...)
         kind TEXT NOT NULL,                      -- event | decision | lifecycle | error
         stage TEXT,                              -- emitting module / pipeline stage

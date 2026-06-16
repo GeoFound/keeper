@@ -25,7 +25,10 @@ config_files:
         daily_usd_per_workspace: 2.0
         on_exceed: "read_only"      # GENERATIVE output only; moderation/receive/safety stay on; DM owner
         ingest_daily_usd: 1.0       # separate bound for embedding/sync so a big first sync can't starve chat
+        safety_daily_usd: 0.5       # separate safety lane for classifiers/vision; never borrowed by chat
         media_scan_daily_cap: 200   # max vision moderation calls/day/workspace; over cap -> hold ALL unscanned media (fail-safe)
+        media_hold_mode: "silent_delete_unscanned" # owner-visible status; no member-facing explanation
+        safety_hold_ttl_hours: 24   # unresolved holds expire to safe default, never to clean
     delivery:                       # send_queue + idempotency (operations) — covers replies AND outbound.requested
       per_channel_rate_per_min: 8   # CONSERVATIVE: this is a USERBOT on a real account, not a Bot API bot
       backoff: "exponential"        # honor MTProto FLOOD_WAIT in full (never retry early)
@@ -82,18 +85,27 @@ config_files:
         name: "AI 主站"
         adapter: "api"
         endpoint: "https://mysite.com/api/content-feed"
+        trust: "owned"                 # owned|partner|rss|crawl|user_file
+        freshness_max_days: 30
+        workspace_priority: 1.0
+        content_type: "site"
         auth: { type: "bearer", token_env: "SITE_MAIN_TOKEN" }
         sync: { interval_minutes: 30 }
       - id: "local-docs"
         name: "本地文档"
         adapter: "file"
         path: "./data/knowledge/general"
+        trust: "owned"
+        freshness_max_days: 180
+        workspace_priority: 0.8
+        content_type: "docs"
         sync: { interval_minutes: 5, watch: true }
 
   config/workspaces.yaml: |
     workspaces:
       - id: "ws-ai-community"
         name: "AI 交流社区"
+        launch_profile: "minimum"              # conservative first launch; owner ramps features later
         channels:
           - { platform: "telegram", channel_id: "-1001234567890", role: "owner" }
         content_sources: ["ai-site-main", "local-docs"]
@@ -103,7 +115,7 @@ config_files:
           marketing: true
           activities: true
           atmosphere: true
-          evolution: true
+          evolution: false                     # default OFF for launch; implement but owner-ramp later
           cross_promotion: false
           user_memory: false
           funnel: false
@@ -123,17 +135,21 @@ config_files:
           reply_rate:                        # mention-flood guard (modules.yaml intent_router)
             per_user_max: 5                  # max reactive replies to one sender within the window
             window_minutes: 10               # beyond this, further @mentions get no reply (silent)
+          brand_safety:
+            high_risk_topics: ["法律", "医疗", "金融", "投资", "政治", "宗教", "战争", "退款", "支付"]
+            high_risk_response: "light_deflect" # no advice/stance; short human deflection
+            strong_opinion_denylist: ["政策站队", "医疗建议", "投资建议", "法律结论"]
         marketing:
-          max_mentions_per_day: 3
-          min_gap_hours: 2
+          max_mentions_per_day: 1             # minimum launch: low-touch
+          min_gap_hours: 6
           style: "recommendation"
         activities:
           auto_topics: true
-          auto_polls: true
+          auto_polls: false                   # owner can enable once the room has density
           require_approval: ["giveaway", "contest", "any_with_cost"]
         atmosphere:
-          cold_threshold_hours: 4
-          max_proactive_per_day: 3
+          cold_threshold_hours: 8
+          max_proactive_per_day: 1
           quiet_hours: "01:00-09:00"
           lifecycle:                          # cold-start gating (see modules.yaml community_lifecycle)
             seed_max_members: 10              # <= this & near-zero activity -> seed (broadcast only)
@@ -187,6 +203,13 @@ config_files:
             send_direct_message: "L1_propose"       # DM funnel — owner approves each DM
             generate_media:      "L0_forbidden"
             refund_or_payment:   "L0_forbidden"     # also an immutable persona boundary
+          suppression:
+            reply_opt_out_phrases: ["别回复我", "不要回我", "别cue我"]
+            dm_opt_out_phrases: ["别私信我", "不要私信我", "别给我发私信"]
+            memory_opt_out_phrase: "不要记住我"
+            owner_mute_command: "/mute-bot-for-user"
+            negative_feedback_quiet_threshold: 3
+            negative_feedback_window_minutes: 60
         privacy:                              # operations.retention + right-to-delete
           message_retention_days: 90
           member_notice:                      # disclosure that gives retention a transparent basis
@@ -200,6 +223,9 @@ config_files:
           require_explicit_interest: true     # repeated engagement alone is not enough to propose a DM
           per_user_cooldown_days: 30          # rejection/no-response/complaint/prior DM suppresses repeats
           max_pending_per_workspace: 5        # bounded queue; no unbounded lead backlog
+          high_engagement_to_digest_only: true
+          no_response_downgrade_days: 3650
+          rejection_downgrade_days: 3650
         content_gap:
           min_score: 0.55                     # RAG top-score below this -> log an unanswered gap
         digest: {}                            # feature flag digest controls owner daily digest (bot.yaml scheduler.digest_cron)
@@ -227,6 +253,7 @@ config_loading:
     - duplicate workspace.id, duplicate source.id, or duplicate (platform, channel_id) bindings across workspaces
     - ids outside the approved charset: workspace/source ids must match ^[a-z0-9][a-z0-9_-]{1,63}$; channel_id is a non-empty platform string, not a workspace id
     - any workspace.content_sources reference to a missing source.id, or any workspace/channel trying to use reserved workspaceId `__system__`
+    - launch_profile: minimum with evolution/funnel/cross_promotion/user_memory enabled by default (owner must ramp these deliberately after first launch)
     - missing or non-numeric owner.approval_channel.user_id; there is exactly one owner control-plane sender unless a future delegated-principal spec adds more
     - any governance.autonomy raised at runtime, or a delegated principal added by anything but owner-authored config at load (no_self_escalation)
   identity_and_uniqueness: >-

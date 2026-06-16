@@ -33,6 +33,14 @@ gates:
       account RETREAT / approaching the account send ceiling, invalid session. The step-1
       redaction guarantee (no secrets in journal/logs) extends to metrics/traces too.
     evidence: "metrics endpoint scraped in a test; an injected error fires an alert rule; a trace shows a full reply correlationId path (drawn from the event_journal); a secret-scan of metrics/traces is clean."
+  - id: telegram_real_e2e
+    requirement: >-
+      Full live Telegram matrix, run nightly/manual with dev-secret credentials, outside the
+      hot local loop: real userbot login, receive, reply, edit re-moderation, media fetch,
+      FLOOD_WAIT simulation/recording where feasible, real control-bot owner DM, callback,
+      non-owner rejection, delete execution, access-right loss, and restart/outbox replay.
+      This complements Step 2's simulator + smoke; it does not replace either.
+    evidence: "nightly/manual transcript with redacted channel/user ids and command output; no secrets; failures block production launch, not local spec iteration."
   - id: resilience
     requirement: >-
       Every external call (Telegram, LLM, sources) has timeout + retry + bounded
@@ -96,7 +104,7 @@ gates:
   - id: legal_privacy
     requirement: >-
       Member-notice disclosure live; retention + right-to-delete operational; a data
-      map (what is stored, where, how long); CSAM handling path documented (delete +
+      map with the three privacy layers (audit skeleton, user payload digest, raw message: what is stored, where, how long); CSAM handling path documented (delete +
       never store + owner escalation to platform report). ToS/privacy stance written down.
     evidence: "notice posted in a real channel; data-map section in this YAML (or a machine-readable spec/data-map.yaml if the spec set is deliberately expanded) reviewed; a /forget request fully purges and is logged; CSAM runbook step rehearsed (with synthetic flag)."
 

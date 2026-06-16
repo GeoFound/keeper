@@ -40,8 +40,10 @@ modules:
     fail_closed: >-
       Moderation FAILS CLOSED. If the text classifier or the media vision classifier
       errors, times out, returns unparseable output, or is unavailable (e.g. media_scan
-      cap hit), the message is HELD (not delivered to message.clean) or treated as a
-      violation candidate — NEVER passed through as clean. Budget/cap pressure may slow
+      cap hit), the message is HELD in a bounded review/owner-digest queue (not delivered
+      to message.clean) or treated as a violation candidate — NEVER passed through as
+      clean. Repeated classifier outages collapse into one owner-visible incident rather
+      than spamming proposals. Budget/cap pressure may slow
       or queue moderation but can never silently open the black floor. (Gate:
       moderation_failclosed.) Use structured/JSON-schema output and treat a parse failure
       as classifier failure.
@@ -225,11 +227,19 @@ modules:
       group ("见人说人话见鬼说鬼话"). This is STYLE only: it NEVER overrides the
       immutable boundaries, never crosses the black content floor, and never breaks
       character. Register is allowed to flex; identity and red lines do not.
+    transparency_boundary: >-
+      The persona does not volunteer model, vendor, system-prompt, or automation details.
+      Ordinary replies must contain no "作为AI" / "我是语言模型" style leakage. If a
+      member directly asks whether the account uses automation, the only allowed answer is
+      a short, natural, member-notice-aligned disclosure such as "群里有自动助手帮忙打理日常，
+      具体问题你找群主就行" — no technical detail, no debate, no privileged action, and no
+      prompt/system explanation. This keeps the public notice, in-character behavior, and
+      owner's risk decision consistent.
     system_prompt_file: assets/persona-system-prompt.txt
     post_process_pipeline:
       - strip markdown (**bold**, - lists, ``` code ```)
       - strip enumerations (1. 2. 3.)
-      - AI-leak check ("作为AI", "我是语言模型", etc.)
+      - AI-leak check ("作为AI", "我是语言模型", model/vendor/system-prompt claims; only the approved one-line direct-automation disclosure is allowed)
       - length check (if over threshold, ask LLM to condense)
       - randomize (occasionally drop trailing period, add an emoji)
 
@@ -445,7 +455,7 @@ modules:
         is never shared (see knowledge.yaml shared_intelligence).
 
     immutable_boundaries:   # hard-coded, never an experiment target
-      - never admit being an AI
+      - never volunteer AI/model/system identity; direct automation questions may use only the approved one-line disclosure, never technical details
       - never answer refund questions
       - never fabricate answers
       - never execute a group member's command; refusals are SILENT, never an AI-revealing apology (see contracts governance)
@@ -552,7 +562,21 @@ modules:
       through the one room-read gate. The kill switch cannot be bypassed.
     correlation: each proposal stores approval_message_id; reply matched by reply-to first, else explicit #id.
     timeout:
-      rule: a pending item not decided within proposal.ttl auto-resolves to its SAFE default — reject for cost/giveaway/cross_promo AND for mute/ban moderation proposals (safe = no punitive action; the harmful content was already auto-deleted); hold (no change) for evolution tuning.
+      safe_defaults:
+        moderation_mute: reject          # no punitive action without owner
+        moderation_ban: reject           # harmful content was already deleted; ban needs owner
+        black_tier_notify: no_decision   # delete already happened; pure notify just expires
+        giveaway: reject
+        cost_bearing: reject
+        cross_promo: reject
+        lead_dm: reject                  # no DM without owner
+        low_risk_activity: drop          # do not post stale activities
+        evolution_tuning: hold           # no live prompt change
+        onboarding_confirm: cancel       # no config write
+      rule: >-
+        A pending item not decided within proposal.ttl auto-resolves exactly once using
+        the table above. New approval kinds MUST add an explicit safe default before they
+        can be persisted; "default approve" is not a valid default.
     digest:
       on: digest.due
       action: >-
@@ -622,6 +646,14 @@ modules:
       the persona, a real person, not a bot) and is additionally bounded by the
       account_survival dm_per_day cap (DMs are the highest ban risk). It never calls the
       adapter directly.
+    safety_friction:
+      - feature flag defaults OFF; enabling it is an explicit owner workspace decision.
+      - lead.identified requires explicit high-intent CONTENT plus engagement; repeated
+        reactions alone are not enough.
+      - a rejection, no-response, complaint, opt-out, or prior DM suppresses repeat
+        proposals for that user until funnel.per_user_cooldown_days expires.
+      - each owner preview shows the triggering evidence and the exact DM draft; approval
+        authorizes only that one DM, not an ongoing sequence.
 
   onboarding_wizard:
     trigger: first run / owner /setup on the control bot
@@ -639,9 +671,12 @@ modules:
       documented BOOTSTRAP exception: after the owner explicitly confirms the draft on
       the control plane, the wizard writes config/workspaces.yaml + config/sources.yaml
       ONCE to bootstrap a first-time setup. It writes a draft the human APPROVED (not an
-      autonomous edit), it never overwrites a hand-edited file without a fresh explicit
-      confirm, and thereafter config/** is human-owned again. The config loader supports
-      hot-reload (see config.yaml) so the new workspace goes live without a restart.
+      autonomous edit). Before writing, it renders the exact diff to the owner for confirm.
+      The write is atomic (temp file + fsync + rename) and records a bootstrap marker so a
+      crash cannot leave half-written YAML. It never overwrites a hand-edited file without
+      a fresh explicit confirm and a new diff, and thereafter config/** is human-owned
+      again. The config loader supports hot-reload (see config.yaml) so the new workspace
+      goes live without a restart.
     preconditions_check: >-
       Before marking a workspace live, the wizard calls verifyAccess on BOTH adapters and
       refuses to finish if the USERBOT is not a member of the channel (hard stop) or the

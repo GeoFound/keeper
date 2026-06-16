@@ -75,6 +75,8 @@ steps:
       - { id: declared_events,     must: "emit/subscribe outside a module's declared set throws in dev/test", ev: unit, gate: declared_events_only }
       - { id: envelope_conformance,must: "every emission validates against its Zod schema + non-empty correlationId/workspaceId", ev: unit, gate: envelope_conformance }
       - { id: config_load,         must: "config loads + Zod-validates; invalid config fails fast; hard_block=false rejected", ev: unit, gate: hard_floor_immutable }
+      - { id: config_uniqueness,   must: "duplicate workspace ids, source ids, channel bindings, missing content_sources, bad id charset, and reserved __system__ workspace bindings are rejected at load/reload", ev: unit, gate: config_uniqueness }
+      - { id: llm_output_isolation,must: "LLM gateway returns advisory typed data only; parsed outputs cannot emit bus events, mutate config/db, call adapters, or choose autonomy except through policy wrappers", ev: static, gate: llm_output_isolation }
       - { id: config_hot_reload,   must: "editing a workspace swaps it live without restart; a bad reload is rejected, prior config stays", ev: integration }
       - { id: lifecycle,           must: "engine register/start/stop + module healthCheck callable", ev: unit }
       - { id: cost_breaker,        must: "budget exhausted => next generative call refused, read-only, owner notified, resets next day; safety still runs", ev: unit, gate: cost_circuit_breaker }
@@ -125,7 +127,8 @@ steps:
     name: Persona Engine + Context Manager
     capabilities:
       - { id: no_markdown,      must: "reply.generated has no markdown / no enumerations", ev: llm_fixture, gate: cold_start_no_cringe }
-      - { id: no_ai_leak,       must: "reply never contains AI-revealing phrases ('作为AI'/'语言模型')", ev: llm_fixture }
+      - { id: no_ai_leak,       must: "ordinary replies never contain AI-revealing phrases ('作为AI'/'我是语言模型') or model/system/vendor details", ev: llm_fixture, gate: persona_transparency_boundary }
+      - { id: direct_automation_question, must: "a direct 'are you automated' question gets only the approved one-line natural disclosure aligned with the member notice; no model/system/vendor detail and no privileged action", ev: llm_fixture, gate: persona_transparency_boundary }
       - { id: coherent,         must: "reply stays coherent with the Context Manager window across multi-party chatter", ev: llm_fixture }
       - { id: register_match,   must: "the posture/register hint from directives is reflected; STYLE flexes, boundaries do not", ev: llm_fixture }
       - { id: style_arm,        must: "Persona sets ReplyDraft.styleVariant from ctx.styling.assign(workspaceId, correlationId); with NO running STYLE experiment it returns 'champion' + the live STYLE prompt, deterministically per correlationId (the experiment/Thompson behavior itself is step 8)", ev: unit }
@@ -166,14 +169,14 @@ steps:
     name: Approval Service + Owner Controls
     capabilities:
       - { id: approval_roundtrip, must: "owner input arrives as control.owner_action (the single authenticated ingress; emitted ONLY for the owner user_id); ✅/❌/📝 matched to the exact pending item by itemRef (callback_data, typed-command fallback by reply-to/#id); a member messaging the control bot produces NO control.owner_action and does nothing", ev: integration, gate: dual_identity_routing }
-      - { id: approval_persistence, must: "every proposal is persisted in approval_items before owner DM; after restart callbacks/reply-to/#id still resolve; expired rows apply the safe default exactly once", ev: crash_injection }
+      - { id: approval_persistence, must: "every proposal is persisted in approval_items before owner DM; after restart callbacks/reply-to/#id still resolve; expired rows apply the per-type safe default exactly once", ev: crash_injection, gate: approval_safe_defaults }
       - { id: pause_overrides,    must: "/pause => no proactive or reactive send; /quiet => proactive off, moderation on; owner DMs still delivered", ev: integration, gate: owner_pause_overrides }
       - { id: no_self_escalation, must: "runtime/evolution attempt to raise autonomy or add a principal is rejected", ev: unit, gate: no_self_escalation }
       - { id: digest,             must: "digest.due => owner DM via outbound with the required sections", ev: integration }
       - { id: status_why,         must: "/status + /why answer from logs (moderation_actions, outbox, command_attempts)", ev: integration }
       - { id: member_notice,      must: "with member_notice on, a one-time + pinned disclosure is posted", ev: integration }
       - { id: retention_forget,   must: "retention sweep deletes past-retention rows AND prunes terminal outbox rows past outbox_prune_after_days (without breaking the idempotency window); /forget emits user.forget -> User Memory erases note+opt-out AND the Database service purges/anonymizes user-scoped raw records it owns (messages, command_attempts, leads, moderation target ids where legally safe, event_journal payload digests/reasons for that subject); opt-out keyword stops memory only", ev: privacy_data, gate: retention_and_erasure }
-      - { id: timeout_default,    must: "an undecided item auto-resolves to its SAFE default at proposal.ttl (reject cost/giveaway/cross_promo; hold tuning)", ev: unit }
+      - { id: timeout_default,    must: "an undecided item auto-resolves at proposal.ttl using the declared safe-default table: punitive/cost/DM/cross-promo rejected, tuning held, onboarding cancelled, low-risk activity dropped", ev: unit, gate: approval_safe_defaults }
     verify: just verify-step 7
 
   - step: 8
@@ -220,6 +223,7 @@ steps:
     capabilities:
       - { id: lead_signal,   must: "a high-intent signal emits lead.identified", ev: integration }
       - { id: approval_gate, must: "no DM is sent without owner approval on the control bot (autonomy L1); approved => outbound dm via:'userbot' to the lead, within the account_survival dm_per_day cap", ev: integration }
+      - { id: lead_suppression, must: "a rejection, no-response, complaint, or prior DM suppresses repeat lead proposals for that user until the configured cooldown expires", ev: unit }
       - { id: never_member,  must: "a member asking can never trigger a DM (provenance)", ev: redteam, gate: command_conversation_separation }
     verify: just verify-step 12
 
@@ -235,6 +239,6 @@ steps:
     capabilities:
       - { id: interview,      must: "wizard interviews the owner via DM ON THE CONTROL BOT; owner input arrives as control.owner_action -> Approval forwards onboarding.input(start|answer|confirm) (owner user_id only — the owner cannot DM their own userbot account); onboarding.input is a DEDICATED event, never a piggyback on activity.approved", ev: real_runtime, real: true }
       - { id: valid_config,   must: "emits a persona + sources config that passes the SAME Zod schema as hand-written", ev: unit }
-      - { id: bootstrap_write,must: "writes config/** ONCE only after explicit owner confirm; never overwrites a hand-edit without a fresh confirm; hot-reload picks it up", ev: integration }
+      - { id: bootstrap_write,must: "renders an owner-visible diff, writes config/** ONCE only after explicit owner confirm, uses atomic temp-write+rename with a bootstrap marker, never overwrites a hand-edit without a fresh confirm, and hot-reload picks it up", ev: integration }
       - { id: preconditions,  must: "refuses to go live if the userbot is not a member or its session is invalid, if the control bot token is invalid, or if the control bot lacks admin delete+restrict; tells the owner exactly what to fix (no privacy-mode concept, no safety-rights degradation)", ev: real_runtime, real: true }
     verify: just verify-step 14

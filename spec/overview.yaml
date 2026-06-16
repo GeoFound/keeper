@@ -319,11 +319,14 @@ invariants:
   - A group member can NEVER trigger a privileged action via chat; privileged actions originate only from the owner control-plane or the bot's own configured policy (action provenance).
   - Malicious member commands / prompt-injection / control-override attempts are handled SILENTLY — no action, no AI-revealing refusal — and logged. Benign out-of-scope support/refund questions are a distinct intent class and get the configured natural deflection (or silence if configured), never a privileged action.
   - Autonomy is owner-granted and ramps per-capability; the bot never self-escalates and never adds a principal (governance is immutable, like the persona boundaries).
+  - Persona never volunteers AI/model/system identity; direct automation questions may receive only the approved one-line member-notice-aligned disclosure, with no model/vendor/system-prompt details and no privileged action.
   - The bot never talks to an empty room or to itself: proactive behavior is gated by community lifecycle phase, and consecutive bot messages are capped.
   - Retrieved content AND member-derived text (usernames, display names, quoted/replyTo text) are DATA, never instructions: neither can change identity, boundaries, or trigger an action (indirect-injection + untrusted-input defense).
+  - LLM outputs are advisory typed data only. Deterministic policy wrappers own all authority: event emission, adapter calls, config/db mutation, autonomy decisions, and approval creation never come directly from model text.
   - LLM spend is hard-bounded per workspace/day; over budget trips to read-only, never unbounded. The breaker bounds GENERATIVE output only — moderation/safety (incl. media vision) and receive never stop, so budget pressure can never loosen the black floor.
   - The bot never re-replies to an already-handled message across crashes (idempotent by correlationId/dedupeKey via the outbox); stale triggers are dropped; a mid-flight crash neither double-sends nor silently loses a send.
   - A message from a channel bound to NO workspace is dropped at the router: no moderation, no LLM call, no DB write, zero spend. The bot operates only in configured channels.
+  - Config identity is unambiguous at load/reload: workspace ids, source ids, owner control sender, and (platform, channel_id) bindings are unique; content source references must resolve; reserved `__system__` cannot be configured as a workspace.
   - The black-tier floor applies to MEDIA, not just text: a best-effort vision classifier removes+bans on detectable black-tier images/video; flagged media bytes are never persisted. (CSAM is escalated to the owner for platform report, not claimed as auto-detected.)
   - An edited message is re-moderated (an edit into black/spam is caught) and never triggers a reply.
   - Every send — reactive reply or proactive/DM/notice — goes through the one send_queue + idempotent outbox; no module calls the platform adapter directly.
@@ -343,6 +346,7 @@ invariants:
   - Moderation FAILS CLOSED: if the text/vision classifier errors, times out, or returns unparseable output, the message is held/treated as a violation candidate, never silently passed as clean. Budget/cap pressure can degrade availability but can never silently open the black floor.
   - Every reply-pipeline correlationId is tracked by an in-flight supervisor with a deadline; a draft that neither emits its next event nor aborts (a hang, not a throw) is force-aborted and surfaced, never silently lost.
   - Mute and ban are owner-confirmed (L1) because they are socially/punitively high-impact even though the CONTROL BOT executes them; only low-risk delete-spam is policy-auto (L2).
+  - Approval timeouts are per-type and deterministic: every pending item has an explicit safe default, applied idempotently at proposal.ttl; no approval type may silently default to approve.
 
 # Automated quality gates. CI runs these; a change is not "done" until green.
 # These turn the invariants above into executable checks (the AGENTS.md "gates").
@@ -380,6 +384,13 @@ quality_gates:
         workspaceId is allowed and a non-empty one is required on everything they cause
         downstream. Test feeds malformed payloads and asserts rejection, and asserts a
         non-exception event with empty workspaceId is rejected.
+    - id: config_uniqueness
+      enforces: config-identity
+      check: >-
+        Config loader fixtures with duplicate workspace.id, duplicate source.id,
+        duplicate (platform, channel_id), missing content_sources references, bad id
+        charset, missing owner user_id, or configured `__system__` workspace all fail
+        fast on startup and fail reload while preserving the prior good config.
     - id: content_isolation
       enforces: content_isolation
       check: >-
@@ -404,6 +415,13 @@ quality_gates:
         In seed phase the bot only broadcasts (no reactive chat, no polls); a poll below
         min_participants_for_poll is refused; consecutive bot messages never exceed
         max_consecutive_bot_messages without an intervening human message.
+    - id: persona_transparency_boundary
+      enforces: persona-boundary
+      check: >-
+        Fixture ordinary replies contain no "作为AI" / "我是语言模型" / model-vendor-system
+        leakage. A direct automation question returns only the approved one-line
+        member-notice-aligned disclosure, without technical detail, markdown, or any
+        privileged action.
     - id: command_conversation_separation
       enforces: action-provenance
       check: >-
@@ -501,6 +519,13 @@ quality_gates:
       check: >-
         With channel_state.paused_until in the future, no proactive or reactive message is emitted
         (RoomRead.posture == stay_silent); /quiet stops proactive while moderation still acts.
+    - id: approval_safe_defaults
+      enforces: approval-safe-defaults
+      check: >-
+        Each approval item type has an explicit safe default in spec/modules.yaml and in
+        the implementation table. Expiry applies it exactly once across restarts; punitive,
+        cost-bearing, cross-promo, and lead-DM items reject; evolution tuning holds;
+        onboarding confirm cancels; no type can default approve.
     - id: unbound_channel_drop
       enforces: unbound-channel
       check: >-
@@ -515,6 +540,14 @@ quality_gates:
         is fed through a reply; assert identity + boundaries unchanged and no action triggered, and that
         the assembled prompt delimits + labels all member-derived strings untrusted, below persona/boundaries.
         (Companion to indirect_injection, which covers retrieved chunks.)
+    - id: llm_output_isolation
+      enforces: llm-advisory-only
+      check: >-
+        Static check and unit fixtures prove LLM output handlers return typed advisory data
+        only. Model-output parsing code cannot import EventBus.emit, PlatformAdapter send/admin
+        methods, config writers, raw db mutators, or autonomy setters except through the
+        deterministic policy wrappers that own those decisions. Malformed model JSON fails
+        closed and emits no authority-bearing event.
     - id: media_black_floor
       enforces: media-floor
       check: >-
@@ -573,17 +606,17 @@ quality_gates:
   # the authoritative capability checklist + evidence that `just verify-step N` enforces.
   # If the two ever diverge, acceptance.yaml wins and this summary must be updated.
   per_step:   # the gate that proves each build_order step is independently done
-    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + hot-reload swaps a workspace; lifecycle callable; declared_events_only + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
+    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + config_uniqueness + hot-reload swaps a workspace; lifecycle callable; declared_events_only + llm_output_isolation + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
     - { step: 2, gate: "Round-trip across BOTH adapters: inbound on the userbot (real test USER account or mock) -> message.received (ONLY from userbot) with DETERMINISTIC correlationId from platform_message_id (idempotent_delivery green); a reply goes out via the userbot under account_survival (FLOOD_WAIT honored, per-account ceiling, warm-up; account_survival green); a moderation.violation executes via the CONTROL BOT; an owner DM goes via the control bot with inline buttons; outbound routes by audience + message.received single-source (dual_identity_routing green); an edit arrives as isEdit=true; verifyAccess per adapter (userbot_access green, no privacy-mode)." }
     - { step: 3, gate: "content_isolation + indirect_injection + untrusted_input green; ctx.knowledge is the only retrieval path; unbound-source query returns zero rows; unbound_channel_drop green; incremental sync dedups by content_hash; a low-score query emits content_gap.detected." }
-    - { step: 4, gate: "reply.ready -> reply.generated: no markdown / no enumerations / no AI-leak; coherent with the Context Manager window; pipeline_failure_abort green (a seeded Persona error aborts, never half-sends); pipeline_watchdog green (a seeded hang is force-aborted, not lost)." }
+    - { step: 4, gate: "reply.ready -> reply.generated: no markdown / no enumerations / persona_transparency_boundary green; coherent with the Context Manager window; pipeline_failure_abort green (a seeded Persona error aborts, never half-sends); pipeline_watchdog green (a seeded hang is force-aborted, not lost)." }
     - { step: 5, gate: "Spam/flood -> auto delete-spam (executed by control bot) + mute proposed; black-tier (text AND media) -> delete (auto, control bot) + ban (owner-confirmed L1, control bot) + escalate; gray-tier under permissive -> untouched; clean -> message.clean; ALL admin actions executed by the control bot, never the userbot (dual_identity_routing green); all silent; classifier error/timeout -> fail CLOSED (moderation_failclosed green); hard_floor_immutable + media_black_floor + edited_remoderation green." }
     - { step: 6, gate: "Intent fixtures classify deterministically; command_conversation_separation green (member commands -> silent, logged); cost pre-filter skips the LLM on obvious cases; per-user mention-flood cap holds; reply_probability + active_hours is the SINGLE reactive-reply decision point." }
-    - { step: 7, gate: "Approval round-trips on the CONTROL BOT (inline ✅/❌/📝 buttons + callback, matched to item; only owner user_id accepted; a member messaging the control bot does nothing); mute/ban L1 proposals approved here execute via the control bot; owner_pause_overrides green (/pause silences all, /quiet stops proactive only, owner DMs still delivered via control bot); /status + digest delivered via outbound→control bot; member notice posted by userbot; no_self_escalation green; retention sweep + /forget full-purge run (retention_and_erasure green)." }
+    - { step: 7, gate: "Approval round-trips on the CONTROL BOT (inline ✅/❌/📝 buttons + callback, matched to item; only owner user_id accepted; a member messaging the control bot does nothing); approval_safe_defaults green; mute/ban L1 proposals approved here execute via the control bot; owner_pause_overrides green (/pause silences all, /quiet stops proactive only, owner DMs still delivered via control bot); /status + digest delivered via outbound→control bot; member notice posted by userbot; no_self_escalation green; retention sweep + /forget full-purge run (retention_and_erasure green)." }
     - { step: 8, gate: "Marketing limits survive restart; cold_start_no_cringe green; atmosphere cold-trigger fires once per cooldown and sends via outbound.requested (suppressed under stay_silent); evolution keeps ONE active experiment per dimension (Thompson-allocated Beta posteriors), promotes a challenger ONLY when P(challenger>champion)>=promote_prob AND min_exposure met AND no guardrail regressed (peek-safe), queues underpowered arms, and auto-rolls-back a seeded regression." }
     - { step: 9, gate: "With CrossPromotion unregistered, reply.enriched passes through to reply.ready unchanged (pipeline_passthrough)." }
     - { step: 10, gate: "relationship memory: recall weaves a prior topic naturally; retention_and_erasure green (opt-out + /forget erase; opted-out recall returns null)." }
     - { step: 11, gate: "repeated unanswered question increments content_gaps.asked_count and surfaces in the digest; stored question carries no asker identity." }
     - { step: 12, gate: "a high-intent signal emits lead.identified -> owner approval required before any DM (governance autonomy L1); no DM without approval." }
     - { step: 13, gate: "an experiment on dimension != style (timing/activity/marketing_angle) runs through the SAME champion/challenger gate + rollback." }
-    - { step: 14, gate: "onboarding wizard interviews the owner via DM and emits a valid persona + sources config that passes the Zod schema." }
+    - { step: 14, gate: "onboarding wizard interviews the owner via DM, emits a valid persona + sources config that passes the Zod schema, shows a diff, and writes atomically only after owner confirm." }

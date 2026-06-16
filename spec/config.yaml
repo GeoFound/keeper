@@ -196,7 +196,10 @@ config_files:
             # feature flag user_memory controls collection; this section is parameters only.
             retention_days: 180
             opt_out_keyword: "不要记住我"      # stops relationship memory only (raw messages still age out)
-        funnel: {}                            # feature flag funnel controls this module; parameters only.
+        funnel:                               # feature flag funnel controls this module; parameters only.
+          require_explicit_interest: true     # repeated engagement alone is not enough to propose a DM
+          per_user_cooldown_days: 30          # rejection/no-response/complaint/prior DM suppresses repeats
+          max_pending_per_workspace: 5        # bounded queue; no unbounded lead backlog
         content_gap:
           min_score: 0.55                     # RAG top-score below this -> log an unanswered gap
         digest: {}                            # feature flag digest controls owner daily digest (bot.yaml scheduler.digest_cron)
@@ -221,7 +224,17 @@ config_loading:
     - moderation.hard_block.enabled = false (the black floor is non-negotiable)
     - moderation.media.vision_classifier != "best_effort" (media black floor may not be disabled; if vision is unavailable at runtime, media fails closed/held)
     - nested module `enabled` booleans under marketing/activities/atmosphere/evolution/content_gap/digest/funnel/user_memory/cross_promotion (workspace.features is the single feature switch)
+    - duplicate workspace.id, duplicate source.id, or duplicate (platform, channel_id) bindings across workspaces
+    - ids outside the approved charset: workspace/source ids must match ^[a-z0-9][a-z0-9_-]{1,63}$; channel_id is a non-empty platform string, not a workspace id
+    - any workspace.content_sources reference to a missing source.id, or any workspace/channel trying to use reserved workspaceId `__system__`
+    - missing or non-numeric owner.approval_channel.user_id; there is exactly one owner control-plane sender unless a future delegated-principal spec adds more
     - any governance.autonomy raised at runtime, or a delegated principal added by anything but owner-authored config at load (no_self_escalation)
+  identity_and_uniqueness: >-
+    The loader builds one canonical binding map before any module starts:
+    workspaceId -> workspace, sourceId -> source, and (platform, channel_id) -> exactly
+    one workspace. Ambiguity is a hard startup/reload failure, not a best-effort choice.
+    This prevents cross-workspace content leaks, double processing, and wrong-owner
+    approvals before implementation code has a chance to drift.
   hot_reload: >-
     config/** is watched; an edited workspace/source/persona is re-validated and swapped
     WITHOUT a restart (a long-lived bot must not drop its connection to pick up a tweak).

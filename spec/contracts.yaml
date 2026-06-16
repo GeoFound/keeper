@@ -86,6 +86,33 @@ governance:
     evolution can never touch governance — it is immutable like the persona
     boundaries. A group member is never a principal at any level.
 
+# LLM output isolation — models produce advisory data, never authority.
+llm_output_isolation:
+  rule: >-
+    An LLM call may return only typed advisory output. It never directly emits bus
+    events, calls a platform adapter, mutates config/db, chooses autonomy, or decides
+    that a privileged action is authorized. Every LLM result is parsed through a
+    schema and then handed to a deterministic policy wrapper that owns the authority
+    boundary (e.g. moderation policy, intent policy, persona post-processor,
+    approval proposal builder).
+  allowed_outputs:
+    - reply text draft or style variant candidate
+    - moderation/intent classification with confidence and evidence spans
+    - retrieval summary or source-grounded answer draft
+    - owner-facing proposal text for an approval item
+    - bounded evolution insight tagged with sample_count + confidence
+  forbidden_outputs:
+    - bus event names to emit or adapter methods to call
+    - config patches, autonomy changes, delegated principals, or workspace bindings
+    - executable code, shell commands, SQL, or raw database mutations
+    - final delete/mute/ban/DM authority without the deterministic policy wrapper
+  enforcement: >-
+    The LLMGateway returns `unknown`/typed JSON only; parse errors fail closed. Module
+    code must convert parsed output through local policy functions before it can emit an
+    event. Static checks reject imports or helper calls that let model-output handlers
+    access EventBus.emit, PlatformAdapter send/admin methods, config writers, or raw db
+    mutation outside their policy wrapper.
+
 # Content isolation rule. Enforced at RAG query time via source_id filter.
 content_isolation:
   rule: RAG retrieval MUST filter by the workspace's bound source_ids only.

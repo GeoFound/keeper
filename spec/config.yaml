@@ -1,0 +1,307 @@
+# =============================================================================
+# CONFIG — the human decision surface (the only files humans routinely edit)
+# plus the target project structure. Config schemas validated with Zod at load.
+# =============================================================================
+
+config_files:
+  config/bot.yaml: |
+    owner:
+      approval_channel:
+        platform: "telegram"
+        via: "control_bot"          # the owner DMs the CONTROL BOT (you cannot DM your own userbot account)
+        user_id: 123456789          # the owner's Telegram user_id — the ONLY accepted control-plane sender
+    llm:
+      providers:
+        default:
+          base_url: "https://openrouter.ai/api/v1"
+          api_key_env: "LLM_API_KEY"
+      models:
+        chat: "google/gemini-2.5-flash"
+        classifier: "google/gemini-2.0-flash-lite"
+        embedding: "openai/text-embedding-3-small"
+        reflection: "google/gemini-2.5-flash"
+        moderation_vision: "google/gemini-2.5-flash"   # multimodal; best-effort black-tier media (SAFETY, not gated by the breaker)
+      budget:                       # cost circuit breaker (operations.cost_circuit_breaker)
+        daily_usd_per_workspace: 2.0
+        on_exceed: "read_only"      # GENERATIVE output only; moderation/receive/safety stay on; DM owner
+        ingest_daily_usd: 1.0       # separate bound for embedding/sync so a big first sync can't starve chat
+        media_scan_daily_cap: 200   # max vision moderation calls/day/workspace; over cap -> hold ALL unscanned media (fail-safe)
+    delivery:                       # send_queue + idempotency (operations) — covers replies AND outbound.requested
+      per_channel_rate_per_min: 8   # CONSERVATIVE: this is a USERBOT on a real account, not a Bot API bot
+      backoff: "exponential"        # honor MTProto FLOOD_WAIT in full (never retry early)
+      reply_max_staleness_seconds: 600   # drop replies to messages older than this (pipeline-wide)
+      pipeline_stage_timeout_seconds: 30 # a stage exceeding this aborts the reply (events failure_policy)
+      pipeline_inflight_deadline_seconds: 45 # in-flight supervisor force-aborts a draft that neither emits nor throws (overview pipeline_watchdog)
+      outbox_prune_after_days: 3    # prune terminal outbox rows older than max_staleness + margin (idempotent_delivery.outbox_pruning)
+    account_survival:               # anti-ban floor (overview operations.account_survival) — posture: MOST CONSERVATIVE
+      account_global_per_min: 12    # hard ceiling on sends across ALL channels+DMs combined (account-wide flood is stricter than per-channel)
+      account_global_per_day: 800   # hard daily account-wide send ceiling
+      dm_per_day: 15                # DMs are the highest ban risk on a user account — keep low, never bulk
+      warmup_days: 7                # newly-configured account ramps volume up over this window
+      warmup_start_fraction: 0.2    # day-1 cap = this fraction of the full ceiling, linearly to 1.0 by warmup_days
+      flood_wait_retreat_threshold: 3   # this many FLOOD_WAITs within the window -> RETREAT
+      flood_wait_window_minutes: 30
+      retreat_cooldown_minutes: 120 # RETREAT duration: proactive off, reactive throttled/paused; folds into posture==stay_silent
+      session_string_env: "TELEGRAM_SESSION_STRING"  # full-account credential — top-tier secret, dev-secret only
+    scheduler:                      # node-cron; missed ticks catch up once on restart.
+      # CRONS ARE EVALUATED PER WORKSPACE in that workspace's persona.timezone (NOT
+      # server-local) — see modules.yaml Scheduler note. sync_cron is the exception
+      # (per-source, no human-facing local time).
+      reflection_cron: "0 4 * * *"  # daily 04:00 (workspace-local)
+      sync_cron: "*/30 * * * *"
+      digest_cron: "0 9 * * *"      # owner daily digest 09:00 (workspace-local)
+      retention_sweep_cron: "0 3 * * *"
+      activity_cron: "0 12 * * *"   # periodic-activity planning tick (topic_day/quiz); emits activity.due (workspace-local)
+    platforms:
+      telegram:
+        # TWO identities (overview operations.dual_identity).
+        userbot:                                     # COMMUNITY face — owner's user account (MTProto/GramJS)
+          api_id_env: "TELEGRAM_API_ID"              # from my.telegram.org
+          api_hash_env: "TELEGRAM_API_HASH"
+          session_string_env: "TELEGRAM_SESSION_STRING"  # full-account credential — top-tier secret (dev-secret)
+        control_bot:                                 # CONTROL plane + MOD executor — Bot API bot (group admin)
+          token_env: "TELEGRAM_CONTROL_BOT_TOKEN"    # from @BotFather; must be promoted to admin in each channel
+    observability:                  # full-flow visibility (operations.observability) — built from step 1
+      journal_enabled: true         # the bus middleware writes one redacted event_journal row per emission
+      journal_retention_days: 14    # event_journal pruned past this by retention.sweep_due (privacy + size bound)
+      journal_sampling: {}          # optional per-event-name down-sampling for high-volume/low-value types; default {} = FULL capture (per-correlationId fidelity always preserved)
+      log_dir: "./data/logs"        # newline-JSON structured logs (correlationId/workspaceId/module on every line), tail/grep-able
+      log_level: "info"             # info | warn | error
+      redact: true                  # MUST stay true: never journal/log the session string, bot token, api keys, or flagged-media bytes (gate: journal_no_secrets)
+      payload_digest_max_chars: 2000  # size cap on the journaled payload summary
+    database:
+      path: "./data/bot.db"
+    vector_store:
+      provider: "sqlite-vec"      # shares bot.db; no extra process. alt: "chroma"
+      # table lives inside the SQLite database; no separate path needed for sqlite-vec.
+      path: "./data/bot.db"
+
+  config/sources.yaml: |
+    sources:
+      - id: "ai-site-main"
+        name: "AI 主站"
+        adapter: "api"
+        endpoint: "https://mysite.com/api/content-feed"
+        auth: { type: "bearer", token_env: "SITE_MAIN_TOKEN" }
+        sync: { interval_minutes: 30 }
+      - id: "local-docs"
+        name: "本地文档"
+        adapter: "file"
+        path: "./data/knowledge/general"
+        sync: { interval_minutes: 5, watch: true }
+
+  config/workspaces.yaml: |
+    workspaces:
+      - id: "ws-ai-community"
+        name: "AI 交流社区"
+        channels:
+          - { platform: "telegram", channel_id: "-1001234567890", role: "owner" }
+        content_sources: ["ai-site-main", "local-docs"]
+        features:
+          moderation: true
+          persona: true
+          marketing: true
+          activities: true
+          atmosphere: true
+          evolution: true
+          cross_promotion: false
+          user_memory: false
+          funnel: false
+          content_gap: true
+          digest: true
+          analytics: false
+          sentiment_analysis: false
+          auto_faq: false
+        persona:
+          name: "展展"
+          identity: "owner"
+          active_hours: "09:00-01:00"        # may cross midnight; parser handles wrap-around
+          timezone: "Asia/Tokyo"             # also the timezone all scheduled jobs fire in for this workspace
+          reply_probability: 0.7
+          min_delay_seconds: 30
+          max_delay_seconds: 300
+          reply_rate:                        # mention-flood guard (modules.yaml intent_router)
+            per_user_max: 5                  # max reactive replies to one sender within the window
+            window_minutes: 10               # beyond this, further @mentions get no reply (silent)
+        marketing:
+          max_mentions_per_day: 3
+          min_gap_hours: 2
+          style: "recommendation"
+        activities:
+          auto_topics: true
+          auto_polls: true
+          require_approval: ["giveaway", "contest", "any_with_cost"]
+        atmosphere:
+          cold_threshold_hours: 4
+          max_proactive_per_day: 3
+          quiet_hours: "01:00-09:00"
+          lifecycle:                          # cold-start gating (see modules.yaml community_lifecycle)
+            seed_max_members: 10              # <= this & near-zero activity -> seed (broadcast only)
+            spark_min_active_24h: 1           # first humans -> spark (warm 1:1)
+            grow_min_active_24h: 5            # enough activity -> normal operations
+            min_participants_for_poll: 8      # below this: no polls/quizzes (they look dead)
+            max_consecutive_bot_messages: 2   # never talk to itself beyond this
+        evolution:
+          reflection_interval_hours: 72
+          contribute_to_shared: true
+          use_shared_insights: true
+          auto_tune: false              # false = owner approves each STYLE variant before it experiments
+          # --- Bayesian/bandit engine (see modules.yaml evolution.experiment) ---
+          challenger_ratio_floor: 0.05  # Thompson allocation clamp: min challenger share (never starves)
+          challenger_ratio_cap: 0.5     # ...and max, so champion serves the majority early
+          min_exposure: 30              # min challenger replies before a promotion can fire
+          promote_prob: 0.95            # promote when P(challenger>champion) >= this (peek-safe, valid at any n)
+          attribution_window_minutes: 30  # window for the primary 'engaged' metric
+          guardrail_tolerance: 0.02     # a challenger worse than champion on any guardrail by > this is vetoed
+          rollback_watch_hours: 72      # auto-revert window after a promotion (posterior-monitored)
+          # --- shared-insight write gate (knowledge.yaml shared_intelligence) ---
+          shared_min_confidence: 0.8    # only insights at/above this confidence are written to shared_insights
+          shared_min_samples: 50        # ...and with at least this many samples (methodology shared, content never)
+        moderation:
+          anti_spam: true
+          welcome_new_members: true
+          new_user_link_delay_minutes: 10
+          new_user_media_delay_minutes: 10    # new users cannot post media for first N min (media abuse fail-safe)
+          flood_limit: 5
+          spam_keywords: ["代购", "刷单"]       # spam axis only (NOT "sensitive content")
+          gray_zone_tolerance: "permissive"   # permissive(default) | moderate | strict — taste, NOT the floor
+          hard_block:                         # the BLACK floor — illegal/harmful, non-negotiable
+            enabled: true                     # MUST stay true; loader rejects false. Legal + platform-ToS floor.
+            on_hit: "delete_now+escalate_ban+notify_owner"   # delete auto (L2); ban proposed to owner (L1, executed by control bot after approval)
+          media:                              # black floor applies to images/video too (modules.yaml media_policy)
+            vision_classifier: "best_effort"  # best_effort only — SAFETY, not gated by the breaker; schema rejects off
+            # CSAM is NOT claimed as auto-detected: flagged media is deleted, never stored, and escalated to the owner to report.
+        governance:                           # control plane — members can NEVER command the bot
+          on_command_attempt: "silent"        # MALICIOUS (action req / injection): silent(default) | natural_deflection. NEVER an AI-revealing apology.
+          on_out_of_scope: "deflect"          # BENIGN off-limits question (real customer asking refund/support): deflect(default, one human deflection) | silent
+          delegated_principals: []            # empty = only the owner. Ramp later, by user_id, never a whole group.
+          autonomy:                           # axis B — owner ramps each capability up over time
+            # CONTROL BOT NOTE: mute/ban are executed by the group-admin control bot and are
+            # higher social/punitive cost, so they default to owner-confirm (L1). Only
+            # low-risk delete-spam stays policy-auto (L2). (Owner decision.)
+            delete_message:      "L2_policy_auto"   # delete spam/black-tier media automatically (low risk)
+            mute_user:           "L1_propose"       # owner confirms each mute
+            ban_user:            "L1_propose"       # owner confirms each ban
+            post_link:           "L2_policy_auto"   # bounded by marketing limits
+            run_activity:        "L2_policy_auto"   # low-risk auto; giveaway/cost -> L1 via activities.require_approval
+            send_direct_message: "L1_propose"       # DM funnel — owner approves each DM
+            generate_media:      "L0_forbidden"
+            refund_or_payment:   "L0_forbidden"     # also an immutable persona boundary
+        privacy:                              # operations.retention + right-to-delete
+          message_retention_days: 90
+          member_notice:                      # disclosure that gives retention a transparent basis
+            enabled: true                     # post a one-time + pinned notice (assistant operates here, retention, how to opt out)
+          forget_purges_raw: true             # owner /forget purges/anonymizes user-scoped raw records (full erasure); opt-out keyword does not
+          user_memory:
+            # feature flag user_memory controls collection; this section is parameters only.
+            retention_days: 180
+            opt_out_keyword: "不要记住我"      # stops relationship memory only (raw messages still age out)
+        funnel: {}                            # feature flag funnel controls this module; parameters only.
+        content_gap:
+          min_score: 0.55                     # RAG top-score below this -> log an unanswered gap
+        digest: {}                            # feature flag digest controls owner daily digest (bot.yaml scheduler.digest_cron)
+        ignore_topics: ["退款", "refund", "付款问题"]
+
+  config/cross-promotion.yaml: |
+    # future
+    cross_promotion:
+      # feature flag cross_promotion controls this module; this file holds permissions/tones.
+      require_approval: true
+      permissions:
+        - { from_workspace: "ws-ai-community", to_workspace: "ws-tool-site", allowed: true, tone: "nonchalant", max_per_week: 2 }
+        - { from_workspace: "ws-tool-site", to_workspace: "ws-ai-community", allowed: true, tone: "curious", max_per_week: 1 }
+      trigger_rules:
+        min_topic_relevance: 0.8
+        require_organic_context: true
+
+# How config is loaded. Zod-validated at startup AND on change.
+config_loading:
+  validation: Every file above is parsed + Zod-validated at load; a schema failure aborts startup (fail-fast), never silently runs a partial config.
+  hard_rejections:   # loader refuses these regardless of file contents
+    - moderation.hard_block.enabled = false (the black floor is non-negotiable)
+    - moderation.media.vision_classifier != "best_effort" (media black floor may not be disabled; if vision is unavailable at runtime, media fails closed/held)
+    - nested module `enabled` booleans under marketing/activities/atmosphere/evolution/content_gap/digest/funnel/user_memory/cross_promotion (workspace.features is the single feature switch)
+    - any governance.autonomy raised at runtime, or a delegated principal added by anything but owner-authored config at load (no_self_escalation)
+  hot_reload: >-
+    config/** is watched; an edited workspace/source/persona is re-validated and swapped
+    WITHOUT a restart (a long-lived bot must not drop its connection to pick up a tweak).
+    This is also what lets the onboarding wizard's one-time bootstrap write go live
+    immediately (modules.yaml onboarding_wizard.config_write_exception). A reload that
+    fails validation is rejected and the previous good config stays live.
+
+# Target project structure. AI scaffolds against this tree.
+project_structure: |
+  telegram/
+  ├── AGENTS.md                            # AI entry pointer
+  ├── justfile                             # command contract: setup|dev|check|test
+  ├── spec/                                # engineering source of truth (this set)
+  │   ├── overview.yaml
+  │   ├── contracts.yaml
+  │   ├── events.yaml
+  │   ├── modules.yaml
+  │   ├── knowledge.yaml
+  │   ├── data-model.yaml
+  │   ├── config.yaml
+  │   ├── acceptance.yaml
+  │   └── production_readiness.yaml
+  ├── assets/                              # freeform content assets
+  │   ├── persona-system-prompt.txt
+  │   ├── member-notice.txt                # privacy disclosure posted by Welcome (kind:'notice')
+  │   └── cross-promotion-tones.yaml
+  ├── config/
+  │   ├── bot.yaml
+  │   ├── sources.yaml
+  │   ├── workspaces.yaml
+  │   └── cross-promotion.yaml             # future
+  ├── src/
+  │   ├── index.ts
+  │   ├── engine/
+  │   │   ├── engine.ts                     # module registration + lifecycle
+  │   │   ├── event-bus.ts                  # typed event bus
+  │   │   ├── module.ts                     # Module interface
+  │   │   ├── pipeline.ts                   # reply-pipeline in-flight supervisor + absent-stage bridge (events.yaml reply_pipeline)
+  │   │   └── events.ts                     # event type definitions
+  │   ├── platforms/
+  │   │   ├── adapter.ts                    # PlatformAdapter interface
+  │   │   ├── types.ts                      # UnifiedMessage etc.
+  │   │   ├── outbound-router.ts            # routes outbound.requested by `via` (userbot/control)
+  │   │   └── telegram/
+  │   │       ├── userbot-adapter.ts        # MTProto/GramJS — community face, sole inbound source
+  │   │       ├── control-adapter.ts        # Bot API/grammY — mod executor + owner control plane (buttons)
+  │   │       ├── account-survival.ts       # FLOOD_WAIT / ceiling / warm-up / retreat (userbot)
+  │   │       └── utils.ts
+  │   ├── modules/
+  │   │   ├── workspace/router.ts
+  │   │   ├── moderation/{module,anti-spam,content-filter,flood-control,welcome}.ts
+  │   │   ├── intent/{module,classifier,rules}.ts
+  │   │   ├── persona/{module,engine,prompts,post-process}.ts
+  │   │   ├── marketing/{module,engine,content-picker}.ts
+  │   │   ├── activity/{module,planner,executor,templates}.ts
+  │   │   ├── atmosphere/{module,monitor,initiator}.ts
+  │   │   ├── evolution/{module,tracker,reflector,style-memory,strategy-memory}.ts
+  │   │   ├── onboarding/wizard.ts          # /setup interview -> bootstrap config (consumes onboarding.input)
+  │   │   └── cross-promotion/{module,matcher,tone-controller}.ts   # future
+  │   ├── knowledge/
+  │   │   ├── rag.ts
+  │   │   ├── embeddings.ts
+  │   │   ├── vector-store.ts
+  │   │   ├── sync-pipeline.ts
+  │   │   └── adapters/{base,api,rss,file,database}.ts
+  │   ├── services/
+  │   │   ├── llm-gateway.ts
+  │   │   ├── database.ts
+  │   │   ├── approval.ts
+  │   │   ├── styling.ts                    # StyleService read-model: STYLE-arm assignment (ctx.styling)
+  │   │   ├── observability.ts              # journal middleware (writes event_journal) + redaction + structured logger + trace/tail/inspect query API
+  │   │   └── scheduler.ts
+  │   ├── cli/
+  │   │   └── observe.ts                    # `just trace|tail|inspect|journal` -> reads event_journal (human-readable render)
+  │   ├── config/{loader,schema,types}.ts
+  │   └── utils/{delay,humanize,logger}.ts
+  ├── data/
+  │   ├── knowledge/{ws-ai-community,ws-tool-site}/
+  │   ├── bot.db                           # relational + sqlite-vec vectors in one file
+  │   └── logs/                            # (data/vector/ only if provider switched to chroma)
+  ├── .env.example
+  ├── package.json
+  └── tsconfig.json

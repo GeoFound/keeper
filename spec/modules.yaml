@@ -1,0 +1,709 @@
+# =============================================================================
+# MODULES — per-module behavior specs + feature flags.
+# Each module consumes ONLY its declared events and emits ONLY its declared
+# events. Independently evolvable; never edit another module to extend behavior.
+# =============================================================================
+
+modules:
+  workspace_router:
+    subscribes: [message.received]
+    publishes: [message.routed, outbound.requested]
+    role: Resolve channel -> workspace + allowed content sources.
+    unbound_channel:   # anyone can add a Telegram bot to an arbitrary group — guard the front door
+      rule: >-
+        If channelId resolves to NO configured workspace, the message is DROPPED at
+        the router: no message.routed, no moderation, no LLM call, no DB write, ZERO
+        spend. An unbound channel can never consume budget, retrieve content, or
+        trigger any action. The bot only ever operates in explicitly configured
+        channels (action provenance starts at configuration).
+      owner_notice: >-
+        The FIRST time the userbot is added to / sees an unknown channel it notifies the
+        owner once ("added to <chat>; not configured — ignoring") via
+        outbound.requested(kind:'notice', via:'control', workspaceId:'__system__', deduped
+        per channel) — i.e. through the CONTROL BOT (owner-facing), so the owner can
+        configure or remove it. `__system__` is a reserved non-workspace scope and cannot
+        retrieve content, spend LLM budget, or receive member data.
+      no_auto_leave: >-
+        The bot does NOT auto-leave (it may be mid-onboarding before its workspace
+        row is written); it simply stays inert until configured. To remove it the
+        owner kicks the bot from the group on the platform — leaving is never an
+        automatic in-bot action.
+
+  moderation:
+    subscribes: [message.routed]
+    publishes: [moderation.violation, moderation.escalated, message.clean]
+    note: >-
+      All admin actions are SILENT. Unsupported platform capabilities auto-degrade.
+      Moderation is SAFETY infrastructure: it runs even when the cost circuit breaker
+      has tripped the workspace to read-only (the breaker bounds GENERATIVE output,
+      never moderation — see overview operations).
+    fail_closed: >-
+      Moderation FAILS CLOSED. If the text classifier or the media vision classifier
+      errors, times out, returns unparseable output, or is unavailable (e.g. media_scan
+      cap hit), the message is HELD (not delivered to message.clean) or treated as a
+      violation candidate — NEVER passed through as clean. Budget/cap pressure may slow
+      or queue moderation but can never silently open the black floor. (Gate:
+      moderation_failclosed.) Use structured/JSON-schema output and treat a parse failure
+      as classifier failure.
+    action_provenance_and_autonomy: >-
+      ALL moderation actions are EXECUTED BY THE CONTROL BOT (the group-admin identity),
+      never the userbot (the owner's personal account performs no admin action — see
+      overview dual_identity). delete (spam + black-tier text/media) is L2 policy-auto:
+      Moderation emits moderation.violation(delete) which the CONTROL BOT executes
+      immediately. mute/ban are L1: Moderation emits moderation.escalated carrying the
+      proposed action to the Approval Service, which presents it to the owner on the
+      control bot (✅ -> moderation.violation(mute|ban) executed by the control bot, ❌/ttl
+      -> drop). Black-tier escalation doubles as the ban approval item. delete_spam needs
+      no approval. The userbot has no admin capability to invoke here.
+    edited_messages:   # an edit can turn a clean message into a violation after the fact
+      rule: >-
+        message.routed carrying UnifiedMessage.isEdit=true is RE-MODERATED with the
+        full tier checks. An edit into black/spam -> moderation.violation just like a
+        fresh post; an edit that becomes clean -> message.clean (Context Manager
+        updates the turn; Intent Router never re-replies to an edit — see events
+        edited_message_handling). Without this, edit-after-approval is a trivial bypass.
+    # Content policy is TIERED — the human world is messy; we tolerate gray, we do
+    # not moderate taste. Only a hard, non-negotiable floor is blocked.
+    content_policy:
+      tiers:
+        - tier: black            # HARD FLOOR — illegal / genuinely harmful / anti-human
+          examples: [child sexual content, real gore / graphic violence, terrorism, weapons & drug trade, human trafficking, scams & fraud, doxxing / 开盒, incitement to harm others]
+          action: "delete NOW (auto) + escalate ban to owner (L1) + notify"   # moderation.violation(delete) immediately; moderation.escalated proposes the ban; owner ✅ -> moderation.violation(ban)
+          tunable: false        # config and evolution can NEVER loosen this. Legal + platform-ToS floor.
+          note: "This tier is immutable, like the persona boundaries. The DETECTION + delete floor is non-negotiable; only the ban step waits on owner confirm (userbot L1) — the harmful content is already removed."
+        - tier: gray             # TOLERATED — legal but distasteful / edgy / controversial
+          examples: [profanity, edgy or dark humor, politics, NSFW-adjacent talk, strong opinions, venting, controversial takes]
+          action: "do nothing — never delete. Bot may match the register (see persona) but never crosses black."
+          tunable: true         # per-workspace gray_zone_tolerance: permissive (default) | moderate | strict
+          default: permissive
+        - tier: spam             # orthogonal axis — handled regardless of tolerance
+          examples: [ad links, repeated messages, bulk joins, scam links]
+          action: "silent delete NOW (auto, L2) + propose mute to owner (L1)"   # delete removes the spam immediately; mute waits on owner ✅
+    # MEDIA (image/video/file) moderation — the black floor must apply to pictures,
+    # not just text, because the legally-critical categories (CSAM, gore, terror) are
+    # visual. Text-only moderation would leave the most dangerous gap open.
+    media_policy:
+      detect:
+        vision_classifier: best_effort   # multimodal classifier over fetched media; runs as SAFETY (not gated by the generative breaker), but is itself budget-aware: see media_budget
+        scope: "detectable black-tier — explicit sexual content, gore/graphic violence, terror/weapons. On a hit -> delete + ban + moderation.escalated (same as text black-tier)."
+      csam:
+        rule: >-
+          A best-effort LLM classifier is NOT a reliable or lawful CSAM detector
+          (the industry uses perceptual-hash matching against databases this bot
+          will not have access to). The bot therefore does NOT claim to detect CSAM.
+          What it DOES: never re-hosts/persists flagged media (never_store_flagged_media),
+          deletes + bans on any black-tier vision hit, and escalates to the owner so
+          a human can report to the platform. CSAM handling = platform + owner report.
+      new_user_media_delay: "untrusted/new users cannot post media for the first N minutes (config moderation.new_user_media_delay_minutes), mirroring new_user_link_delay — most drive-by image abuse comes from fresh accounts."
+      never_store_flagged_media: "media that trips the black-tier vision classifier is deleted and its bytes are NEVER written to disk/db; only a tier+reason audit row is kept (no media payload)."
+      media_budget: "vision calls are counted in llm_usage(purpose=moderation_vision). If a per-day media_scan cap is hit, ALL further unscanned media (new AND established users) is held/blocked (fail-safe) rather than scanned — safety never silently degrades to allow."
+    rules:
+      - { feature: anti_spam,            behavior: "ad links / repeated messages / bulk joins -> silent delete NOW (auto); mute proposed to owner (L1)" }
+      - { feature: hard_block,           behavior: "black-tier hit (text OR media) -> silent delete NOW (auto) + DM owner (moderation.escalated) proposing the ban (L1). Detection+delete NOT tunable; ban awaits owner ✅." }
+      - { feature: flood_control,        behavior: "many messages in short window -> temporary mute proposed to owner (L1); the flood itself is also rate-limited by ignoring further triggers" }
+      - { feature: new_user_link_delay,  behavior: new users cannot post links for first N minutes }
+      - { feature: new_user_media_delay, behavior: new users cannot post media for first N minutes (media abuse fail-safe) }
+      - { feature: audit_log,            behavior: "every action writes a moderation_actions row (tier+reason, no media bytes) — powers /why + digest counts" }
+    # NOTE: welcoming new members moved OUT of moderation into its own welcome_module
+    # (moderation subscribes message.routed only; member.joined was never wired here).
+
+  welcome_module:
+    subscribes: [member.joined]
+    publishes: [outbound.requested]
+    feature_flag: moderation   # welcome rides the moderation/community-ops flag (welcome_new_members config)
+    role: >-
+      The actual consumer of member.joined (events.yaml lists "Welcome Module"; it was
+      previously unwired — moderation only subscribes message.routed). On a join it
+      composes a natural, persona-styled welcome and emits outbound.requested
+      (kind:'welcome', via:'userbot', notBefore = now + 1-3 min random, deduped per
+      channel+user) — the welcome comes from the persona (userbot), in-channel.
+    member_notice:   # privacy disclosure (decided: notice + tiered delete)
+      rule: >-
+        On the FIRST join after a workspace enables privacy.member_notice (and as a
+        pinned message), the bot posts a short disclosure — that an assistant operates
+        here, that messages may be retained up to message_retention_days, and how to
+        opt out of relationship memory (the opt_out_keyword) — emitted as
+        outbound.requested(kind:'notice'). This gives the message-retention a lawful,
+        transparent basis. The notice text lives in assets/ (content), not code.
+    guards:
+      - obeys the kill switch: a welcome is proactive, so suppressIfKillSwitch=true (RoomRead.posture==stay_silent -> no welcome).
+      - seed/spark aware: still welcomes (1:1 warmth is wanted early) but counts toward consecutive_bot_messages so it cannot monologue.
+      - silent on its own failure (no AI-leak); a missed welcome is never retried noisily.
+
+  intent_router:
+    subscribes: [message.clean]
+    publishes: [reply.needed]
+    role: >-
+      The SINGLE decision point for whether a REACTIVE reply happens. It owns
+      reply_probability and the active_hours/quiet_hours gate — no other module
+      may gate reply emission. As the pipeline head it is the one stage allowed to
+      emit nothing (that is how "no reply" is expressed). When it does reply it
+      builds the initial ReplyDraft (intent + RAG retrieval request) and emits
+      reply.needed.
+    reads_room: >-
+      Before deciding, it reads ctx.social.assess(channelId) (see contracts
+      SocialContext) to get { phase, temperature, posture }. The same room-read
+      feeds Atmosphere, so reactive and proactive behavior share ONE notion of
+      "度" — no two modules disagree about how lively/tense the room is.
+    decision_order:   # evaluated top to bottom; first match wins
+      - { when: "message is an EDIT (isEdit=true)", action: "never reply (edits are re-moderated, not re-triggered — see events edited_message_handling)" }
+      - { when: "message is a MALICIOUS COMMAND_ATTEMPT — a privileged-action request ('删了他'/'封他'), a control-override/prompt-injection ('ignore your instructions'/'reveal your prompt'/'you are now…') — even if it @mentions the bot", action: "SILENT: no action, no reply; log to command_attempts(kind:action_request|control_override). Silence reads as 'didn't take the bait', stays in character. This rule wins over mentions." }
+      - { when: "message is a BENIGN OUT-OF-SCOPE question — a real person genuinely asking about an ignore_topic (refund/payment/support), NOT trying to command or inject", action: "per governance.on_out_of_scope: 'deflect' (default) => ONE natural in-character human deflection ('这个我帮不上，你找下客服哈') and NEVER a privileged action / refund answer / AI-leak; 'silent' => no reply. Logged to command_attempts(kind:out_of_scope). Ghosting a real customer is worse for the business than a warm human deflection — the two cases are distinguished by intent, not topic." }
+      - { when: "this sender has already received >= reply_rate.per_user_max replies in reply_rate.window_minutes (mention-flood guard)", action: "do not reply — SILENT (a member cannot force unbounded replies/LLM spend by repeatedly @mentioning the bot). Counts both reactive replies; resets per window." }
+      - { when: message @mentions the bot OR is a direct conversational question, action: reply (mustReply=true — answer when addressed) }
+      - { when: "posture == stay_silent OR temperature in [heated, argument]", action: do not reply (observe; never pour oil on a fight) }
+      - { when: now outside persona.active_hours OR inside atmosphere.quiet_hours, action: do not reply }
+      - { when: phase == seed, action: do not reactively chat (there is no audience yet — see cold_start) }
+      - { when: phase == spark, action: reply eagerly (boost probability — make the first humans feel seen) }
+      - { when: otherwise, action: reply with probability = persona.reply_probability, scaled by posture (engage_lightly halves it) }
+    cost_prefilter: >-
+      The LLM classifier is the single biggest cost driver — it would otherwise run
+      on EVERY message in a busy room. A cheap RULE-BASED pre-filter (intent/rules.ts)
+      runs FIRST and short-circuits the obvious cases with NO LLM call: non-mention
+      chatter that fails the probability gate, edits, messages outside active_hours,
+      seed phase, and posture==stay_silent are decided without the classifier. The
+      LLM classifier is invoked only for the survivors (mentions, direct questions,
+      ambiguous in-scope lines). When the workspace is read-only (breaker tripped)
+      the classifier is skipped entirely — there will be no reply anyway.
+    retrieval: >-
+      When it decides to reply, the Intent Router fills ReplyDraft.retrieval by calling
+      ctx.knowledge.search(workspaceId, query) (the isolation-filtered read-model — see
+      contracts KnowledgeService). It does NOT touch the knowledge layer any other way;
+      ctx.knowledge emits content_gap.detected itself on a low top score.
+    passes_posture: >-
+      The chosen posture + register hint are written into ReplyDraft.directives so
+      Persona speaks at the right "度" (warm/light/matter-of-fact). This is how
+      "见人说人话" is carried through the pipeline.
+    decision_trace: >-
+      Because the head may emit NOTHING (decline to reply), the decision would otherwise be
+      invisible. So on every non-trivial outcome it writes ONE journal trace via
+      ctx.logger.trace('decision.no_reply' | 'decision.reply', { reason, correlationId })
+      naming the WINNING branch (e.g. reason='posture==stay_silent', 'mention-flood cap',
+      'outside active_hours', 'seed phase', 'malicious command_attempt', 'probability gate').
+      This is what makes "why didn't it answer that?" answerable from `just trace <id>` /
+      `/why`, not a silent black hole. (Cheap: one redacted row, no LLM.)
+    note: >-
+      Proactive messages (cold group, scheduled topics) are NOT decided here —
+      that is Atmosphere/Activity. This module is reactive-only.
+
+  marketing:
+    subscribes: [reply.needed]
+    publishes: [reply.enriched]
+    passthrough: >-
+      Pipeline stage — MUST ALWAYS emit reply.enriched. When the marketing
+      feature is off, the topic is not relevant, or a daily/gap limit is hit, it
+      emits reply.enriched with marketing.recommend=false and the draft otherwise
+      unchanged. It MUST NOT swallow the event (doing so would break the chain;
+      the pipeline_passthrough gate asserts this).
+    principle: No ads. Provide "useful recommendations", organically.
+    strategies:
+      - { strategy: in_conversation_recommendation, frequency: when topic-relevant, example: "对了我之前写过一篇对比几个模型的" }
+      - { strategy: proactive_share,                frequency: 1-2x per day,         example: "刚看到一个挺有意思的事" }
+      - { strategy: post_answer_followup,           frequency: occasional,           example: "详细的我在站上写过" }
+      - { strategy: activity_embed,                 frequency: during activities,    example: "这次送的是我们的 XX 产品" }
+    limits:
+      max_mentions_per_day: 3
+      min_gap_hours: 2
+      never_mention_in: ["用户抱怨", "争论", "气氛紧张"]
+      style: recommendation
+
+  persona:
+    subscribes: [reply.ready]
+    publishes: [reply.generated]
+    role: Assemble prompt, call LLM, humanize output.
+    style_arm: >-
+      Before assembling, Persona calls ctx.styling.assign(workspaceId, correlationId) (read-model
+      — see contracts StyleService) to get { variant, stylePrompt } for THIS reply: a Thompson
+      draw over the running STYLE experiment, deterministic per correlationId, or 'champion' +
+      the live STYLE prompt when none is running. It uses stylePrompt as the STYLE section of the
+      system prompt and stamps variant onto ReplyDraft.styleVariant so it rides to
+      ReplySent.styleVariant (Evolution attributes the engaged outcome to the arm). Persona does
+      NOT import the Evolution module; the arm arrives only through the read-model.
+    register_matching: >-
+      Reads ReplyDraft.directives (posture + register hint from Intent Router) and
+      matches the room's tone — casual, warm, light, or edgy/dark when that fits the
+      group ("见人说人话见鬼说鬼话"). This is STYLE only: it NEVER overrides the
+      immutable boundaries, never crosses the black content floor, and never breaks
+      character. Register is allowed to flex; identity and red lines do not.
+    system_prompt_file: assets/persona-system-prompt.txt
+    post_process_pipeline:
+      - strip markdown (**bold**, - lists, ``` code ```)
+      - strip enumerations (1. 2. 3.)
+      - AI-leak check ("作为AI", "我是语言模型", etc.)
+      - length check (if over threshold, ask LLM to condense)
+      - randomize (occasionally drop trailing period, add an emoji)
+
+  activity_planner:
+    subscribes: [activity.due, activity.approved, activity.rejected]
+    publishes: [activity.proposed, outbound.requested]
+    role: >-
+      Planner + Executor in ONE registered module. The Planner proposes on the
+      activity.due scheduler tick (the trigger for PERIODIC types — topic_day/quiz — fired
+      per-workspace in its own timezone) and on event-driven cues it derives from its own
+      inputs: auto for no-approval types, else activity.proposed -> owner. The Executor
+      consumes activity.approved (and runs auto-approved types directly) and emits the
+      activity message(s) via outbound.requested(kind:'activity', suppressIfKillSwitch=true) —
+      it does NOT call the adapter directly. activity.rejected returns an owner ❌ to the
+      Planner so it drops/reschedules the proposal rather than leaving it pending. Polls go
+      out as OutgoingMessage.poll (auto-degrades if the platform lacks polls).
+    approval_flow: Bot plans -> DM owner -> owner replies ✅/❌/📝 -> Bot executes/adjusts
+    activity_types:
+      - { type: ai_news_discussion, trigger: big news, approval: false }
+      - { type: poll_survey,        trigger: hot topic, approval: false }
+      - { type: topic_day,          trigger: periodic,  approval: false }
+      - { type: quiz,               trigger: periodic,  approval: false }
+      - { type: giveaway,           trigger: planned,   approval: true }
+      - { type: cost_bearing,       trigger: planned,   approval: true }
+
+  atmosphere:
+    subscribes: [message.clean, member.left, atmosphere.cold, content_calendar.due]
+    publishes: [atmosphere.cold, outbound.requested]
+    role: >-
+      Two cooperating parts in ONE registered module: the Monitor detects a cold/
+      idle room and publishes atmosphere.cold; the Initiator consumes atmosphere.cold
+      AND content_calendar.due and produces the actual proactive message via
+      outbound.requested (the previously-missing proactive send path — see events
+      proactive_send). atmosphere.cold is a real bus event (kept for observability +
+      future consumers); the module legitimately subscribes to its own event.
+    sending: >-
+      The Initiator composes persona-styled text (ctx.llm with the shared persona
+      prompt + humanize util — the same de-AI post-processing as Persona) and emits
+      outbound.requested(kind:'proactive_post'|'activity', via:'userbot',
+      suppressIfKillSwitch=true). It NEVER calls the adapter directly and NEVER bypasses
+      the send_queue.
+    reads_room: Uses ctx.social.assess(channelId) — the SAME read-model Intent Router uses.
+
+    # A bot cannot manufacture a community from zero real humans. So behavior is
+    # gated by the community LIFECYCLE PHASE. The job in an empty/tiny room is not
+    # to "chat" (nobody reads) but to make the room look worth staying in.
+    community_lifecycle:
+      phases:
+        - phase: seed       # 0~seed_max_members, ~no activity
+          posture: broadcast-only
+          do:   [low-freq high-value posts (1-2/day): a daily AI-news pick, a useful resource, one pinned "建群初衷"]
+          dont: [talk to the void, ask questions nobody will answer, fake a conversation, post consecutive bot messages]
+          goal: a newcomer scrolling up sees substance, not a bot monologue.
+        - phase: spark      # first handful of real humans show up
+          posture: warm 1:1
+          do:   [welcome warmly, reply eagerly + fast, ask light questions, make the first people feel seen]
+          dont: [run polls/quizzes/giveaways — they look dead with <min_participants]
+          goal: convert the first arrivals into regulars.
+        - phase: grow       # >= grow_min_active_24h active humans
+          posture: normal operations
+          do:   [normal cold-revival, topics, activities turn on]
+        - phase: mature     # stable activity
+          posture: full operations
+          do:   [everything + evolution self-tuning]
+      anti_cringe_rules:   # hard guards, enforced regardless of phase
+        - never run a poll/quiz below min_participants_for_poll
+        - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself)
+        - in seed phase, only broadcast value — never simulate dialogue
+        - if posture == stay_silent (e.g. argument), do nothing
+
+    # In grow/mature phases the classic cold-revival applies:
+    behavior_table:
+      - { state: "cold > 4h (daytime), phase>=grow",  action: share AI news,             cooldown: 8h }
+      - { state: "cold > 8h, phase>=grow",            action: start topic/poll,          cooldown: 12h }
+      - { state: someone posts interesting content,   action: probabilistic response,    cooldown: none }
+      - { state: heated discussion,                   action: occasional interjection,   cooldown: 10min }
+      - { state: new member joins,                    action: welcome + guide,           cooldown: none }
+      - { state: argument in group,                   action: observe, do not engage,    cooldown: none }
+
+  evolution:
+    subscribes: [message.clean, reply.sent, outbound.sent, reaction.received, member.left, evolution.reflection_due, evolution.tuning_decided]
+    publishes: [evolution.insights_generated, evolution.tuning_proposed]
+    role: >-
+      Closed-loop, gated learner. It observes outcomes, runs a champion/challenger
+      experiment on the STYLE prompt section ONLY, promotes a challenger ONLY when
+      it beats the live baseline on a pre-registered metric with enough evidence,
+      and auto-rolls-back regressions. It never edits identity or immutable
+      boundaries, and it never writes the live prompt directly from an LLM
+      suggestion — every change passes the gate. This makes evolution falsifiable
+      (the experiment measures it) and safe (the gate + rollback bound it).
+    internal_components: >-
+      Tracker, Reflector, Style Memory, and Strategy Memory are INTERNAL sub-components
+      (files) of THIS one registered module (src/modules/evolution/**), updated in-process —
+      not separate modules and not bus round-trips. evolution.insights_generated is published
+      for observability + future external consumers and currently has NO external subscriber
+      (Strategy Memory writes shared_insights in-process). The Evolution module OWNS the
+      evolution_experiments + style_memory + shared_insights tables.
+    style_assignment: >-
+      The live STYLE arm is served to Persona through the StyleService read-model
+      (ctx.styling.assign — see contracts ModuleContext). That read-model reads THIS module's
+      evolution_experiments row (the one running STYLE experiment) and Thompson-draws seeded by
+      correlationId; Persona stamps the result onto ReplyDraft.styleVariant, which rides to
+      ReplySent.styleVariant. The Evolution module then attributes outcomes back to that arm
+      (see primary_metric) — closing the loop without Persona ever importing Evolution.
+
+    # ---- metrics: a clean PRIMARY decision metric + GUARDRAIL veto metrics.
+    #      A single weighted composite let a reaction-farming variant hide a
+    #      complaint/churn regression behind a strong positive. Splitting them makes
+    #      the decision both more rigorous and Goodhart-resistant. ----
+    primary_metric:
+      definition: >-
+        engaged ∈ {0,1} PER bot reply: 1 if a human replies-to / quotes / positively
+        reacts to the bot message within the attribution window, else 0. One clean
+        Bernoulli outcome (collapses the old got_reply/was_quoted/got_emoji positives).
+        This is the metric arms are compared on.
+      attribution: >-
+        Observed from the bus, not polled: a reply/quote is a subsequent message.clean whose
+        replyTo.messageId == a tracked bot_message_id (this is why Evolution subscribes
+        message.clean); a positive reaction is a reaction.received on that bot_message_id.
+        The match must land within attribution_window_minutes. reply_feedback is indexed on
+        (workspace_id, bot_message_id) for this lookup (data-model ix_reply_feedback_botmsg);
+        engaged + measured_at are written there, keyed back to the styleVariant arm.
+    guardrail_metrics:   # each is a rate; a challenger that worsens ANY of these beyond tolerance is VETOED regardless of primary lift
+      - { metric: complaint_rate,    detect: "reflection-time sentiment on human messages replying to the bot (needs sentiment_analysis; degrade to neutral if off)" }
+      - { metric: member_left_rate,  detect: "member.left correlated with a recent bot message in-channel" }
+      - { metric: negative_reaction_rate, detect: "negative emoji on a bot message" }
+      - { metric: admin_deleted_rate, detect: "bot message deleted by a (human) admin — best-effort/often unobservable on Telegram -> auto-degrade" }
+    composite_score: >-
+      RETAINED only as a SECONDARY, exploratory/diagnostic signal (and for the digest);
+      the promotion DECISION never rides on it. When shown, it is stratum-normalised
+      (intent_category × time-bucket × had_marketing) for readability.
+
+    # ---- the experiment: a Bayesian, always-valid, bandit-allocated A/B. This is
+    #      what makes "evolution" decidable EVEN IN small/slow communities (valid at
+    #      any sample size) and low-regret (traffic flows to the better arm). ----
+    experiment:
+      dimensions: >-
+        Same machinery generalizes beyond STYLE to other levers
+        (evolution_experiments.dimension): timing, activity_type, marketing_angle.
+        STYLE ships first; others reuse the identical engine + gate + rollback. Identity,
+        boundaries, and governance are NEVER a dimension.
+      design: Bayesian champion/challenger on the STYLE prompt section only (dimension=style)
+      champion: the live STYLE prompt
+      challenger: ONE LLM-proposed STYLE variant per cycle
+      one_active_per_dimension: >-
+        At most ONE running experiment per dimension at a time (DB unique index
+        ux_one_running_experiment). A reflection cycle does NOT start a new arm for a
+        dimension whose experiment is still running (decision not yet reached). Keeps the
+        allocation unambiguous (exactly one champion vs one challenger) and prevents
+        pile-up in slow communities.
+      model: >-
+        Each arm has a Beta(α,β) posterior over the primary metric (engaged is Bernoulli,
+        Beta is conjugate -> an EXACT posterior at ANY sample size, no large-n assumption).
+        Init Beta(1,1); update α += successes, β += failures as feedback lands.
+      allocation: >-
+        THOMPSON SAMPLING, not a fixed ratio. For each eligible reply, draw
+        θ_champion~Beta, θ_challenger~Beta and route to the higher draw — traffic flows
+        to the better arm as evidence accrues (low regret; converges even at low traffic).
+        challenger_ratio is now only a FLOOR/CAP clamp (e.g. keep challenger share in
+        [0.05, 0.5]) so the champion always serves the majority early and no arm starves.
+        Assignment stays deterministic per reply via hash(correlationId) as the PRNG seed
+        (reproducible + idempotent under replay).
+      variance_reduction: >-
+        Apply CUPED-style covariate adjustment using each responder-pool's PRE-period
+        engagement as the covariate (and optionally intent_category as a stratum in a
+        hierarchical posterior) — purely to SHRINK variance, never to partition the
+        decision. Randomized assignment already balances confounders in expectation; this
+        just makes the small-community posterior tighten 20–50% faster.
+      promote_when: >-
+        P(θ_challenger > θ_champion) >= promote_prob (default 0.95, computed from the two
+        Beta posteriors — VALID under continuous peeking, so the rollback watch's repeated
+        looks do NOT inflate false positives, unlike a fixed-horizon p-value) AND no
+        guardrail_metric is worse than champion beyond its tolerance (non-inferiority) AND
+        min_exposure replies have been served to the challenger (a small floor so a lucky
+        3-sample run can't promote).
+      power_aware_admission: >-
+        Before launching an arm, estimate eligible replies in the watch window from
+        channel_state.messages_24h. If even a large effect cannot cross promote_prob within
+        the window, DON'T launch — QUEUE the challenger (the one-active slot stays free).
+        This stops burning reflection cost on undecidable experiments in tiny rooms.
+      otherwise: discard challenger; champion stays live; log the negative posterior result
+      guard: a challenger that weakens any immutable_boundary (red-team prompt set) is rejected before it ever runs (evolution_safety gate)
+    rollback:
+      watch_window_hours: 72
+      rule: >-
+        After a promotion, keep updating posteriors. Auto-revert to the stored prior STYLE
+        if P(θ_new < θ_prior_baseline) >= promote_prob over the watch window OR any guardrail
+        regresses beyond tolerance. (Posterior monitoring is peek-safe, so continuous watch
+        is statistically sound.)
+      record: every promotion stores the prior prompt + its baseline posterior so revert is one row read.
+
+    reflection:
+      interval_hours: 72
+      inputs: [primary-metric + guardrail posteriors since last reflection, current STYLE prompt, active experiment results]
+      llm_role: >-
+        PROPOSE — produce ONE challenger STYLE variant + candidate insights with
+        evidence. The LLM never writes the live prompt; its output only enters the
+        gated experiment (or, with auto_tune off, the owner approval queue first).
+      outputs:
+        - one challenger STYLE variant (enters experiment, not live)
+        - candidate shared insights (each tagged with sample_count + confidence)
+        - bounded topic-interest weight updates (capped per cycle to prevent drift)
+
+    auto_tune:
+      flag: evolution.auto_tune          # DEFAULT OFF — conservative start
+      off: emit evolution.tuning_proposed -> Approval Service DMs the owner ✅/❌; only an approved variant enters the experiment
+      on: proposed variant enters the champion/challenger experiment automatically; promotion is STILL gated as above
+
+    shared_contribution:
+      rule: >-
+        Only insights with confidence >= shared_min_confidence AND sample_count >=
+        shared_min_samples are written to shared_insights. Methodology is shared; content
+        is never shared (see knowledge.yaml shared_intelligence).
+
+    immutable_boundaries:   # hard-coded, never an experiment target
+      - never admit being an AI
+      - never answer refund questions
+      - never fabricate answers
+      - never execute a group member's command; refusals are SILENT, never an AI-revealing apology (see contracts governance)
+      - never self-escalate autonomy and never grant a principal; governance is owner-only and immutable
+      - core identity is fixed; ONLY the STYLE prompt section may be tuned
+      - every challenger is validated against these post-generation; a violating variant is rejected
+
+  cross_promotion:
+    status: future   # not implemented now; all hooks are pre-wired
+    # As a reply-pipeline stage it consumes reply.enriched and MUST emit reply.ready
+    # (its out-event — passthrough when it adds nothing); separately it proposes a cross-promo
+    # (cross_promo.proposed -> Approval) and consumes the owner decision (cross_promo.approved).
+    # While UNREGISTERED, the engine pipeline bridge emits reply.ready in its place (see
+    # events.yaml reply_pipeline.absent_stage_bridge) — these declarations apply once it is built.
+    subscribes: [reply.enriched, cross_promo.approved]
+    publishes: [reply.ready, cross_promo.proposed]
+    enable_by: implement CrossPromotionModule + register it
+    config_file: config/cross-promotion.yaml
+    tones_file: assets/cross-promotion-tones.yaml
+    trigger_rules:
+      min_topic_relevance: 0.8
+      require_organic_context: true
+    current_hook: |
+      // NOT a Marketing-module hook (that would make Marketing emit reply.ready, an event
+      // it does not declare). The ENGINE installs the bridge for any unregistered optional
+      // stage from the reply_pipeline.stages table (events.yaml absent_stage_bridge):
+      //   if (!engine.isRegistered('cross-promotion'))
+      //     bus.bridge('reply.enriched' -> 'reply.ready');  // forward unchanged
+      // When CrossPromotionModule is registered, the bridge is not installed and the module
+      // owns reply.ready. Marketing.publishes stays [reply.enriched] either way.
+    approval_preview_example: |
+      🔔 跨站推荐审批 #7
+      📍 来源群：AI交流群
+      🎯 推荐内容：工具站的 XX 产品
+      💬 上下文：用户在讨论 AI 代码生成工具
+      话术预览：
+      '这个让我想起个东西，我之前用过一个代码辅助的工具，
+      还挺好用的，有兴趣的话我回头发你链接'
+      ✅ 批准  ❌ 拒绝  📝 修改
+
+  # === Control plane + read-model modules (previously referenced by events but unspecified) ===
+
+  approval_service:
+    subscribes: [control.owner_action, activity.proposed, cross_promo.proposed, moderation.escalated, evolution.tuning_proposed, lead.identified, digest.due]
+    publishes: [activity.approved, activity.rejected, cross_promo.approved, evolution.tuning_decided, lead.approved, moderation.violation, user.forget, onboarding.input, outbound.requested]
+    control_ingress: >-
+      EVERY owner input enters through control.owner_action — the ONE authenticated edge,
+      emitted by the CONTROL BOT adapter only for the owner user_id (a member DMing the
+      control bot never produces it; the adapter drops non-owner senders first). The
+      Approval Service is the sole consumer and dispatches by kind (see events.yaml flows
+      control_plane_ingress), resolving the target workspaceId from the matched pending item
+      or the command scope and stamping it on whatever event it emits next:
+        - decision (✅/❌/📝): match itemRef -> emit that item's decision event
+          (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided,
+          lead.approved, or moderation.violation(approved) for an L1 mute/ban); a 📝 amend
+          carries amendText.
+        - command /pause|/quiet|/resume: WRITE channel_state.paused_until /
+          proactive_paused_until (the kill switch — the one control-owned write to
+          channel_state; SocialContext only READS these for posture, see contracts).
+        - command /status|/why|/trace: compose from the event_journal (+ read-model tables) -> outbound.requested(kind:'dm', via:'control'); /trace <id> renders the full ordered correlationId story.
+        - command /forget <user|me>: resolve userId + workspaceId -> emit user.forget.
+        - command /setup, or owner text during an active interview, or a confirm on the
+          onboarding draft: emit onboarding.input(start|answer|confirm) to the Onboarding Wizard.
+    pending_store: >-
+      Every owner-decision item is persisted in `approval_items` BEFORE its owner DM is
+      sent. itemRef/callback_data is the primary key; the row stores workspaceId, item type,
+      safe default, expires_at, payload_json, approval_message_id, and source correlationId.
+      Approval Service loads pending rows on restart, matches callbacks/reply-to/#id against
+      this table, applies proposal.ttl safe defaults idempotently, and never relies on
+      in-memory queues for authority. This one table covers moderation L1 mute/ban,
+      activity/giveaway/cost proposals, lead DMs, evolution tuning, onboarding confirm, and
+      future cross-promo.
+    moderation_approvals: >-
+      moderation.escalated may carry a PROPOSED L1 action (mute/ban — see moderation
+      action_provenance_and_autonomy). The Approval Service presents it as an approve/reject
+      item (DM owner, ✅/❌); on ✅ it emits moderation.violation(mute|ban) for the Platform
+      Adapter to execute; on ❌ (or proposal.ttl timeout -> SAFE default = reject) nothing
+      executes. A black-tier escalation that is purely a notify (delete already done) needs no
+      decision. The auto delete is emitted by Moderation itself and never waits here.
+    role: >-
+      The owner's ENTIRE control plane, operated OVER THE CONTROL BOT (Bot API) — the
+      single authenticated bridge between owner and bot (see contracts governance). The
+      owner DMs the CONTROL BOT (not the userbot — you cannot DM your own account);
+      decisions use inline ✅/❌/📝 BUTTONS (callback queries) with a typed-command
+      fallback, both Bot-API-only affordances. Authenticates strictly by
+      config.owner.approval_channel.user_id; any other sender (incl. a member messaging
+      the control bot) is silently ignored (no authority, no error). Turns a pending
+      proposal into a decision and correlates it back to the exact item. All its sends
+      use OutboundMessage.via='control'.
+    inbound_owner_actions:   # all arrive as control.owner_action (see control_ingress)
+      decisions: "✅ approve | ❌ reject | 📝 amend(text)"   # OwnerAction.itemRef from callback_data (inline button); typed fallback matches by reply-to, else #id token
+      controls:    # the KILL SWITCH + visibility — owner-only operational commands
+        - "/pause [scope] [duration]   -> bot goes FULLY silent in scope (sets channel_state.paused_until)"
+        - "/resume [scope]"
+        - "/quiet 2h                   -> stop PROACTIVE only; moderation stays on (proactive_paused_until)"
+        - "/status                     -> what the bot is doing + pending items + today's counts (read from the event_journal + read-model tables)"
+        - "/why <messageId>            -> explain a recent action/reply from the event_journal (the full trace for that message's correlationId, rendered human-readable)"
+        - "/trace <id>                 -> the complete ordered story of one correlationId (every event + decision + failure for that message), the control-bot mirror of `just trace <id>`"
+        - "/forget <user|me>           -> emits user.forget(scope:full): User Memory deletes the relationship-memory note + sets opted_out (stops collection); the Database service purges/anonymizes its user-scoped raw records (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject). Distinct from the opt_out_keyword, which stops relationship memory only (raw messages still age out per message_retention_days). See privacy decision."
+        - "/setup                      -> starts the onboarding interview (emits onboarding.input(start))"
+    pause_is_authoritative: >-
+      paused_until / proactive_paused_until are folded into SocialContext: while
+      paused, RoomRead.posture == stay_silent, so EVERY module already obeys it
+      through the one room-read gate. The kill switch cannot be bypassed.
+    correlation: each proposal stores approval_message_id; reply matched by reply-to first, else explicit #id.
+    timeout:
+      rule: a pending item not decided within proposal.ttl auto-resolves to its SAFE default — reject for cost/giveaway/cross_promo AND for mute/ban moderation proposals (safe = no punitive action; the harmful content was already auto-deleted); hold (no change) for evolution tuning.
+    digest:
+      on: digest.due
+      action: >-
+        compose + DM the owner the daily digest via outbound.requested(kind:'digest',
+        via:'control', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
+        bot is never silenced by /pause or account RETREAT). Contents: messages sent, reply rate, spam blocked,
+        black-tier escalations (text+media), command_attempts, unbound-channel notices,
+        repeated content gaps, pending items, evolution status, and repeated
+        pipeline-stage failures (read from the pipeline_failures table — errors, timeouts,
+        and watchdog hang-aborts). Owner's window into the black box.
+    sending: >-
+      ALL owner-facing sends (proposals, escalations, digest, /status, /why replies)
+      go out via outbound.requested(kind:'dm'|'digest', via:'control', dmUserId=owner) —
+      through the CONTROL BOT. The control plane never calls the adapter directly. Owner
+      DMs set suppressIfKillSwitch=false so neither the kill switch nor account RETREAT
+      ever gags the owner's own visibility.
+    note: Never executes a member request; controls accepted ONLY from the owner user_id.
+
+  context_manager:
+    subscribes: [message.clean]
+    publishes: []
+    role: >-
+      Maintains a rolling per-channel conversation window (recent turns, current
+      topic, active participants) as a READ-MODEL exposed via ctx.conversation.
+      Intent Router seeds the ReplyDraft from it; Persona reads it to stay
+      coherent across multi-party chatter. Trims by token budget + recency; resets
+      topic on detected switch. It is an updater, not a pipeline stage (publishes nothing).
+
+  user_memory:
+    subscribes: [message.clean, member.left, user.forget]
+    publishes: []
+    feature_flag: user_memory   # default OFF — privacy-sensitive, opt-in per workspace
+    role: >-
+      Per-user RELATIONSHIP memory — the lever that turns "a bot" into "a real
+      regular" ("你上周不是问过 X 嘛"). Distills a short SUMMARY per user (topics,
+      preferences, last seen), never stores raw logs beyond retention. Exposed via
+      ctx.memory.recall(); Persona may weave it in naturally.
+    privacy:
+      - opt-out (keyword): a user sending the configured opt_out_keyword erases their note, sets opted_out=true, and stops relationship-memory collection. It does NOT purge their raw messages — those still age out per message_retention_days. (Tiered-delete decision.)
+      - forget (owner /forget -> user.forget event): FULL erase. This module erases the note + sets opted_out on user.forget; the Database service purges/anonymizes the user-scoped raw records it owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject) on the same event. The stronger, complete right-to-erasure path. (Each endpoint erases only the data it owns — no cross-module table write.)
+      - retention: notes expire after user_memory.retention_days; raw messages trimmed by message_retention_days (retention.sweep_due).
+      - never returns memory for an opted-out user; never exposes another user's memory.
+
+  content_gap:
+    subscribes: [content_gap.detected]
+    publishes: []
+    role: >-
+      The community -> content reverse signal. When RAG cannot answer (top score
+      below threshold), it logs the unanswered question and counts repeats. Surfaces
+      to the owner in the digest ("本周 8 人问了 X，建议写一篇"). Near-zero cost,
+      high value to the content team. Pure observer; never replies.
+
+  funnel:
+    subscribes: [message.clean, reply.sent, reaction.received, lead.approved]
+    publishes: [lead.identified, outbound.requested]
+    feature_flag: funnel        # default OFF
+    role: >-
+      DM lead funnel — the real conversion lever. Detects high-intent signals
+      (repeated engagement via reply.sent/reaction.received, AND explicit interest in
+      message CONTENT via message.clean) and proposes moving a lurker to 1:1.
+    governance: >-
+      Sending a DM is a privileged action gated by autonomy.send_direct_message
+      (default L1_propose -> owner approves ON THE CONTROL BOT). It is NEVER triggered by a
+      member asking; only by the bot's own signal + the configured autonomy level. On
+      lead.approved the Funnel emits outbound.requested(kind:'dm', via:'userbot',
+      dmUserId=lead) — the DM to the LEAD goes through the USERBOT (the lead is talking to
+      the persona, a real person, not a bot) and is additionally bounded by the
+      account_survival dm_per_day cap (DMs are the highest ban risk). It never calls the
+      adapter directly.
+
+  onboarding_wizard:
+    trigger: first run / owner /setup on the control bot
+    subscribes: [onboarding.input]    # start|answer|confirm|cancel — the Approval Service forwards owner control input belonging to an active /setup session (it owns the authenticated edge; onboarding owns the interview state machine). NOTE: this is a dedicated event, NOT a piggyback on activity.approved (which would collide with the Activity Executor).
+    publishes: [outbound.requested]    # interview questions + the draft-for-confirmation are DM'd to the owner via the control bot
+    role: >-
+      Lowers activation: instead of hand-editing YAML, the bot INTERVIEWS the owner
+      over DM (who are you, what do you sell, what tone, where's your content) and
+      produces a DRAFT persona + sources config for the owner to confirm. It is a normal
+      registered module reachable only over the bus (onboarding.input in, outbound.requested
+      out). Output must pass the same Zod schema as a hand-written config. Runs only on the
+      control plane (the Approval Service authenticated the owner user_id before forwarding).
+    config_write_exception: >-
+      AGENTS.md says humans own config/** and AI owns src/**. Onboarding is the ONE
+      documented BOOTSTRAP exception: after the owner explicitly confirms the draft on
+      the control plane, the wizard writes config/workspaces.yaml + config/sources.yaml
+      ONCE to bootstrap a first-time setup. It writes a draft the human APPROVED (not an
+      autonomous edit), it never overwrites a hand-edited file without a fresh explicit
+      confirm, and thereafter config/** is human-owned again. The config loader supports
+      hot-reload (see config.yaml) so the new workspace goes live without a restart.
+    preconditions_check: >-
+      Before marking a workspace live, the wizard calls verifyAccess on BOTH adapters and
+      refuses to finish if the USERBOT is not a member of the channel (hard stop) or the
+      CONTROL BOT is not a group admin with delete+restrict rights (hard stop, reported for
+      the owner to grant; required safety/admin rights never silently degrade). It confirms
+      the userbot session string AND the control bot token both authenticate. There is NO
+      privacy-mode check — the userbot reads everything by membership. The interview itself
+      runs over the CONTROL BOT (the owner cannot DM the userbot, which is their own
+      account).
+
+  # Scheduler is a SYSTEM SERVICE (services/scheduler.ts), not a Module. It owns
+  # cron + missed-tick policy and emits ticks consumed by modules:
+  #   evolution.reflection_due, knowledge.sync_due, digest.due,
+  #   retention.sweep_due, content_calendar.due, activity.due.
+  # TIMEZONE: cron expressions in bot.yaml are evaluated PER WORKSPACE in that
+  #   workspace's persona.timezone, NOT in server-local time. So "digest 09:00"
+  #   fires at 09:00 for each workspace's own timezone — the Scheduler emits one tick
+  #   per (workspace, job) at the workspace-local time. (knowledge.sync_due is global/
+  #   per-source — it has no human-facing local time.)
+  # Missed-tick policy: on restart, a tick whose window passed fires once (catch-up),
+  # except retention which always runs the full sweep.
+
+# Feature flags — every capability is independently switchable per workspace.
+# Modules self-check the flag at runtime; disabled = no-op.
+feature_flags:
+  defaults:
+    moderation: true
+    persona: true
+    marketing: true
+    activities: true
+    atmosphere: true
+    evolution: true
+    cross_promotion: false
+    user_memory: false        # relationship memory — privacy-sensitive, opt-in
+    funnel: false             # DM lead funnel — opt-in
+    content_gap: true         # passive observer, no user-visible action
+    digest: true              # owner daily digest via the control bot
+    analytics: false
+    sentiment_analysis: false
+    auto_faq: false
+  # Runtime flag check. CRITICAL: a disabled PIPELINE stage must PASS THROUGH,
+  # never `return` — an early return drops the chain event and silences the bot.
+  # Non-pipeline (fan-out) modules may simply no-op.
+  # `workspace.features` is the SINGLE source of feature truth. Nested module config
+  # sections hold parameters only; schema rejects duplicate `enabled` booleans that would
+  # create a second truth source.
+  runtime_check_pattern: |
+    // Flags are resolved from the envelope's workspaceId via ctx (config lookup,
+    // NOT a call into another module).
+    const features = (env) => ctx.getWorkspace(env.workspaceId).features;
+
+    // Pipeline stage (Marketing, Cross-Promotion): PASS THROUGH when disabled.
+    this.bus.on('reply.needed', (env) => {
+      if (!features(env).marketing) {
+        const draft = { ...env.payload, marketing: { recommend: false } };
+        return this.bus.emit('reply.enriched', { ...env, payload: draft }); // forward, don't drop
+      }
+      // ...enrich, then emit reply.enriched
+    });
+
+    // Fan-out module (e.g. Atmosphere): safe to no-op when disabled.
+    this.bus.on('message.clean', (env) => {
+      if (!features(env).atmosphere) return; // no downstream chain to break
+      // ...
+    });

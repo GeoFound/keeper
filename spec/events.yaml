@@ -1,0 +1,375 @@
+# =============================================================================
+# EVENTS — the Event Bus contract: envelope + payloads + catalog + flows.
+# All cross-module communication happens here. Zero direct calls.
+# Two event shapes (see overview.yaml zero_coupling):
+#   - fan-out notifications: many independent consumers, no ordering.
+#   - the ordered reply pipeline: a versioned enrichment chain (see reply_pipeline).
+# =============================================================================
+
+events:
+  bus: typed EventEmitter (self-built, zero-dependency)
+
+  # Every payload is wrapped in this envelope. It is what makes tracing and
+  # isolation possible, and what the envelope_conformance gate validates.
+  envelope:
+    signature: |
+      interface EventEnvelope<T> {
+        eventId: string;        // unique per emission (uuid)
+        correlationId: string;  // stable across one inbound message's entire journey
+        causationId?: string;   // the eventId that directly caused this emission
+        workspaceId: string;    // resolved isolation scope; set by Workspace Router,
+                                // guaranteed non-empty for every event downstream of message.routed
+        name: string;           // the event name (matches catalog)
+        version: number;        // payload schema version for this event name
+        timestamp: Date;
+        payload: T;
+      }
+    rules:
+      - correlationId is DERIVED DETERMINISTICALLY from the platform message identity by the Platform Adapter (`corr:<platform>:<channelId>:<platform_message_id>`; for an edit, still the original/editOf message id), NEVER a fresh uuid. This is what makes outbox dedup protect against redelivery — a reconnect/crash that REPLAYS an update yields the SAME correlationId, so it is idempotent end-to-end. The inbound replay guard is separate: it keys on the concrete platform update identity (original message vs each edit revision, e.g. Telegram update id / edit_date), so repeated edits are re-moderated while replaying the same edit is a no-op. (See overview operations.idempotent_delivery.inbound_idempotency.) control.owner_action is keyed the same way off the owner's control-bot message/callback id (`corr:telegram:<owner_dm>:<message_or_callback_id>`), so a redelivered owner tap is also idempotent and never double-acts.
+      - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY message journey; it copies it onto message.routed and every downstream stage propagates it unchanged. Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
+      - Two events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: message.received (workspace not yet routed) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other event MUST carry a non-empty workspaceId.
+      - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emission is outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false) with a kind-namespaced dedupeKey.
+      - A consumer MUST ignore an event whose version it does not understand (forward-compatible).
+      - |
+        Most producers are registered Modules whose subscribesTo/publishes are asserted by
+        the declared_events_only gate. A SMALL fixed set of NON-module INFRA endpoints also
+        touch the bus and are explicitly whitelisted at engine construction. The gate
+        validates against modules PLUS this whitelist (for BOTH produced and consumed
+        events), never modules alone.
+        PRODUCERS:
+          (a) Platform Adapter — the USERBOT adapter emits (message.received, member.*,
+              reaction.received, reply.sent, outbound.sent); the CONTROL BOT adapter emits
+              (outbound.sent for owner sends, and control.owner_action for EVERY authenticated
+              owner input — inline-button callbacks, slash commands, onboarding answers). The
+              control bot does NOT mint message.received (no re-ingest).
+          (b) Scheduler — the *.due ticks (evolution.reflection_due, knowledge.sync_due,
+              digest.due, retention.sweep_due, content_calendar.due, activity.due).
+          (c) Content Sync Pipeline + RAG/Knowledge service — knowledge.updated, content_gap.detected.
+          (d) Engine pipeline bridge — when an OPTIONAL pipeline stage's module is not
+              registered (e.g. Cross-Promotion, future), the engine forwards that stage's
+              in-event to its out-event unchanged (see reply_pipeline.absent_stage_bridge).
+              This is how reply.ready is emitted when Cross-Promotion is absent — NOT by Marketing.
+        CONSUMERS (infra that subscribes without being a peer module):
+          (e) SocialContext (channel_state updater) — consumes message.clean, member.joined,
+              member.left, reply.sent, outbound.sent.
+          (f) Database service — consumes retention.sweep_due (retention sweep) and user.forget
+              (user-scoped raw-record purge/redaction).
+          (g) Observability journal middleware — a UNIVERSAL consumer: it observes EVERY event
+              (a wildcard subscription) and writes one redacted event_journal row per emission,
+              persisting eventId + correlationId + causationId. It only READS+records, never
+              re-emits, so it cannot affect any flow; it is explicitly exempt from (and the sole
+              exception to) the "consume only declared events" rule. See overview operations.observability.
+        These are infra, not peer modules; no module imports them.
+      - An EDITED inbound message is NOT a new event name: the Platform Adapter re-emits message.received with UnifiedMessage.isEdit=true (and editOf set), so an edit flows the SAME route (Workspace Router -> Moderation) and is RE-MODERATED. Downstream reactive stages MUST NOT treat an edit as a fresh trigger (Intent Router never replies to an edit); the Context Manager updates the edited turn in place.
+
+  # Event name -> payload type. Payload schemas are authoritative (Zod at runtime).
+  catalog:
+    - { event: message.received,             version: 1, publisher: "Platform Adapter (USERBOT only — the control bot never re-ingests)", consumers: [Workspace Router],                          payload: UnifiedMessage }
+    - { event: message.routed,               version: 1, publisher: Workspace Router,                 consumers: [Moderation],                                                        payload: RoutedMessage }
+    - { event: message.clean,                version: 1, publisher: Moderation,                       consumers: [Context Manager, Intent Router, Atmosphere Monitor, Evolution Tracker, User Memory, Funnel, SocialContext (channel_state updater)], payload: RoutedMessage }   # Evolution Tracker observes human replies/quotes to the bot here (the primary engaged metric); Funnel reads explicit-interest signals
+    - { event: moderation.violation,         version: 1, publisher: "Moderation (auto delete) / Approval Service (approved mute|ban)", consumers: ["Platform Adapter (CONTROL BOT — the group-admin executor)"], payload: ModerationAction }   # control bot executes; delete is auto, mute/ban only after owner ✅
+    - { event: moderation.escalated,         version: 1, publisher: Moderation,                       consumers: [Approval Service],                                                  payload: ModerationAction }   # black-tier notify AND the L1 proposal for mute/ban (owner ✅ -> moderation.violation)
+    - { event: member.joined,                version: 1, publisher: Platform Adapter,                 consumers: [Welcome Module, SocialContext (channel_state updater)],              payload: MemberEvent }
+    - { event: member.left,                  version: 1, publisher: Platform Adapter,                 consumers: [Atmosphere Monitor, Evolution Tracker, User Memory, SocialContext (channel_state updater)], payload: MemberEvent }
+    - { event: reaction.received,            version: 1, publisher: Platform Adapter,                 consumers: [Evolution Tracker, Funnel],                                         payload: ReactionEvent }
+    # --- control plane ingress (the SINGLE authenticated owner->bot input edge) ---
+    - { event: control.owner_action,         version: 1, publisher: "Platform Adapter (CONTROL BOT — owner-authenticated input only)", consumers: [Approval Service],                  payload: OwnerAction }     # inline-button decisions, slash commands, onboarding answers; workspaceId resolved by Approval
+    # --- ordered reply pipeline (see reply_pipeline below) ---
+    - { event: reply.needed,                 version: 1, publisher: Intent Router,                    consumers: [Marketing Engine],                                                  payload: ReplyDraft }
+    - { event: reply.enriched,               version: 1, publisher: Marketing Engine,                consumers: [Cross-Promotion],                                                   payload: ReplyDraft }
+    - { event: reply.ready,                  version: 1, publisher: "Cross-Promotion (or the ENGINE PIPELINE BRIDGE when Cross-Promotion is unregistered — see reply_pipeline.absent_stage_bridge; never the Marketing module)", consumers: [Persona Engine], payload: ReplyDraft }
+    - { event: reply.generated,              version: 1, publisher: Persona Engine,                  consumers: [Platform Adapter],                                                  payload: ReplyDraft }
+    - { event: reply.sent,                   version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Funnel, SocialContext (channel_state updater)],   payload: ReplySent }
+    # --- unified outbound (ALL non-reply sends go through here -> send_queue + outbox; see overview operations) ---
+    - { event: outbound.requested,           version: 1, publisher: "Workspace Router (system notices) / Welcome / Atmosphere Initiator / Activity Executor / Approval Service (digest+DM) / Funnel / Onboarding", consumers: ["Platform Adapter (ROUTED by audience: owner→control bot, community+lead→userbot)"], payload: OutboundMessage }   # proactive/broadcast/DM/notice; routed adapter de-dups via outbox + obeys kill switch
+    - { event: outbound.sent,                version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, SocialContext (channel_state updater)],           payload: OutboundSent }     # proactive sends feed timing/activity evolution + consecutive-bot-message guard
+    # --- proactive / operations ---
+    - { event: atmosphere.cold,              version: 1, publisher: Atmosphere Monitor,              consumers: [Initiator],                                                         payload: AtmosphereState }
+    - { event: activity.proposed,            version: 1, publisher: Activity Planner,                consumers: [Approval Service],                                                  payload: ActivityProposal }
+    - { event: activity.due,                 version: 1, publisher: Scheduler,                       consumers: [Activity Planner],                                                  payload: ScheduledTick }    # periodic activity planning tick (topic_day/quiz); per-workspace tz like the other ticks
+    - { event: activity.approved,            version: 1, publisher: Approval Service,                consumers: [Activity Planner],                                                  payload: ApprovalDecision }   # Activity Executor lives inside the Activity Planner module
+    - { event: activity.rejected,            version: 1, publisher: Approval Service,                consumers: [Activity Planner],                                                  payload: ApprovalDecision }
+    - { event: cross_promo.proposed,         version: 1, publisher: Cross-Promotion,                 consumers: [Approval Service],                                                  payload: CrossPromoProposal }
+    - { event: cross_promo.approved,         version: 1, publisher: Approval Service,                consumers: [Cross-Promotion],                                                   payload: ApprovalDecision }
+    # --- evolution (closed loop; see modules.yaml evolution) ---
+    - { event: evolution.tuning_proposed,    version: 1, publisher: Evolution Reflector,             consumers: [Approval Service],                                                  payload: TuningProposal }   # only when evolution.auto_tune is OFF
+    - { event: evolution.tuning_decided,     version: 1, publisher: Approval Service,                consumers: [Evolution Reflector],                                               payload: ApprovalDecision }
+    - { event: evolution.reflection_due,     version: 1, publisher: Scheduler,                       consumers: [Evolution Reflector],                                               payload: ScheduledTick }
+    - { event: evolution.insights_generated, version: 1, publisher: Evolution Reflector,             consumers: [],                                                                  payload: InsightBatch }   # Strategy/Style Memory are INTERNAL sub-components of the Evolution module (updated in-process, not over the bus); this event is published for observability + future external consumers and currently has no external subscriber
+    - { event: knowledge.sync_due,           version: 1, publisher: Scheduler,                       consumers: [Content Sync Pipeline],                                             payload: ScheduledTick }
+    - { event: knowledge.updated,            version: 1, publisher: Content Sync Pipeline,           consumers: [RAG Engine],                                                        payload: KnowledgeDelta }
+    # --- operations / control / product levers ---
+    - { event: digest.due,                   version: 1, publisher: Scheduler,                       consumers: [Approval Service],                                                  payload: ScheduledTick }   # owner daily digest
+    - { event: retention.sweep_due,          version: 1, publisher: Scheduler,                       consumers: [Database service],                                                  payload: ScheduledTick }   # privacy retention sweep
+    - { event: content_calendar.due,         version: 1, publisher: Scheduler,                       consumers: [Initiator],                                                         payload: ScheduledTick }   # proactive planned content
+    - { event: content_gap.detected,         version: 1, publisher: RAG Engine,                      consumers: [Content Gap],                                                       payload: ContentGap }      # KB could not answer
+    - { event: lead.identified,              version: 1, publisher: Funnel,                          consumers: [Approval Service],                                                  payload: Lead }            # DM proposal -> owner (governance-gated)
+    - { event: lead.approved,                version: 1, publisher: Approval Service,                consumers: [Funnel],                                                            payload: ApprovalDecision }   # owner ✅ -> Funnel sends the DM
+    - { event: user.forget,                  version: 1, publisher: Approval Service,                consumers: [User Memory, "Database service (user-scoped raw-record purge/redaction)"], payload: ForgetRequest }   # owner /forget — note+opt-out erased by User Memory, user-scoped raw records purged/redacted by the Database service
+    - { event: onboarding.input,             version: 1, publisher: Approval Service,                consumers: [Onboarding Wizard],                                                 payload: OnboardingInput }  # Approval forwards owner control input that belongs to an active /setup session
+
+  # Payload schemas not already defined as domain types in contracts.yaml.
+  payloads:
+    RoutedMessage: |
+      interface RoutedMessage {
+        message: UnifiedMessage;
+        workspace: Workspace;          // resolved
+        allowedSources: string[];      // workspace.contentSources, copied for convenience
+      }
+    ModerationAction: |
+      interface ModerationAction {
+        channelId: string;
+        action: 'delete' | 'mute' | 'ban';   // ONE action per event (no combined delete+ban):
+                                              // delete is auto (L2) and emitted on moderation.violation
+                                              // immediately; mute/ban are L1 — emitted on
+                                              // moderation.escalated as a PROPOSAL, and only re-emitted as
+                                              // moderation.violation by the Approval Service after owner ✅.
+        tier?: 'black' | 'spam' | 'flood';   // black -> always also emits moderation.escalated
+        autonomy: 'auto' | 'proposed' | 'approved';  // auto=execute now; proposed=needs owner ✅; approved=owner confirmed -> execute
+        messageId?: string;
+        userId?: string;
+        durationSeconds?: number;      // for mute/ban
+        reason: string;                // logged, never shown in-channel (silent)
+      }
+    ReplySent: |
+      interface ReplySent {
+        correlationId: string;         // links back to the ReplyDraft journey
+        botMessageId: string;          // platform message id of the sent reply
+        channelId: string;
+        text: string;
+        intentCategory: string;
+        hadMarketing: boolean;
+        styleVariant: 'champion' | 'challenger';   // which evolution variant produced it
+        knowledgeSourcesUsed: string[];
+        sentAt: Date;
+      }
+    OutboundMessage: |
+      // The ONE way any module asks for a NON-reply send (proactive post, welcome,
+      // activity, owner digest/DM, funnel DM, member notice). Modules NEVER call the
+      // adapter directly (zero_coupling) and NEVER bypass the send_queue. The adapter
+      // is the sole consumer; it enqueues, de-duplicates via the outbox, and obeys the
+      // kill switch + lifecycle gates before sending.
+      interface OutboundMessage {
+        kind: 'proactive_post' | 'welcome' | 'activity' | 'digest' | 'dm' | 'notice';
+        via: 'userbot' | 'control';    // ROUTING: which Telegram identity sends this.
+                                        //   owner-facing (digest, approval items, /status, /why, owner DM) -> 'control'
+                                        //   community + lead-facing (proactive_post, welcome, activity, notice,
+                                        //   funnel DM to a LEAD) -> 'userbot' (the persona). Set by the producer;
+                                        //   the engine asserts owner-recipient kinds are never 'userbot'. System
+                                        //   notices (workspaceId='__system__') are always owner-facing via 'control'.
+        channelId?: string;            // target channel (omit for a DM)
+        dmUserId?: string;             // set for kind:'dm'/'digest' to the owner (via control) or a lead (via userbot)
+        content: OutgoingMessage;      // text (+ optional poll/media/buttons), already humanized by the producer
+        dedupeKey: string;            // idempotency key for the outbox (e.g. `welcome:<channel>:<user>`), kind-namespaced
+        notBefore?: Date;             // honor scheduled delay (welcome 1-3 min, quiet hours)
+        suppressIfKillSwitch?: boolean; // default true for proactive/activity; false for owner digest/DM + notice
+        correlationId?: string;       // present when caused by an inbound message (e.g. funnel DM)
+      }
+    OutboundSent: |
+      interface OutboundSent {
+        dedupeKey: string;
+        kind: string;
+        channelId?: string;
+        dmUserId?: string;
+        botMessageId: string;          // platform id of the sent message
+        sentAt: Date;
+      }
+    AtmosphereState: |
+      interface AtmosphereState {
+        channelId: string;
+        state: 'cold' | 'heated' | 'idle';
+        coldForHours?: number;
+        suggestedAction: 'share_news' | 'start_topic' | 'poll' | 'observe';
+      }
+    ScheduledTick: { interface: "{ jobId: string; firedAt: Date }" }
+    KnowledgeDelta: |
+      interface KnowledgeDelta {
+        sourceId: string;
+        added: number; updated: number; removed: number;
+        // RAG Engine re-indexes only the affected source; isolation unaffected.
+      }
+    ContentGap: |
+      interface ContentGap {
+        workspaceId: string;
+        question: string;      // paraphrased — NOT the asker's identity
+        topScore: number;      // below threshold = unanswered
+      }
+    Lead: |
+      interface Lead {
+        workspaceId: string;
+        channelId: string;
+        userId: string;
+        signal: string;        // why flagged (repeated engagement / explicit interest)
+        proposedDm: string;    // draft opener for owner to approve (governance L1)
+      }
+    OwnerAction: |
+      // The SINGLE authenticated control-plane ingress. Emitted by the CONTROL BOT
+      // adapter for EVERY owner input and ONLY for the owner: the adapter drops any
+      // sender != config.owner.approval_channel.user_id BEFORE emitting (a member who
+      // DMs the control bot never produces this event). workspaceId on the envelope MAY
+      // be empty — the Approval Service resolves the target workspace from itemRef /
+      // command scope, then stamps it on whatever it emits next.
+      interface OwnerAction {
+        senderId: string;                          // already owner-verified by the adapter
+        kind: 'decision' | 'command' | 'text';
+        decision?: 'approve' | 'reject' | 'amend'; // kind:'decision' — inline ✅/❌/📝 (callback query)
+        itemRef?: string;                          // pending-item id (from callback_data; or reply-to / #id token in the typed fallback)
+        amendText?: string;                        // kind:'decision' + 📝 amend
+        command?: string;                          // kind:'command' — '/pause' | '/resume' | '/quiet 2h' | '/status' | '/why <id>' | '/trace <id>' | '/forget <user|me>' | '/setup'
+        text?: string;                             // kind:'text' — free-form owner text (e.g. an onboarding interview answer)
+      }
+    OnboardingInput: |
+      // Approval Service (the control front door) forwards owner input that belongs to an
+      // active /setup session to the Onboarding Wizard, which owns the interview state
+      // machine. Keeps Approval the single authenticated bridge while onboarding stays a
+      // normal module reachable only over the bus.
+      interface OnboardingInput {
+        phase: 'start' | 'answer' | 'confirm' | 'cancel';
+        text?: string;                             // the owner's answer text (phase:'answer')
+      }
+    ForgetRequest: |
+      // owner /forget — FULL right-to-erasure. Consumed by TWO infra/module endpoints,
+      // each owning its own data: User Memory erases the distilled note + sets opted_out;
+      // the Database service purges/anonymizes its user-scoped raw records (messages,
+      // command_attempts, leads, moderation target ids where legally safe, and event_journal
+      // payload digests/reasons for that subject). No module writes another module's table directly.
+      interface ForgetRequest {
+        workspaceId: string;                       // resolved by Approval before emit
+        userId: string;                            // resolved target ('/forget me' resolved to the owner's id)
+        scope: 'full';
+      }
+    # MemberEvent / ReactionEvent / ActivityProposal / ApprovalDecision /
+    # CrossPromoProposal / TuningProposal / InsightBatch are defined inline where
+    # first owned (modules.yaml) — listed here so the catalog is complete.
+
+# -----------------------------------------------------------------------------
+# THE ORDERED REPLY PIPELINE
+# The reactive reply path is a versioned enrichment chain, NOT free fan-out.
+# Stages pass a single accumulating ReplyDraft inside the envelope. Each stage
+# enriches its own field and emits the next event. This ordering is a deliberate
+# contract — it is the one place coupling exists, and it is explicit + typed.
+# -----------------------------------------------------------------------------
+reply_pipeline:
+  draft_signature: |
+    interface ReplyDraft {
+      trigger: UnifiedMessage;                 // the message being answered
+      intent: { category: string; confidence: number; mustReply: boolean };
+      retrieval: KnowledgeChunk[];             // RAG context, isolation-filtered. Fetched by the
+                                               // chain head (Intent Router) via ctx.knowledge.search()
+                                               // (see contracts ModuleContext) — NOT a bus round-trip.
+                                               // ctx.knowledge emits content_gap.detected when topScore < threshold.
+      marketing?: { recommend: boolean; sourceId?: string; itemId?: string; angle?: string };
+      crossPromo?: { proposalId: string; product: string; tone: string } | null;
+      directives: string[];                    // accumulated style/content hints for Persona
+      styleVariant?: 'champion' | 'challenger'; // which evolution STYLE arm produced this reply.
+                                               // Set by Persona from ctx.styling.assign(workspaceId, correlationId)
+                                               // (see contracts ModuleContext StyleService) when it assembles the
+                                               // prompt; the Platform Adapter copies it onto ReplySent.styleVariant so
+                                               // Evolution can attribute the engaged outcome to the right arm. Absent
+                                               // when no STYLE experiment is running (treated as 'champion').
+      text?: string;                           // final reply text, set by Persona only
+    }
+  stages:   # fixed order; each consumes the previous event, emits the next
+    - { order: 1, module: Intent Router,   in: message.clean,  out: reply.needed,    owns: "intent + reply decision (chain head; may decline)" }
+    - { order: 2, module: Marketing,       in: reply.needed,   out: reply.enriched,  owns: "marketing field (passthrough when off/irrelevant/rate-limited)" }
+    - { order: 3, module: Cross-Promotion, in: reply.enriched, out: reply.ready,     owns: "crossPromo field (passthrough when module absent — default)" }
+    - { order: 4, module: Persona,         in: reply.ready,    out: reply.generated, owns: "text (assemble prompt, call LLM, humanize)" }
+  passthrough_rule: >-
+    Every stage except the head MUST emit its out-event even when it has nothing
+    to add: it forwards the same ReplyDraft (its owned field left null/false).
+    This is asserted by the pipeline_passthrough quality gate. The head (Intent
+    Router) is the sole stage allowed to NOT emit — that is how "no reply" is
+    expressed.
+  extension_rule: >-
+    Pipeline order is a versioned contract, not arbitrary pub/sub. Inserting a
+    new enrichment stage is the ONE sanctioned edit to the chain wiring: register
+    the new module and re-point exactly ONE subscription edge in this stages
+    table (the consumer that previously read the event you now insert before). No
+    existing module's internal behavior changes. Reviewers diff against this table
+    — it is the single source of truth for pipeline order.
+  absent_stage_bridge: >-
+    passthrough_rule covers a REGISTERED stage whose feature flag is OFF (it emits its
+    own out-event). A stage whose MODULE IS NOT REGISTERED AT ALL (an optional/`future`
+    stage — Cross-Promotion is the only current case) has no module to emit anything. The
+    ENGINE handles this from the stages table: at startup, for any stage whose module is
+    absent, it installs a built-in BRIDGE that subscribes the stage's in-event and re-emits
+    the unchanged envelope as the stage's out-event (its owned field left null). This is
+    engine infrastructure (whitelisted producer — see envelope.rules), NOT a module, so no
+    module ever emits an event outside its declared set. This is precisely how reply.ready
+    is produced when Cross-Promotion is unregistered; the Marketing module's publishes stays
+    [reply.enriched] only. Gate: pipeline_passthrough (which now asserts BOTH the flag-off
+    passthrough AND the unregistered-stage bridge).
+  failure_policy: >-
+    passthrough covers a DISABLED stage; this covers a stage that THROWS or TIMES
+    OUT (e.g. Persona's LLM call fails). A stage MUST wrap its work: on error or on
+    exceeding stage_timeout_seconds it logs the failure against the correlationId,
+    WRITES a pipeline_failures row (data-model — kind:'error'|'timeout', stage, reason),
+    and ABORTS the reply for that correlationId — it does NOT emit its out-event and
+    does NOT emit a half-built draft. Aborting is safe because the reply was never
+    delivered, so idempotency frees the correlationId on the next inbound (no stuck
+    chain, no partial send, no double send). A stage error is NEVER swallowed as a
+    silent passthrough (that would ship an un-humanized or un-enriched draft). The
+    bus also drops any pipeline event whose trigger is already older than
+    reply.max_staleness (the staleness guard applies at every stage, not just the
+    head). Repeated stage failures surface in the owner digest (read from
+    pipeline_failures) and the row doubles as the production resilience dead-letter.
+  inflight_supervisor: >-
+    The above relies on a stage to throw/time-out and report itself. A stage that
+    HANGS (an await that never resolves) or has a bug path that returns WITHOUT emitting
+    would otherwise drop the reply silently with no trace and no abort. So the engine
+    keeps an IN-FLIGHT REGISTRY: each correlationId entering the pipeline is recorded
+    with the stage it is in and a deadline (delivery.pipeline_inflight_deadline_seconds).
+    A supervisor sweeps it; any correlationId past its deadline without advancing is
+    FORCE-ABORTED (frees the slot, logs it, WRITES a pipeline_failures row with
+    kind:'hang_aborted', counts it for the digest). This makes a hung stage observable
+    and recoverable, not an invisible black hole. Gate: pipeline_watchdog.
+
+# Primary message-handling flow (reference sequence).
+flows:
+  message_handling:
+    steps:
+      - Platform Adapter: receive platform message -> UnifiedMessage -> emit message.received (workspaceId empty)
+      - Workspace Router: resolve workspace + allowedSources -> mint workspaceId -> emit message.routed
+      - Moderation:
+          on_violation: "emit moderation.violation(action:'delete', autonomy:'auto') -> Platform Adapter deletes NOW (silent); for mute/ban emit moderation.escalated(autonomy:'proposed') -> Approval Service -> owner ✅ -> moderation.violation(autonomy:'approved') executes"
+          on_classifier_failure: "FAIL CLOSED — hold the message / treat as violation candidate; never emit message.clean"
+          on_clean: emit message.clean
+      - Intent Router: decide (intent + reply_probability + active_hours). If reply warranted -> build ReplyDraft -> emit reply.needed; else stop.
+      - Marketing Engine: set/skip marketing field -> emit reply.enriched (always)
+      - Cross-Promotion (or passthrough): set/skip crossPromo -> emit reply.ready (always)
+      - "Persona Engine: ctx.styling.assign(workspaceId, correlationId) -> {variant, stylePrompt} (Thompson draw over the running STYLE experiment, deterministic per correlationId; 'champion' if none); assemble prompt with that STYLE section -> call LLM -> post-process (de-AI) -> set text + styleVariant -> emit reply.generated"
+      - Platform Adapter: delay + typing indicator + send via send_queue+outbox -> emit reply.sent (with styleVariant + correlationId)
+      - Evolution Tracker: record reply.sent for feedback tracking
+  edited_message_handling:
+    note: An edit is re-moderated, never re-replied. See envelope.rules (isEdit).
+    steps:
+      - Platform Adapter: receive edit update -> UnifiedMessage{isEdit:true, editOf} -> emit message.received
+      - Workspace Router -> Moderation re-evaluates: if now black/spam -> moderation.violation (delete/ban); else message.clean
+      - Intent Router: sees isEdit -> never emits reply.needed (no re-reply)
+      - Context Manager: updates the edited turn in the window in place
+  proactive_send:   # the previously-missing wiring: how non-reply messages reach the channel
+    note: >-
+      EVERY non-reply send (welcome, cold-revival, activity, owner digest/DM, funnel
+      DM, member notice) funnels through outbound.requested -> Platform Adapter, so
+      it shares the SAME send_queue + idempotent outbox + flood-safety as replies and
+      can never bypass them. No module owns a send path.
+    steps:
+      - "Producer (Welcome / Atmosphere Initiator / Activity Executor / Approval Service / Funnel / Onboarding): compose + humanize text -> emit outbound.requested (with dedupeKey, notBefore, suppressIfKillSwitch)"
+      - "Platform Adapter (selected by OutboundMessage.via — userbot for community/lead, control bot for owner): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, and correlationId so a restart can actually retry it; if dedupeKey already exists, drop (no double-send). If suppressIfKillSwitch and RoomRead.posture==stay_silent (kill switch OR account RETREAT), mark dropped. Honor notBefore; send via the matching send_queue (userbot under the account_survival floor: FLOOD_WAIT obedience + per-account ceiling; control bot under Bot-API limits) -> mark outbox sent with platform_message_id -> emit outbound.sent"
+      - "SocialContext updater: on outbound.sent bump last_bot_message_at + consecutive_bot_messages; Evolution Tracker records proactive sends for timing/activity feedback"
+  control_plane_ingress:   # how owner input reaches the bot — the single authenticated edge
+    note: >-
+      The owner's EVERY interaction with the bot (button taps, slash commands, onboarding
+      answers) enters through ONE event, control.owner_action, emitted by the CONTROL BOT
+      adapter and ONLY for the owner (the adapter drops non-owner senders before emitting).
+      The Approval Service is the sole consumer and the control front door; it resolves the
+      target workspace and dispatches. No adapter ever calls a module directly.
+    steps:
+      - "CONTROL BOT adapter: receive owner DM / inline-button callback -> verify senderId == owner user_id (else drop) -> emit control.owner_action (workspaceId may be empty; correlationId from the control message/callback id)"
+      - "Approval Service: dispatch by kind —
+          decision(✅/❌/📝): match itemRef to a pending item (callback_data first, else reply-to/#id), resolve its workspaceId, emit the item's decision event (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided, lead.approved, or moderation.violation(approved) for an L1 mute/ban);
+          command('/pause'|'/quiet'|'/resume'): write channel_state.paused_until / proactive_paused_until (the kill switch — the one control-owned write to channel_state, read by SocialContext for posture);
+          command('/status'|'/why'|'/trace'): compose from the event_journal (+ read-models) -> outbound.requested(kind:'dm', via:'control');
+          command('/forget <user|me>'): resolve userId+workspaceId -> emit user.forget;
+          command('/setup') or text during an active session: emit onboarding.input(start|answer); a confirm decision on the onboarding draft -> onboarding.input(confirm)"
+      - "Target consumer acts: Platform Adapter executes an approved moderation.violation; Funnel sends an approved lead DM; User Memory + Database service erase on user.forget; Onboarding Wizard advances its interview on onboarding.input"

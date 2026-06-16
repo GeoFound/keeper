@@ -1,0 +1,51 @@
+# capabilities.yaml — 项目在联邦中的供需声明（联邦模式：复用靠"提供/调用服务"，不共享代码）
+# 见 ~/ai-workspace/platform/CONTRACT.md。capabilities = 软信号（ai-cap note）。
+# 每行 tag 后的注释是本项目自评的复用速记；reuse_plan 段是分档 + offer 时机（纯文档，ai-cap 不解析）。
+project: telegram
+
+# 我对外提供的服务（ai-cap offer 写入）。实现并运行后才登记 ${ENV_VAR} 地址；
+# 现在为空 —— 本项目还是 spec-only，无运行服务，故全部尚未 offer。
+provides:
+  # - <tag>  ${ENV_VAR}
+
+# 我调用的别人的服务（ai-cap use 写入）。
+consumes:
+  # - <tag>
+
+# 我内部实现的能力（软信号；ai-cap note）。注释 = 复用分档·数据泄露·要点。
+capabilities:
+  - oracle.bandit        # A档·领域无关·零泄露 —— 自进化决策引擎（贝叶斯+Thompson+护栏+功率感知），最强复用品
+  - llm.route            # A档·领域无关·低泄露 —— LLM 网关+模型路由
+  - cost.budget          # A档·领域无关·低泄露 —— 每租户预算+断路器(reserve-not-check)+用量记账
+  - moderation.classify  # A档·领域无关·低泄露 —— 分级分类(black/gray/spam)+视觉+fail-closed（执行平台绑定，分类不是）
+  - rag.retrieve         # A档·服务可复用/数据按租户隔离 —— 隔离过滤检索+ingest+注入防御
+  - governance.gate      # A档·领域无关·低泄露 —— action-provenance+自治阶梯(L0–L3)（更宜作方法论）
+  - prompt.registry      # A档·低泄露 —— 版本化 prompt + champion/challenger 变体（persona 内容不复用）
+  - chat.gateway         # B档·同领域·平台耦合 —— 多平台消息归一化(UnifiedMessage)
+
+# ---------------------------------------------------------------------------
+# 复用分档 + offer 时机（本项目自评；纯文档，ai-cap 不读此段）
+# ---------------------------------------------------------------------------
+reuse_plan:
+  status: all_noted_none_offered   # 全部仅软信号(noted)，尚未 offer（spec-only，无运行服务）
+  policy: >-
+    联邦规则：先本地实现、重复无妨；真有第二个项目 ai-cap check 命中并要调用时，
+    才把对应能力 ai-cap offer <tag> ${ENV_VAR} 暴露为网络服务。绝不抽成共享代码包。
+    实现时把它们做成干净边界的内部 infra 服务（LLMGateway / KnowledgeService /
+    SocialContext 等），日后抽成网络服务很便宜；不要现在就建服务网格（单消费者=过度工程）。
+  tiers:
+    A_domain_agnostic:        # 任何项目任何领域可调，最值得做成服务
+      tags: [oracle.bandit, llm.route, cost.budget, moderation.classify, rag.retrieve, governance.gate, prompt.registry]
+      data_leak: none_to_low  # oracle.bandit 零泄露；rag.retrieve 服务可复用但数据按租户隔离
+    B_same_domain:            # 仅"聊天社区"类项目可复用
+      tags: [chat.gateway]
+      product_modules: [atmosphere, marketing, activity, cold_start, welcome]   # 对方也是社区机器人才复用（非 ai-cap tag）
+      shared_insights: same_domain_only   # 「短句回复率高」等方法论结论只对其他社区 workspace 有意义，不发无关项目
+    C_not_reusable:           # 项目/租户绑定 或 横切基础设施
+      platform_bound: [telegram-userbot, telegram-control]   # 平台层，天生不复用
+      per_tenant_data: [persona, style_memory, reply_feedback, user_memory, channel_state, knowledge_content]  # 复用即泄露，content_isolation 禁止
+      infra_conventions: [event_bus, outbox, send_queue, scheduler]   # 当约定/模板抄，既不做服务也不做共享包
+  evolution_data_reuse:       # 专门回答"自进化方法论 vs 数据"
+    engine_methodology: reusable        # = oracle.bandit，领域无关，零数据泄露 —— 复用首选
+    per_workspace_data: never           # 每 workspace 实验/反馈/画像，跨项目共享=泄露，禁止
+    shared_insights: same_domain_only   # 仅同领域(社区)内可复用的"方法论结论"，非原始数据

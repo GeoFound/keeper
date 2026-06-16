@@ -1,0 +1,511 @@
+# =============================================================================
+# DATA MODEL — SQLite (better-sqlite3). The DDL is authoritative.
+# =============================================================================
+
+data_model:
+  engine: sqlite
+  tables:
+    messages: |
+      -- Raw message log. Aged out by retention.sweep_due past message_retention_days.
+      -- Owner /forget purges all rows for a user_id (forget_purges_raw); the opt_out
+      -- keyword does NOT purge here (it only stops relationship memory).
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        correlation_id TEXT,                      -- envelope correlationId, for tracing
+        platform TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        platform_message_id TEXT,
+        sender_id TEXT,
+        sender_name TEXT,                         -- UNTRUSTED display string (never an instruction)
+        text TEXT,
+        media_type TEXT,                          -- image|video|file|sticker (NULL for text)
+        -- NOTE: black-tier-flagged media bytes are NEVER stored; only an audit row in
+        -- moderation logs records tier+reason. media_url here is a transient platform ref, not a re-host.
+        is_edit BOOLEAN DEFAULT FALSE,            -- this row is an edit (re-moderated, never re-replied)
+        edit_of TEXT,                             -- original platform_message_id this edit replaces
+        is_bot_reply BOOLEAN DEFAULT FALSE,
+        reply_to_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        edited_at DATETIME,                         -- latest platform edit timestamp/revision, if any
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      -- One canonical row per platform message. A genuine edit updates this row in place;
+      -- redelivered non-edit updates become no-op by this unique key.
+      CREATE UNIQUE INDEX ux_messages_platform_identity
+        ON messages (platform, channel_id, platform_message_id);
+    inbound_updates: |
+      -- Idempotency guard for inbound platform updates. This separates replayed updates
+      -- from genuine edits before any pipeline work starts. A replay hits this unique key
+      -- and stops; a genuine edit has update_kind='edit' plus a distinct update_identity
+      -- (Telegram update id / edit_date / pts) and proceeds to re-moderation. Multiple
+      -- edits to the same platform_message_id must each pass once; replaying the same edit
+      -- revision is the no-op.
+      CREATE TABLE inbound_updates (
+        id TEXT PRIMARY KEY,                         -- upd:<platform>:<channel>:<message>:<kind>:<identity>
+        platform TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        platform_message_id TEXT NOT NULL,
+        update_kind TEXT NOT NULL,                   -- message|edit
+        update_identity TEXT NOT NULL,               -- original message id, or per-edit revision/update id
+        correlation_id TEXT NOT NULL,
+        received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(platform, channel_id, platform_message_id, update_kind, update_identity)
+      );
+    reply_feedback: |
+      CREATE TABLE reply_feedback (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        correlation_id TEXT,                      -- links the whole reply journey
+        bot_message_id TEXT NOT NULL,
+        bot_reply_text TEXT,
+        reply_count INTEGER DEFAULT 0,
+        reaction_count INTEGER DEFAULT 0,
+        positive_reactions INTEGER DEFAULT 0,
+        negative_reactions INTEGER DEFAULT 0,     -- brake signal
+        was_quoted BOOLEAN DEFAULT FALSE,
+        user_complained BOOLEAN DEFAULT FALSE,    -- brake signal (sentiment on replies-to-bot)
+        member_left_after BOOLEAN DEFAULT FALSE,  -- brake signal
+        deleted_by_admin BOOLEAN DEFAULT FALSE,   -- brake signal (best-effort/platform-dependent)
+        intent_category TEXT,
+        had_marketing BOOLEAN DEFAULT FALSE,
+        style_variant TEXT,                       -- 'champion' | 'challenger' (experiment arm)
+        stratum TEXT,                             -- intent_category|time_bucket|had_marketing
+        composite_score REAL,                     -- computed at measurement time
+        knowledge_sources_used TEXT,
+        engaged INTEGER,                          -- the PRIMARY metric (0/1), written at measurement time (NULL until measured)
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        measured_at DATETIME
+      );
+      -- Index for the engaged-metric attribution lookup (modules.yaml evolution.primary_metric):
+      -- match a subsequent human reply/quote (message.clean.replyTo.messageId) or reaction to a
+      -- tracked bot_message_id within the attribution window.
+      CREATE INDEX ix_reply_feedback_botmsg ON reply_feedback (workspace_id, bot_message_id);
+    style_memory: |
+      CREATE TABLE style_memory (
+        workspace_id TEXT PRIMARY KEY,
+        preferred_expressions TEXT,
+        preferred_emoji TEXT,
+        avg_response_length INTEGER,
+        high_engagement_topics TEXT,
+        low_engagement_topics TEXT,
+        custom_prompt_additions TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    evolution_log: |
+      CREATE TABLE evolution_log (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        reflection_text TEXT,
+        prompt_adjustments TEXT,
+        style_updates TEXT,
+        sample_count INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    evolution_experiments: |
+      -- One Bayesian champion/challenger experiment on the STYLE prompt section.
+      -- Beta posteriors over the PRIMARY metric (engaged, Bernoulli) + guardrail rates.
+      -- This table is what makes evolution falsifiable, decidable-at-any-n, and reversible.
+      CREATE TABLE evolution_experiments (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        status TEXT DEFAULT 'running',            -- queued|running|promoted|rejected|rolled_back
+        champion_prompt TEXT NOT NULL,            -- live STYLE at experiment start (the prior, for rollback)
+        challenger_prompt TEXT NOT NULL,
+        -- Beta(α,β) posteriors over the primary metric (engaged). Init (1,1).
+        champion_alpha REAL DEFAULT 1, champion_beta REAL DEFAULT 1,
+        challenger_alpha REAL DEFAULT 1, challenger_beta REAL DEFAULT 1,
+        champion_samples INTEGER DEFAULT 0,
+        challenger_samples INTEGER DEFAULT 0,
+        -- Thompson allocation clamp (challenger share kept within [floor,cap])
+        challenger_ratio_floor REAL DEFAULT 0.05,
+        challenger_ratio_cap REAL DEFAULT 0.5,
+        min_exposure INTEGER DEFAULT 30,          -- min challenger replies before a promotion can fire
+        promote_prob REAL DEFAULT 0.95,           -- P(challenger>champion) bar (peek-safe Bayesian)
+        posterior_prob_better REAL,               -- P(θ_challenger > θ_champion), computed at each look
+        -- guardrail rates (challenger vetoed if any worse than champion beyond tolerance)
+        guardrail_json TEXT,                      -- {complaint_rate, member_left_rate, negative_reaction_rate, admin_deleted_rate} per arm + tolerances
+        baseline_alpha REAL, baseline_beta REAL,  -- pre-promotion champion posterior, watched for regression
+        composite_score REAL,                     -- SECONDARY diagnostic only (not the decision)
+        decision_reason TEXT,
+        approved_by_owner BOOLEAN,                -- when auto_tune off
+        dimension TEXT DEFAULT 'style',          -- style|timing|activity_type|marketing_angle (evolution multi-dim)
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decided_at DATETIME,
+        rolled_back_at DATETIME
+      );
+      -- Enforce evolution.experiment.one_active_per_dimension at the DB level:
+      -- at most one running experiment per (workspace, dimension).
+      CREATE UNIQUE INDEX ux_one_running_experiment
+        ON evolution_experiments (workspace_id, dimension)
+        WHERE status = 'running';
+    shared_insights: |
+      CREATE TABLE shared_insights (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        description TEXT NOT NULL,
+        confidence REAL DEFAULT 0.5,
+        sample_count INTEGER DEFAULT 0,
+        derived_from TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    activities: |
+      CREATE TABLE activities (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        plan TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        approval_message_id TEXT,
+        owner_response TEXT,
+        scheduled_at DATETIME,
+        executed_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    approval_items: |
+      -- The persistent owner-decision queue. Approval authority must survive restarts;
+      -- callbacks/reply-to/#id all resolve through this table, never in-memory state.
+      CREATE TABLE approval_items (
+        item_ref TEXT PRIMARY KEY,                  -- callback_data / #id token
+        workspace_id TEXT NOT NULL,
+        type TEXT NOT NULL,                        -- moderation|activity|lead|evolution|onboarding|cross_promo
+        source_event_id TEXT,
+        source_correlation_id TEXT,
+        status TEXT DEFAULT 'pending',             -- pending|approved|rejected|amended|expired|cancelled
+        safe_default TEXT NOT NULL,                -- reject|hold|drop
+        payload_json TEXT NOT NULL,                -- redacted proposal payload, no secrets/media bytes
+        approval_message_id TEXT,                  -- control-bot DM message id
+        owner_response TEXT,
+        amend_text TEXT,
+        expires_at DATETIME NOT NULL,
+        decided_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_approval_items_pending
+        ON approval_items (workspace_id, status, expires_at);
+    marketing_log: |
+      CREATE TABLE marketing_log (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        content_source_id TEXT,
+        content_item_id TEXT,
+        mention_type TEXT,
+        engagement_score REAL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    command_attempts: |
+      -- Every time a member tries to command the bot (action request, prompt
+      -- injection, or an out-of-scope demand) it is handled SILENTLY and logged
+      -- here — for owner visibility + abuse/injection-rate detection. See
+      -- contracts.yaml governance.
+      CREATE TABLE command_attempts (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT,
+        sender_id TEXT,
+        text TEXT,
+        kind TEXT,                               -- action_request|control_override|out_of_scope
+        handled TEXT DEFAULT 'silent',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_command_attempts_subject
+        ON command_attempts (workspace_id, sender_id, created_at);
+    channel_state: |
+      -- Read-model backing SocialContext.assess(): community phase + room temp.
+      -- Refreshed on message.clean / member events; queried by Intent Router +
+      -- Atmosphere so the whole engine shares one notion of "度".
+      CREATE TABLE channel_state (
+        channel_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        member_count INTEGER DEFAULT 0,
+        active_members_24h INTEGER DEFAULT 0,
+        messages_24h INTEGER DEFAULT 0,
+        phase TEXT DEFAULT 'seed',               -- seed|spark|grow|mature
+        temperature TEXT DEFAULT 'silent',       -- silent|calm|lively|heated|argument
+        last_human_message_at DATETIME,
+        last_bot_message_at DATETIME,
+        consecutive_bot_messages INTEGER DEFAULT 0,
+        paused_until DATETIME,                   -- kill switch: fully silent until (owner /pause)
+        proactive_paused_until DATETIME,         -- /quiet: proactive off, moderation stays
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    workspace_runtime_state: |
+      -- Durable operational state for holds that are not human /pause: cost read-only,
+      -- missing required platform rights, adapter auth/access failures, and safety holds.
+      -- /status and the owner digest read this so a restart does not hide a degraded state.
+      CREATE TABLE workspace_runtime_state (
+        workspace_id TEXT PRIMARY KEY,
+        mode TEXT DEFAULT 'normal',              -- normal|read_only|safety_hold|disabled
+        reason TEXT,
+        details_json TEXT,                       -- redacted, no secrets/media bytes
+        until DATETIME,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    knowledge_items: |
+      CREATE TABLE knowledge_items (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        type TEXT,
+        title TEXT,
+        url TEXT,
+        tags TEXT,
+        language TEXT,
+        chunk_count INTEGER,
+        content_hash TEXT,
+        created_at DATETIME,
+        updated_at DATETIME,
+        synced_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    source_sync_state: |
+      -- Per-source incremental sync checkpoint. Supports cursor/since pagination,
+      -- restart-safe resumption, and embedding-model compatibility checks.
+      CREATE TABLE source_sync_state (
+        source_id TEXT PRIMARY KEY,
+        adapter TEXT NOT NULL,
+        cursor TEXT,
+        since DATETIME,
+        last_success_at DATETIME,
+        last_error TEXT,
+        embedding_model TEXT,
+        embedding_dim INTEGER,
+        full_reembed_required BOOLEAN DEFAULT FALSE,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    knowledge_chunks: |
+      -- Text chunks used by RAG. source_id is the isolation key; embedding_model/dim make
+      -- model changes detectable instead of silently mis-scoring vectors.
+      CREATE TABLE knowledge_chunks (
+        id TEXT PRIMARY KEY,                       -- source:item:chunk_index:content_hash
+        source_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        title TEXT,
+        text TEXT NOT NULL,
+        url TEXT,
+        content_hash TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding_dim INTEGER NOT NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(source_id, item_id, chunk_index, content_hash)
+      );
+      CREATE INDEX ix_knowledge_chunks_source
+        ON knowledge_chunks (source_id, item_id);
+    knowledge_vectors: |
+      -- sqlite-vec virtual table created with the configured embedding dimension during
+      -- migration (e.g. float[1536] for text-embedding-3-small). knowledge_vector_map
+      -- links sqlite rowid back to knowledge_chunks; queries must pre-filter candidate
+      -- chunk_ids by allowed source_id before/during KNN, never post-filter the global top-K.
+      CREATE VIRTUAL TABLE knowledge_vectors USING vec0(
+        embedding float[1536]
+      );
+    knowledge_vector_map: |
+      -- Stable mapping between sqlite-vec rowid and knowledge_chunks.id. Keeping source_id
+      -- here lets the vector worker build the allowed candidate set before KNN.
+      CREATE TABLE knowledge_vector_map (
+        chunk_id TEXT PRIMARY KEY,
+        vector_rowid INTEGER NOT NULL UNIQUE,
+        source_id TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding_dim INTEGER NOT NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_knowledge_vector_map_source
+        ON knowledge_vector_map (source_id, vector_rowid);
+    daily_budget_state: |
+      -- Atomic reserve-not-check budget state. LLMGateway updates this row BEFORE any
+      -- generative/ingest/media call, then reconciles to actual llm_usage after completion.
+      CREATE TABLE daily_budget_state (
+        workspace_id TEXT NOT NULL,
+        day TEXT NOT NULL,                         -- YYYY-MM-DD in workspace timezone
+        generative_budget_usd REAL NOT NULL,
+        ingest_budget_usd REAL NOT NULL,
+        media_scan_cap INTEGER NOT NULL,
+        generative_reserved_usd REAL DEFAULT 0,
+        generative_actual_usd REAL DEFAULT 0,
+        ingest_reserved_usd REAL DEFAULT 0,
+        ingest_actual_usd REAL DEFAULT 0,
+        media_scans_reserved INTEGER DEFAULT 0,
+        media_scans_used INTEGER DEFAULT 0,
+        read_only_until DATETIME,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (workspace_id, day)
+      );
+    llm_usage: |
+      -- Cost circuit breaker backing. Per workspace per day; LLMGateway checks the
+      -- daily_budget_state reservation row BEFORE each call and appends actual usage here
+      -- after completion for audit/model/purpose breakdowns.
+      CREATE TABLE llm_usage (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        day TEXT NOT NULL,                       -- YYYY-MM-DD (workspace timezone)
+        model TEXT,
+        purpose TEXT,                            -- chat|classifier|embedding|reflection|moderation_vision
+        tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0,
+        calls INTEGER DEFAULT 0,
+        UNIQUE(workspace_id, day, model, purpose)
+      );
+    user_memory: |
+      -- Per-user relationship memory (feature_flag user_memory, default OFF).
+      -- Stores a DISTILLED summary, never raw logs. Privacy-bounded + opt-out.
+      CREATE TABLE user_memory (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        display_name TEXT,
+        summary TEXT,                            -- distilled note, not transcripts
+        topics TEXT,                             -- json array
+        last_seen DATETIME,
+        opted_out BOOLEAN DEFAULT FALSE,         -- true -> no recall, no collection
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+    content_gaps: |
+      -- Community -> content reverse signal. Paraphrased question, no asker identity.
+      CREATE TABLE content_gaps (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        asked_count INTEGER DEFAULT 1,
+        top_score REAL,                          -- best RAG score (below threshold)
+        suggested_source_id TEXT,
+        first_asked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_asked_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    leads: |
+      -- DM funnel (feature_flag funnel, default OFF). A DM is governance-gated.
+      CREATE TABLE leads (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT,
+        user_id TEXT NOT NULL,
+        stage TEXT DEFAULT 'identified',         -- identified|proposed|dm_sent|converted|dropped
+        signal TEXT,
+        approval_message_id TEXT,                -- owner approval of the DM (autonomy L1)
+        dm_sent_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_leads_subject
+        ON leads (workspace_id, user_id, created_at);
+    outbox: |
+      -- Backs idempotent_delivery + send_queue for EVERY send (reply.generated AND
+      -- outbound.requested). A row is written 'pending' BEFORE the platform call and
+      -- marked 'sent' on confirm. On restart the bot reconciles: a 'pending' row within
+      -- max_staleness is retried ONCE (dedupe_key makes it safe — no double send), past
+      -- staleness it is marked 'dropped'. This is what makes a mid-flight crash neither
+      -- double-send nor silently lose a reply.
+      CREATE TABLE outbox (
+        dedupe_key TEXT PRIMARY KEY,             -- KIND-NAMESPACED (idempotent_delivery.dedupe_key_namespace): replies use `reply:<correlationId>`, proactive sends use OutboundMessage.dedupeKey (`<kind>:<...>`, e.g. welcome:<ch>:<user>). The namespace is what keeps the reply and proactive key spaces from colliding in this shared PK.
+        workspace_id TEXT NOT NULL,
+        correlation_id TEXT,
+        platform TEXT DEFAULT 'telegram',
+        via TEXT NOT NULL,                       -- userbot|control (for Telegram); enough to pick the send queue on retry
+        channel_id TEXT,
+        dm_user_id TEXT,
+        kind TEXT NOT NULL,                      -- reply|proactive_post|welcome|activity|digest|dm|notice
+        payload_json TEXT NOT NULL,              -- serialized OutgoingMessage; no secrets or media bytes; pruned with terminal rows
+        suppress_if_kill_switch BOOLEAN DEFAULT TRUE,
+        status TEXT DEFAULT 'pending',           -- pending|sent|dropped|failed
+        attempts INTEGER DEFAULT 0,
+        not_before DATETIME,                     -- honor scheduled delay / quiet hours
+        trigger_at DATETIME,                     -- for staleness reconciliation
+        platform_message_id TEXT,                -- set on 'sent'
+        last_error TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        sent_at DATETIME
+      );
+    account_health: |
+      -- Account-survival state for the USERBOT only (overview operations.account_survival;
+      -- the control bot is a disposable Bot-API bot and is not tracked here).
+      -- One row per platform account. Backs the per-account global send ceiling, the
+      -- cold-start warm-up curve, FLOOD_WAIT tracking, and RETREAT. RETREAT folds into
+      -- SocialContext (posture==stay_silent) so every module obeys it like the kill switch.
+      CREATE TABLE account_health (
+        account_id TEXT PRIMARY KEY,             -- platform account identity (the owner's user account)
+        platform TEXT NOT NULL,
+        first_active_at DATETIME,                -- start of the warm-up window
+        sends_today INTEGER DEFAULT 0,           -- account-wide (all channels+DMs), reset daily
+        dms_today INTEGER DEFAULT 0,
+        day TEXT,                                -- YYYY-MM-DD for the counters above
+        flood_wait_count INTEGER DEFAULT 0,      -- FLOOD_WAITs in the current window
+        flood_window_started_at DATETIME,
+        last_flood_wait_seconds INTEGER,
+        retreat_until DATETIME,                  -- in RETREAT while now < this (proactive off, reactive throttled)
+        session_valid BOOLEAN DEFAULT TRUE,      -- false -> out-of-band owner auth alert
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    moderation_actions: |
+      -- Audit log of every moderation action (delete/mute/ban/escalate). Powers /why,
+      -- the daily digest counts (spam blocked, black-tier escalations), and abuse stats.
+      -- For black-tier media hits this is the ONLY record kept — tier + reason, NEVER the
+      -- media bytes (never_store_flagged_media).
+      CREATE TABLE moderation_actions (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT,
+        target_user_id TEXT,
+        target_message_id TEXT,
+        action TEXT NOT NULL,                    -- delete|mute|ban (one per row; delete is auto, mute/ban logged when owner-approved)
+        autonomy TEXT,                           -- auto|proposed|approved (mute/ban are owner-confirmed L1)
+        tier TEXT,                               -- black|spam|flood
+        modality TEXT,                           -- text|media
+        reason TEXT,                             -- logged, NEVER shown in-channel (silent)
+        escalated BOOLEAN DEFAULT FALSE,         -- true for black-tier owner DM
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_moderation_actions_target
+        ON moderation_actions (workspace_id, target_user_id, created_at);
+    event_journal: |
+      -- THE single append-only "everything that happened" record — the spine of
+      -- observability (overview operations.observability). A bus middleware writes ONE row
+      -- per event emission (so the FULL ordered story of any correlationId is one query),
+      -- plus modules/engine write synthetic TRACE rows for things that do not emit an event
+      -- (e.g. Intent Router deciding NOT to reply, a lifecycle/posture change, a force-abort)
+      -- so "why did nothing happen?" is answerable too. causation_id persists the causal
+      -- graph the envelope models. payload_digest is REDACTED + size-capped: it NEVER contains
+      -- the session string, bot token, API keys, or flagged-media bytes (gate: journal_no_secrets).
+      -- If user-scoped text appears, subject_user_id/channel/message metadata is set so /forget
+      -- can redact payload_digest/reason while preserving the trace skeleton.
+      -- Written via a BATCHED async buffer off the receive/send critical path (better-sqlite3
+      -- is synchronous — see tech_stack.database); pruned by retention.sweep_due past
+      -- observability.journal_retention_days.
+      CREATE TABLE event_journal (
+        id INTEGER PRIMARY KEY,
+        event_id TEXT,                           -- envelope eventId (generated for synthetic trace rows)
+        correlation_id TEXT,                     -- the spine: one message's whole journey shares this
+        causation_id TEXT,                       -- the eventId that directly caused this (the causal edge)
+        workspace_id TEXT,                       -- may be empty for pre-resolution events (message.received/control.owner_action)
+        subject_user_id TEXT,                    -- set when payload_digest/reason contains user-scoped text or user-specific state
+        channel_id TEXT,
+        platform_message_id TEXT,
+        contains_user_text BOOLEAN DEFAULT FALSE,
+        name TEXT NOT NULL,                      -- event name, OR a trace name (decision.no_reply, lifecycle.posture, pipeline.abort, ...)
+        kind TEXT NOT NULL,                      -- event | decision | lifecycle | error
+        stage TEXT,                              -- emitting module / pipeline stage
+        level TEXT DEFAULT 'info',               -- info | warn | error (for filtering)
+        reason TEXT,                             -- human-readable why (esp. for decision/error rows: "posture==stay_silent")
+        payload_digest TEXT,                     -- REDACTED, size-capped JSON summary — never secrets/credentials/media bytes
+        redacted_at DATETIME,                    -- set by /forget subject redaction, if applicable
+        at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_journal_corr ON event_journal (correlation_id, at);
+      CREATE INDEX ix_journal_ws_time ON event_journal (workspace_id, at);
+      CREATE INDEX ix_journal_name ON event_journal (name, at);
+      CREATE INDEX ix_journal_subject ON event_journal (workspace_id, subject_user_id, at);
+    pipeline_failures: |
+      -- Dead-letter + observability for the reply pipeline. A row is written when a stage
+      -- THROWS or TIMES OUT (events.yaml failure_policy) or is FORCE-ABORTED by the in-flight
+      -- supervisor (events.yaml inflight_supervisor). Read by the Approval Service for the
+      -- daily digest ("repeated pipeline-stage failures") and by the production resilience
+      -- dead-letter gate. This is the persistence the digest's failure section reads from —
+      -- without it those failures would live only in logs and be un-derivable at digest time.
+      CREATE TABLE pipeline_failures (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT,                       -- may be empty if the failure precedes workspace resolution
+        correlation_id TEXT,
+        stage TEXT,                              -- intent|marketing|cross_promotion|persona
+        kind TEXT NOT NULL,                      -- error|timeout|hang_aborted
+        reason TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );

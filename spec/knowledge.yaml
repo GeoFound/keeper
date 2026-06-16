@@ -1,0 +1,144 @@
+# =============================================================================
+# KNOWLEDGE — content provider protocol, source adapters, shared intelligence.
+# =============================================================================
+
+# Read-only endpoints exposed by the website (content) side.
+content_provider_protocol:
+  endpoints:
+    - method: GET
+      path: /api/content-feed
+      params: [since (incremental), cursor (pagination), limit, type (filter)]
+      response_example: |
+        {
+          "source_id": "my-ai-site",
+          "source_name": "我的AI站",
+          "items": [{
+            "id": "article-123",
+            "type": "article",
+            "title": "GPT-5 发布了什么新功能",
+            "summary": "...",
+            "content": "完整正文...",
+            "url": "https://mysite.com/blog/gpt5",
+            "tags": ["gpt","openai"],
+            "language": "zh",
+            "created_at": "2026-06-13T10:00:00Z",
+            "updated_at": "2026-06-13T10:00:00Z",
+            "metadata": {}
+          }],
+          "has_more": false,
+          "cursor": "abc123"
+        }
+    - method: GET
+      path: /api/content-feed/{id}
+      response: full single content item
+
+source_adapters:
+  - { type: api,      use: Content Feed API, config: endpoint + auth }
+  - { type: rss,      use: RSS/Atom feed,    config: feed URL }
+  - { type: crawl,    use: web crawling,     config: sitemap or URL list }
+  - { type: file,     use: local files,      config: directory path, hot-reload supported }
+  - { type: database, use: direct DB,        config: connection string + SQL }
+
+sync_state:
+  rule: >-
+    Every source adapter persists its incremental checkpoint in `source_sync_state`
+    (cursor and/or since). A restart resumes from the last successful checkpoint and
+    dedups by knowledge_items.content_hash / knowledge_chunks.content_hash, so pagination
+    cannot skip or duplicate content. Checkpoints advance only after chunks + vectors are
+    committed in the same sync transaction.
+
+# Indirect prompt-injection defense. Retrieved content (esp. crawled/RSS) is
+# UNTRUSTED — it may contain "ignore your instructions...". We defended against
+# MEMBERS commanding the bot (governance); this defends the OTHER ingress: content.
+retrieval_safety:
+  rule: Retrieved chunks are DATA, never instructions. They can inform what the bot says, never change what it does or who it is.
+  measures:
+    - wrap every chunk in explicit delimiters and label it "untrusted reference content" in the prompt.
+    - strip/neutralize instruction-like patterns ("ignore previous", "system:", role markers) at ingest (sync pipeline), not just at query.
+    - the assembled prompt keeps system/persona/boundary sections ABOVE and immune to retrieved text.
+    - a chunk can never trigger a tool/action — actions have only the two provenances in governance.
+  gate: indirect_injection (overview quality_gates) — a poisoned fixture chunk must not alter identity, boundaries, or cause any action.
+
+# The THIRD ingress (besides member commands and retrieved content): member-derived
+# DISPLAY strings that ride along inside otherwise-conversation data. A username,
+# display name, or quoted/replyTo text is attacker-chosen and lands in the prompt
+# context (welcome echoes it, Persona sees the quoted line, Context Manager lists
+# participants). Treated as commands it is a trivial injection.
+untrusted_input:
+  rule: ALL member-derived strings — sender.username, sender.displayName, replyTo.text, and any quoted/forwarded text — are UNTRUSTED DATA, exactly like retrieved chunks. They inform what the bot says, never what it does or who it is.
+  measures:
+    - whenever a name or quoted text enters an LLM prompt, delimit + label it untrusted and keep it BELOW the system/persona/boundary sections (same envelope as retrieved chunks).
+    - never echo a raw display name into a privileged path; a name is rendered as plain text, never interpreted.
+    - the same instruction-pattern neutralization applied to chunks applies to names/quoted text used in prompts.
+  gate: untrusted_input (overview quality_gates) — a crafted name / quoted line must not alter identity, boundaries, or cause any action.
+
+# Embedding model is a hard compatibility boundary for the vector store.
+# Isolation must not silently cost RECALL. A shared vector table with POST-KNN
+# filtering is safe (never leaks) but drops relevant in-workspace chunks that were
+# crowded out of the global top-K by other workspaces' vectors. The filter must be
+# pre/in-KNN (see contracts.yaml content_isolation.recall_note).
+retrieval_recall:
+  rule: The source_id filter is applied BEFORE/DURING KNN (per-workspace partition or filtered candidate set), not after, so a workspace's top-K is drawn from ITS OWN corpus.
+  test: >-
+    Seed a multi-workspace corpus where workspace A's relevant chunks are globally
+    out-ranked by workspace B's vectors. Assert A's query still returns A's relevant
+    chunks in its top-K (recall preserved), not just "no B chunks" (safety). A post-KNN
+    filter implementation fails this; a pre-KNN partition/filter passes.
+
+embedding_compatibility:
+  rule: >-
+    All vectors in sqlite-vec share one embedding model + dimension (config llm.models.embedding).
+    Changing the embedding model invalidates every stored vector (different space/dimension). A model
+    change therefore requires a FULL re-embed of all sources, run under the ingest budget, before the
+    new vectors are queryable. The sync pipeline records the model used per item so a mismatch is detected,
+    not silently mis-scored. Stale chunks are marked via source_sync_state.full_reembed_required and
+    excluded from KnowledgeService.search until their knowledge_chunks + knowledge_vectors rows have been
+    rebuilt with the new model/dimension.
+
+# Content-gap reverse signal: what the community asks that the KB can't answer.
+content_gap_detection:
+  rule: When RAG's top score < content_gap.min_score, the question is logged as an unanswered gap (content_gaps table) and emitted as content_gap.detected.
+  value: distilled into the owner digest ("本周 N 人问了 X，建议补一篇") — community drives the content calendar.
+  privacy: store the QUESTION (paraphrased), not the asker's identity.
+
+# Shared Intelligence — methodology is shared across workspaces; content is NOT.
+shared_intelligence:
+  rule: Content is never shared; methodology is shared.
+  write_gate: >-
+    An insight is written to shared_insights ONLY when confidence >= shared_min_confidence
+    AND sample_count >= shared_min_samples (see modules.yaml evolution.shared_contribution).
+    Unproven hunches stay private — this keeps the shared pool trustworthy for
+    cold-starting new workspaces.
+  reusable_examples:
+    - 短句回复互动率更高
+    - emoji 用 😂 比 🤣 更自然
+    - 周五晚上发活动参与率最高
+    - 问答后追一句推荐效果好
+    - 营销话术模板
+    - 活动策划模板
+  non_reusable_examples:
+    - 网站 A 的文章内容
+    - 网站 B 的产品信息
+    - 某个群的对话历史
+    - 某个 workspace 的用户信息
+  signature: |
+    interface StrategyMemory {
+      conversational_insights: Insight[];
+      marketing_insights: Insight[];
+      activity_insights: Insight[];
+      timing_insights: Insight[];
+      tactic_templates: TacticTemplate[];
+    }
+    interface Insight {
+      id: string;
+      category: string;
+      description: string;     // "短句（<30字）的回复获得回复的概率高 40%"
+      confidence: number;
+      sample_count: number;
+      derived_from_workspaces: string[];
+      created_at: Date;
+    }
+  reuse_flow: >-
+    Workspace A runs 72h -> reflects -> produces private style_memory + shared
+    methodology. Workspace B is created -> cold-starts from Strategy Memory ->
+    evolves independently on its own data.

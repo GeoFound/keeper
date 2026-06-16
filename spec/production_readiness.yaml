@@ -1,0 +1,103 @@
+# =============================================================================
+# PRODUCTION READINESS — a SEPARATE track so "functional-complete" can never
+# masquerade as "production-ready". The 14 build_order steps make the system
+# correct + feature-complete + single-node runnable. These gates make it
+# survivable under real traffic, real failures, and real scrutiny. They are NOT
+# prerequisites for the functional steps; they ARE prerequisites for a
+# production launch. Same discipline as acceptance.yaml: each gate is proven by
+# evidence (`just verify-prod <id>`), never by assertion.
+# =============================================================================
+
+meta:
+  rule: >-
+    A "production launch" claim is valid only when every gate below is green with
+    evidence. Until then the honest status is "functional MVP", stated as such.
+  scaling_note: >-
+    The $5 single-node SQLite default is the DEV/SMALL floor, not the ceiling. The
+    tech_stack `alt:` entries (Postgres, Chroma/Qdrant, BullMQ) are the documented
+    scale-out path; these gates assume the system may be moved off single-node, and
+    the core modules must not assume otherwise.
+
+gates:
+  - id: observability
+    requirement: >-
+      BUILDS ON the functional observability floor already shipped at build_order step 1
+      (operations.observability: the event_journal + structured redacted logging + the
+      trace/tail/inspect + /trace,/why,/status read interface — the human can already
+      reconstruct any correlationId's full flow). This production gate adds the OPERATOR
+      scale layer on top: metrics (messages/min, reply rate, LLM cost/tokens per workspace/
+      day, queue depth, FLOOD_WAIT rate, error rate, breaker trips, account-survival RETREATs,
+      account-wide send rate vs ceiling, journal write-lag), aggregate traces across the reply
+      pipeline, and a dashboard + alerting on: breaker tripped, error-rate spike, queue
+      backlog, repeated pipeline failures (from pipeline_failures), black-tier escalation,
+      account RETREAT / approaching the account send ceiling, invalid session. The step-1
+      redaction guarantee (no secrets in journal/logs) extends to metrics/traces too.
+    evidence: "metrics endpoint scraped in a test; an injected error fires an alert rule; a trace shows a full reply correlationId path (drawn from the event_journal); a secret-scan of metrics/traces is clean."
+  - id: resilience
+    requirement: >-
+      Every external call (Telegram, LLM, sources) has timeout + retry + bounded
+      failure. A dead/poison event is dead-lettered, not silently dropped. The bot
+      recovers from: LLM provider outage (degrade, not crash), DB lock contention,
+      adapter disconnect (reconnect with backoff). No unhandled rejection takes the
+      process down. Moderation classifier failures FAIL CLOSED (hold, never pass clean).
+      The reply pipeline has an in-flight supervisor so a hung stage is force-aborted,
+      not leaked.
+    evidence: "chaos test: kill the LLM endpoint / DB / adapter mid-run and assert graceful degrade + recovery; a poison event lands in the dead-letter, pipeline keeps flowing; a seeded classifier error holds the message; a seeded pipeline hang is force-aborted within the deadline."
+  - id: account_survival
+    requirement: >-
+      USERBOT-specific: the integration drives the OWNER'S real Telegram account, so an
+      account ban is the one unrecoverable failure. FLOOD_WAIT is always honored in full;
+      a per-account global send ceiling + cold-start warm-up + human pacing are enforced;
+      recurring flood/anomaly signals trip RETREAT and alert the owner out-of-band; DMs are
+      capped low (never bulk). Session-string validity is monitored; an expired/revoked
+      session alerts the owner instead of crash-looping.
+    evidence: "a soak test holds the account-wide send rate under the configured ceiling across multiple channels for M hours with zero FLOOD_WAIT-induced bans; a simulated recurring FLOOD_WAIT trips RETREAT + owner alert; an invalidated session produces an out-of-band alert, not a crash loop."
+  - id: load_perf
+    requirement: >-
+      A documented capacity target (msgs/sec per node, max workspaces/channels) backed
+      by a load test. Backpressure under flood (send_queue + classifier pre-filter hold;
+      memory bounded). p50/p95 reply latency measured and within target.
+    evidence: "load-test script drives N msgs/sec for M minutes; report shows latency percentiles, bounded memory, no queue runaway, no ban."
+  - id: data_durability
+    requirement: >-
+      Automated backup of bot.db (relational + vectors) with a TESTED restore. A schema
+      migration path (versioned, forward-only) that preserves data. Retention sweep +
+      /forget proven idempotent and crash-safe.
+    evidence: "backup taken, DB wiped, restore verified byte/row-equal; a migration applied to a populated DB preserves rows; restore drill documented in the runbook."
+  - id: security
+    requirement: >-
+      A security review covering: the two injection ingresses (chat + retrieved content
+      + member-derived strings), secret handling (no secrets in logs/db/repo — dev-secret
+      only), action-provenance (no privileged action from chat plane), and dependency
+      audit. The red-team corpora from acceptance.yaml run in CI on every change.
+    evidence: "`just security-review` / scan green; dependency audit clean or risk-accepted; all redteam gates green in CI; a secret-scan finds nothing in repo/logs."
+  - id: secrets_config
+    requirement: >-
+      All secrets via dev-secret / env (TELEGRAM_API_ID, TELEGRAM_API_HASH,
+      TELEGRAM_SESSION_STRING, TELEGRAM_CONTROL_BOT_TOKEN, LLM_API_KEY, source tokens);
+      .env.example holds placeholders only; ai-secrets-check passes; config validated +
+      hot-reload safe; no real key ever reaches git history or chat. The MTProto SESSION
+      STRING is the highest-value secret (full control of the owner's account) — never
+      logged, never in the DB, never echoed; rotation procedure documented. The control
+      bot TOKEN is also a secret but lower blast radius (revocable via @BotFather).
+    evidence: "ai-secrets-check green; grep of repo + logs for key patterns is empty; a bad config reload is rejected without dropping the live connection."
+  - id: deploy
+    requirement: >-
+      Reproducible build + deploy (the long-lived connection survives restarts/redeploys
+      with idempotent outbox reconcile). Rollback procedure. Health/readiness probe.
+      `just build` + a deploy recipe that a fresh machine can run from zero.
+    evidence: "clean-machine deploy from scratch reaches healthy; a redeploy mid-flight loses/duplicates no messages (outbox); rollback exercised once."
+  - id: slo_runbook
+    requirement: >-
+      Stated SLOs (uptime, max reply latency, max time-to-moderate black-tier) and a
+      runbook: how to read the digest, how to pause/resume, how to respond to a
+      black-tier escalation, how to restore from backup, who to page.
+    evidence: "The runbook section in this YAML (or a machine-readable spec/runbook.yaml if the spec set is deliberately expanded) is dry-run walked once; SLOs are measured by the observability gate's metrics."
+  - id: legal_privacy
+    requirement: >-
+      Member-notice disclosure live; retention + right-to-delete operational; a data
+      map (what is stored, where, how long); CSAM handling path documented (delete +
+      never store + owner escalation to platform report). ToS/privacy stance written down.
+    evidence: "notice posted in a real channel; data-map section in this YAML (or a machine-readable spec/data-map.yaml if the spec set is deliberately expanded) reviewed; a /forget request fully purges and is logged; CSAM runbook step rehearsed (with synthetic flag)."
+
+verify: just verify-prod <id>   # runs one gate; `just verify-prod all` runs every gate

@@ -1,0 +1,11 @@
+# Member notice — privacy disclosure (modules.yaml welcome_module.member_notice)
+# Posted ONCE per channel + pinned, via the userbot (kind:'notice'), when
+# privacy.member_notice.enabled is true. {{placeholders}} are filled at send time
+# from the workspace config — keep them; do not hard-code numbers/keywords here.
+# Tone: plain, human, in-character (no markdown, no "as an AI"). This is the one
+# message that is allowed to be slightly more formal than chat — it is a disclosure.
+
+小提示：这个群有自动助手帮忙打理日常（答疑、活动、维持秩序）。
+为了能接上话题，群里的消息会保留最多 {{message_retention_days}} 天，过期自动清掉。
+如果不希望我记住和你相关的聊天偏好，发一句「{{opt_out_keyword}}」就行，我会停掉并清掉这部分记录。
+你也可以随时找群主处理你的数据。

@@ -1,0 +1,20 @@
+# Cross-promotion tone presets (content asset). Referenced by spec/modules.yaml
+# cross_promotion.tones_file. {product} is interpolated at runtime.
+tones:
+  nonchalant:   # 漫不经心
+    templates:
+      - "话说我之前好像在别的地方看到过类似的东西"
+      - "对了想起来了，{product}好像挺适合你说的这个场景"
+      - "你这个需求的话...嗯我记得有个{product}，你可以看看"
+    rules: 绝不主动解释产品细节，只轻描淡写提一句。如果对方追问再说。
+  curious:      # 勾起好奇心
+    templates:
+      - "这个让我想起个东西，挺有意思的但我现在不想展开了哈哈"
+      - "有个相关的工具我用着还行，想知道的话我回头发你链接"
+      - "这个方向的话其实有个挺巧妙的解法..."
+    rules: 只勾起兴趣，不主动给出完整信息。等对方追问。
+  casual:       # 随意
+    templates:
+      - "我之前用过一个{product}，还行吧，看你需不需要"
+      - "{product}可以试试，不一定适合你但可以看看"
+    rules: 简短直接，但带有'可能不适合你'的姿态，不要卖力推荐。

@@ -1,0 +1,47 @@
+{
+  "$comment": "AI-first repo permission policy (versioned, shared across sessions). Goal: routine dev loop never prompts; secret-reading is HARD-denied to protect the userbot session string + keys. Things NOT listed simply prompt (e.g. git push, curl) — that is intentional, not a block. Widen 'allow' as the toolchain settles; never add secret reads.",
+  "permissions": {
+    "allow": [
+      "Bash(just *)",
+      "Bash(pnpm *)",
+      "Bash(pnpm install)",
+      "Bash(npm run *)",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(npx eslint *)",
+      "Bash(node *)",
+      "Bash(tsx *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git restore*)",
+      "Bash(git stash*)",
+      "Bash(git checkout -b *)",
+      "Bash(git branch*)",
+      "Bash(ai-cap check*)",
+      "Bash(ai-cap note*)",
+      "Bash(ai-cap candidates*)",
+      "Bash(ai-cap services*)",
+      "Bash(ai-cap vocab*)",
+      "Bash(ai-secrets-check*)",
+      "Bash(dev-secret run *)",
+      "Bash(dev-secret list*)",
+      "Bash(mkdir *)",
+      "Bash(python3 -c *)"
+    ],
+    "deny": [
+      "Bash(dev-secret get*)",
+      "Bash(gpg *)",
+      "Bash(env)",
+      "Bash(printenv*)",
+      "Bash(cat *.env*)",
+      "Bash(cat *secret*)",
+      "Bash(cat *.gpg)",
+      "Read(./.env*)",
+      "Read(**/*.session)"
+    ]
+  }
+}

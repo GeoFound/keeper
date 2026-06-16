@@ -231,7 +231,7 @@ config_loading:
 
 # Target project structure. AI scaffolds against this tree.
 project_structure: |
-  telegram/
+  keeper/
   ├── AGENTS.md                            # AI entry pointer
   ├── justfile                             # command contract: setup|dev|check|test
   ├── spec/                                # engineering source of truth (this set)

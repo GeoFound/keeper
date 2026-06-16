@@ -115,6 +115,11 @@ track in `spec/production_readiness.yaml`, claimed only when its gates are green
   `config/sources.yaml` ONCE to bootstrap a first-time setup, and only after the owner
   explicitly confirms the draft on the control plane (see `spec/modules.yaml`
   `onboarding_wizard.config_write_exception`).
+- GitHub gets reproducible, non-secret project state: `spec/**`, `src/**`, `tests/**`,
+  `assets/**`, `justfile`, `.claude/settings.json`, sanitized config examples/templates,
+  and redacted `.evidence/step-N.md` proof logs. Local-only: `.env*`, dev-secret material,
+  Telegram session strings, Bot/API tokens, `data/**`, SQLite DBs, logs, `.remember/**`,
+  `.codex/**`, `.agents/**`, raw evidence captures, and private/local config overrides.
 
 ## Federation (reuse over the network, never shared code)
 

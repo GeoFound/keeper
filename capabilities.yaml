@@ -1,7 +1,7 @@
 # capabilities.yaml — 项目在联邦中的供需声明（联邦模式：复用靠"提供/调用服务"，不共享代码）
 # 见 ~/ai-workspace/platform/CONTRACT.md。capabilities = 软信号（ai-cap note）。
 # 每行 tag 后的注释是本项目自评的复用速记；reuse_plan 段是分档 + offer 时机（纯文档，ai-cap 不解析）。
-project: telegram
+project: keeper
 
 # 我对外提供的服务（ai-cap offer 写入）。实现并运行后才登记 ${ENV_VAR} 地址；
 # 现在为空 —— 本项目还是 spec-only，无运行服务，故全部尚未 offer。

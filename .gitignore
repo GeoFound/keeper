@@ -1,0 +1,33 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+.coverage
+
+# Runtime state
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+logs/
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.session
+*.session.json
+*.secret
+*.key
+*.pem
+
+# Local agent/session memory
+.remember/
+.codex/
+.agents/
+
+# Local config overrides; commit sanitized examples or intentional shared config only.
+config/*.local.yaml

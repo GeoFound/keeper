@@ -27,7 +27,8 @@ events:
     rules:
       - correlationId is DERIVED DETERMINISTICALLY from the platform message identity by the Platform Adapter (`corr:<platform>:<channelId>:<platform_message_id>`; for an edit, still the original/editOf message id), NEVER a fresh uuid. This is what makes outbox dedup protect against redelivery — a reconnect/crash that REPLAYS an update yields the SAME correlationId, so it is idempotent end-to-end. The inbound replay guard is separate: it keys on the concrete platform update identity (original message vs each edit revision, e.g. Telegram update id / edit_date), so repeated edits are re-moderated while replaying the same edit is a no-op. (See overview operations.idempotent_delivery.inbound_idempotency.) control.owner_action is keyed the same way off the owner's control-bot message/callback id (`corr:telegram:<owner_dm>:<message_or_callback_id>`), so a redelivered owner tap is also idempotent and never double-acts.
       - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY message journey; it copies it onto message.routed and every downstream stage propagates it unchanged. Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
-      - Two events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: message.received (workspace not yet routed) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other event MUST carry a non-empty workspaceId.
+      - Two events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: message.received (workspace not yet routed) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other workspace-scoped event MUST carry a non-empty workspaceId.
+      - A SMALL fixed set of SOURCE-SCOPED infra events is NOT workspace-scoped at all: knowledge.sync_due and knowledge.updated operate on a content SOURCE that may be bound to MANY workspaces (and a sync may belong to none yet), so a single workspaceId is meaningless for them. They carry an EMPTY workspaceId and MUST instead carry a non-empty sourceId in their payload (ScheduledTick.sourceId for knowledge.sync_due — the Scheduler fires one tick PER SOURCE on that source's own interval; KnowledgeDelta.sourceId for knowledge.updated). Isolation for these is enforced downstream at RAG QUERY time by the source_id filter (see knowledge.yaml content_isolation), never by the envelope. This is the ONLY non-workspace, non-`__system__` scope class; every other event still requires a non-empty workspaceId. (The envelope_conformance gate asserts a source-scoped event with empty sourceId is rejected.)
       - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emission is outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false) with a kind-namespaced dedupeKey.
       - A consumer MUST ignore an event whose version it does not understand (forward-compatible).
       - |
@@ -42,8 +43,12 @@ events:
               (outbound.sent for owner sends, and control.owner_action for EVERY authenticated
               owner input — inline-button callbacks, slash commands, onboarding answers). The
               control bot does NOT mint message.received (no re-ingest).
-          (b) Scheduler — the *.due ticks (evolution.reflection_due, knowledge.sync_due,
-              digest.due, retention.sweep_due, content_calendar.due, activity.due).
+          (b) Scheduler — the *.due ticks. The per-WORKSPACE ticks (evolution.reflection_due,
+              digest.due, retention.sweep_due, content_calendar.due, activity.due,
+              marketing.share_due) carry workspaceId and fire in each workspace's timezone;
+              knowledge.sync_due is
+              SOURCE-SCOPED — one tick per source on its own sync interval, carrying
+              ScheduledTick.sourceId with an empty workspaceId (see envelope.rules).
           (c) Content Sync Pipeline + RAG/Knowledge service — knowledge.updated, content_gap.detected.
           (d) Engine pipeline bridge — when an OPTIONAL pipeline stage's module is not
               registered (e.g. Cross-Promotion, future), the engine forwards that stage's
@@ -67,7 +72,7 @@ events:
     - { event: message.received,             version: 1, publisher: "Platform Adapter (USERBOT only — the control bot never re-ingests)", consumers: [Workspace Router],                          payload: UnifiedMessage }
     - { event: message.routed,               version: 1, publisher: Workspace Router,                 consumers: [Moderation],                                                        payload: RoutedMessage }
     - { event: message.clean,                version: 1, publisher: Moderation,                       consumers: [Context Manager, Intent Router, Atmosphere Monitor, Evolution Tracker, User Memory, Funnel, SocialContext (channel_state updater)], payload: RoutedMessage }   # Evolution Tracker observes human replies/quotes to the bot here (the primary engaged metric); Funnel reads explicit-interest signals
-    - { event: moderation.violation,         version: 1, publisher: "Moderation (auto delete) / Approval Service (approved mute|ban)", consumers: ["Platform Adapter (CONTROL BOT — the group-admin executor)"], payload: ModerationAction }   # control bot executes; delete is auto, mute/ban only after owner ✅
+    - { event: moderation.violation,         version: 1, publisher: "Moderation (auto delete) / Approval Service (approved mute|ban)", consumers: ["Platform Adapter (CONTROL BOT — the group-admin executor)"], payload: ModerationAction }   # control bot executes; delete is auto, mute/ban only after owner ✅. Execute-once: the executor claims moderation_actions.action_key (UNIQUE) before the platform call, so a replayed violation never double-acts (data-model moderation_actions)
     - { event: moderation.escalated,         version: 1, publisher: Moderation,                       consumers: [Approval Service],                                                  payload: ModerationAction }   # black-tier notify AND the L1 proposal for mute/ban (owner ✅ -> moderation.violation)
     - { event: member.joined,                version: 1, publisher: Platform Adapter,                 consumers: [Welcome Module, SocialContext (channel_state updater)],              payload: MemberEvent }
     - { event: member.left,                  version: 1, publisher: Platform Adapter,                 consumers: [Atmosphere Monitor, Evolution Tracker, User Memory, SocialContext (channel_state updater)], payload: MemberEvent }
@@ -81,7 +86,7 @@ events:
     - { event: reply.generated,              version: 1, publisher: Persona Engine,                  consumers: [Platform Adapter],                                                  payload: ReplyDraft }
     - { event: reply.sent,                   version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Funnel, SocialContext (channel_state updater)],   payload: ReplySent }
     # --- unified outbound (ALL non-reply sends go through here -> send_queue + outbox; see overview operations) ---
-    - { event: outbound.requested,           version: 1, publisher: "Workspace Router (system notices) / Welcome / Atmosphere Initiator / Activity Executor / Approval Service (digest+DM) / Funnel / Onboarding", consumers: ["Platform Adapter (ROUTED by audience: owner→control bot, community+lead→userbot)"], payload: OutboundMessage }   # proactive/broadcast/DM/notice; routed adapter de-dups via outbox + obeys kill switch
+    - { event: outbound.requested,           version: 1, publisher: "Workspace Router (system notices) / Welcome / Atmosphere Initiator / Activity Executor / Marketing (proactive_share) / Approval Service (digest+DM) / Funnel / Onboarding", consumers: ["Platform Adapter (ROUTED by audience: owner→control bot, community+lead→userbot)"], payload: OutboundMessage }   # proactive/broadcast/DM/notice; routed adapter de-dups via outbox + obeys kill switch
     - { event: outbound.sent,                version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, SocialContext (channel_state updater)],           payload: OutboundSent }     # proactive sends feed timing/activity evolution + consecutive-bot-message guard
     # --- proactive / operations ---
     - { event: atmosphere.cold,              version: 1, publisher: Atmosphere Monitor,              consumers: [Initiator],                                                         payload: AtmosphereState }
@@ -96,12 +101,13 @@ events:
     - { event: evolution.tuning_decided,     version: 1, publisher: Approval Service,                consumers: [Evolution Reflector],                                               payload: ApprovalDecision }
     - { event: evolution.reflection_due,     version: 1, publisher: Scheduler,                       consumers: [Evolution Reflector],                                               payload: ScheduledTick }
     - { event: evolution.insights_generated, version: 1, publisher: Evolution Reflector,             consumers: [],                                                                  payload: InsightBatch }   # Strategy/Style Memory are INTERNAL sub-components of the Evolution module (updated in-process, not over the bus); this event is published for observability + future external consumers and currently has no external subscriber
-    - { event: knowledge.sync_due,           version: 1, publisher: Scheduler,                       consumers: [Content Sync Pipeline],                                             payload: ScheduledTick }
-    - { event: knowledge.updated,            version: 1, publisher: Content Sync Pipeline,           consumers: [RAG Engine],                                                        payload: KnowledgeDelta }
+    - { event: knowledge.sync_due,           version: 1, publisher: Scheduler,                       consumers: [Content Sync Pipeline],                                             payload: ScheduledTick }   # SOURCE-SCOPED: one tick PER SOURCE on its own interval; carries ScheduledTick.sourceId, empty workspaceId (see envelope.rules)
+    - { event: knowledge.updated,            version: 1, publisher: Content Sync Pipeline,           consumers: [RAG Engine],                                                        payload: KnowledgeDelta }   # SOURCE-SCOPED: carries KnowledgeDelta.sourceId, empty workspaceId
     # --- operations / control / product levers ---
     - { event: digest.due,                   version: 1, publisher: Scheduler,                       consumers: [Approval Service],                                                  payload: ScheduledTick }   # owner daily digest
     - { event: retention.sweep_due,          version: 1, publisher: Scheduler,                       consumers: [Database service],                                                  payload: ScheduledTick }   # privacy retention sweep
     - { event: content_calendar.due,         version: 1, publisher: Scheduler,                       consumers: [Initiator],                                                         payload: ScheduledTick }   # proactive planned content
+    - { event: marketing.share_due,          version: 1, publisher: Scheduler,                       consumers: [Marketing Engine],                                                  payload: ScheduledTick }   # periodic PROACTIVE marketing share (strategy proactive_share, 1-2x/day); per-workspace tz; Marketing composes -> outbound.requested, gated by phase>=grow + posture + marketing limits
     - { event: content_gap.detected,         version: 1, publisher: RAG Engine,                      consumers: [Content Gap],                                                       payload: ContentGap }      # KB could not answer
     - { event: lead.identified,              version: 1, publisher: Funnel,                          consumers: [Approval Service],                                                  payload: Lead }            # DM proposal -> owner (governance-gated)
     - { event: lead.approved,                version: 1, publisher: Approval Service,                consumers: [Funnel],                                                            payload: ApprovalDecision }   # owner ✅ -> Funnel sends the DM
@@ -181,7 +187,16 @@ events:
         coldForHours?: number;
         suggestedAction: 'share_news' | 'start_topic' | 'poll' | 'observe';
       }
-    ScheduledTick: { interface: "{ jobId: string; firedAt: Date }" }
+    ScheduledTick: |
+      interface ScheduledTick {
+        jobId: string;
+        firedAt: Date;
+        // SOURCE-SCOPED ticks only (knowledge.sync_due): the Scheduler fires one tick per
+        // content source on that source's own interval, so the source-scoped envelope rule
+        // can carry sourceId here while workspaceId stays empty. Absent for the per-workspace
+        // ticks (digest/reflection/retention/content_calendar/activity), which carry workspaceId.
+        sourceId?: string;
+      }
     KnowledgeDelta: |
       interface KnowledgeDelta {
         sourceId: string;
@@ -296,8 +311,10 @@ reply_pipeline:
     the unchanged envelope as the stage's out-event (its owned field left null). This is
     engine infrastructure (whitelisted producer — see envelope.rules), NOT a module, so no
     module ever emits an event outside its declared set. This is precisely how reply.ready
-    is produced when Cross-Promotion is unregistered; the Marketing module's publishes stays
-    [reply.enriched] only. Gate: pipeline_passthrough (which now asserts BOTH the flag-off
+    is produced when Cross-Promotion is unregistered; the Marketing module's PIPELINE output
+    stays reply.enriched only — it NEVER emits reply.ready (its publishes are [reply.enriched,
+    outbound.requested]; outbound.requested is its separate proactive_share path, never the
+    pipeline out-event). Gate: pipeline_passthrough (which now asserts BOTH the flag-off
     passthrough AND the unregistered-stage bridge).
   failure_policy: >-
     passthrough covers a DISABLED stage; this covers a stage that THROWS or TIMES
@@ -354,7 +371,7 @@ flows:
       it shares the SAME send_queue + idempotent outbox + flood-safety as replies and
       can never bypass them. No module owns a send path.
     steps:
-      - "Producer (Welcome / Atmosphere Initiator / Activity Executor / Approval Service / Funnel / Onboarding): compose + humanize text -> emit outbound.requested (with dedupeKey, notBefore, suppressIfKillSwitch)"
+      - "Producer (Welcome / Atmosphere Initiator / Activity Executor / Marketing proactive_share / Approval Service / Funnel / Onboarding): compose + humanize text -> emit outbound.requested (with dedupeKey, notBefore, suppressIfKillSwitch)"
       - "Platform Adapter (selected by OutboundMessage.via — userbot for community/lead, control bot for owner): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, and correlationId so a restart can actually retry it; if dedupeKey already exists, drop (no double-send). If suppressIfKillSwitch and RoomRead.posture==stay_silent (kill switch OR account RETREAT), mark dropped. Honor notBefore; send via the matching send_queue (userbot under the account_survival floor: FLOOD_WAIT obedience + per-account ceiling; control bot under Bot-API limits) -> mark outbox sent with platform_message_id -> emit outbound.sent"
       - "SocialContext updater: on outbound.sent bump last_bot_message_at + consecutive_bot_messages; Evolution Tracker records proactive sends for timing/activity feedback"
   control_plane_ingress:   # how owner input reaches the bot — the single authenticated edge

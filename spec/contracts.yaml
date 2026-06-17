@@ -182,7 +182,7 @@ interfaces:
         onMemberJoin(handler: (event: MemberEvent) => void): void;
         onMemberLeave(handler: (event: MemberEvent) => void): void;
         onReaction(handler: (event: ReactionEvent) => void): void;
-        fetchMedia(mediaUrl: string): Promise<{ bytes: Uint8Array; mime: string }>;  // for media moderation; bytes are NEVER persisted for black-tier hits
+        fetchMedia(mediaUrl: string): Promise<{ bytes: Uint8Array; mime: string }>;  // for media moderation; bytes are NEVER persisted for black-tier hits. Modules NEVER call this directly (zero_coupling) — the MediaService infra read-model (ctx.media) delegates here for the inbound adapter; on Telegram only the userbot's MTProto session can download the file.
         // outbound
         sendMessage(channelId: string, content: OutgoingMessage): Promise<string>;
         sendTypingIndicator(channelId: string): Promise<void>;
@@ -246,7 +246,14 @@ interfaces:
       interface ModuleContext {
         bus: EventBus;
         db: Database;
-        llm: LLMGateway;         // enforces per-workspace token BUDGET + circuit breaker (see operations)
+        llm: LLMGateway;         // enforces per-workspace token BUDGET + circuit breaker (see operations).
+                                 // ALSO exposes the multimodal SAFETY call used by Moderation's
+                                 // vision classifier: classifyMedia(bytes, mime, ...) accepts the raw
+                                 // media bytes (base64/multimodal) — NOT a URL the provider cannot
+                                 // reach — runs the config.llm.models.moderation_vision model, and is
+                                 // metered in the SAFETY budget lane (purpose=moderation_vision), never
+                                 // the generative breaker. Bytes are advisory input only; the classifier
+                                 // returns typed tier/evidence (llm_output_isolation), never authority.
         config: ModuleConfig;    // also exposes getWorkspace(workspaceId) for flag/persona lookup
         logger: Logger;          // STRUCTURED + journal-backed (see overview operations.observability):
                                  // every line carries { correlationId, workspaceId, module, eventId? }
@@ -261,6 +268,23 @@ interfaces:
         memory: UserMemory;           // per-user relationship memory (read-model, privacy-gated)
         knowledge: KnowledgeService;  // isolation-filtered RAG retrieval (read-model, infra not a peer module)
         styling: StyleService;        // STYLE-experiment arm assignment (read-model, infra not a peer module)
+        media: MediaService;          // on-demand media-byte fetch for moderation (infra, not a peer module)
+      }
+      // MediaService is the SANCTIONED read path for media bytes. Media moderation
+      // needs the raw bytes to run the vision classifier, but a module may NOT call a
+      // PlatformAdapter (zero_coupling) and the bytes can only be downloaded through the
+      // inbound adapter's authenticated session (e.g. a Telegram CDN file is fetchable
+      // ONLY by the userbot's MTProto client, never by the LLM provider). So MediaService
+      // is infra (like db/llm/knowledge) that DELEGATES to the inbound adapter's
+      // fetchMedia for the message's platform/channel and returns { bytes, mime }. It is
+      // the ONLY way a module obtains bytes; the bytes are transient and NEVER persisted
+      // (black-tier hits keep only a tier+reason audit row — never_store_flagged_media).
+      // Moderation hands the bytes to ctx.llm's vision classifier; on a fetch failure
+      // Moderation FAILS CLOSED (holds/treats as a violation candidate — moderation_failclosed),
+      // exactly as it does for a classifier error.
+      interface MediaService {
+        fetch(channelId: string, media: { mediaUrl: string; mediaType?: string }): Promise<{ bytes: Uint8Array; mime: string }>;
+        // delegates to the inbound adapter's fetchMedia; bytes are never written to disk/db.
       }
       // KnowledgeService is the read-model that backs RAG retrieval. It is infra
       // (like db/llm/social) — NOT a peer module — so the Intent Router can fill
@@ -310,7 +334,13 @@ interfaces:
       // Intent Router (reactive) and Atmosphere (proactive) read it, so the whole
       // engine shares ONE notion of community phase + room temperature ("度").
       // It is the sole writer of the DERIVED channel_state fields (phase, temperature,
-      // member/active/message counts, consecutive_bot_messages, last_human/bot_message_at):
+      // member/active/message counts, consecutive_bot_messages, last_human/bot_message_at)
+      // AND the sole writer of the per-member channel_members presence table (joined_at /
+      // first_seen_at / last_seen_at / left_at — the clock the new_user_link_delay /
+      // new_user_media_delay moderation rules read; see data-model channel_members):
+      // member.joined sets joined_at+first_seen_at, the first message.clean from an unseen
+      // user creates the row (first_seen_at=now), EVERY message.clean bumps last_seen_at, and
+      // member.left sets left_at+status='left'.
       // it subscribes to message.clean, member.joined, member.left, reply.sent and
       // outbound.sent to keep them current. Critically it increments
       // consecutive_bot_messages + last_bot_message_at on every bot send (reply.sent OR
@@ -326,6 +356,13 @@ interfaces:
       // reactive path through the same one gate, exactly like the kill switch.
       interface SocialContext {
         assess(channelId: string): Promise<RoomRead>;
+        // Per-member presence, backing the new_user_link_delay / new_user_media_delay
+        // fail-safes (Moderation reads this). Returns null when the user has never been
+        // observed in this channel — the caller treats null as "brand new" (most
+        // conservative), i.e. the first observation is still inside the new-user window.
+        // firstSeenAt is the earliest of join or first observed message; joinedAt is null
+        // when the bot joined after the user (member.joined was never seen).
+        memberPresence(channelId: string, userId: string): Promise<{ firstSeenAt: Date; joinedAt: Date | null; status: 'active' | 'left' } | null>;
       }
       // Suppression is a cross-cutting read-model owned by infra, not by a feature module.
       // It is updated from explicit member phrases ("别回复我", "别私信我", "不要记住我"),
@@ -350,7 +387,8 @@ interfaces:
       const engine = new Engine();
       // INFRA SERVICES (constructed, not register()'d as Modules): EventBus, Database,
       // LLMGateway, SocialContext (also the channel_state writer), ConversationContext,
-      // KnowledgeService (RAG), StyleService (STYLE-arm assignment), Scheduler, the engine
+      // KnowledgeService (RAG), StyleService (STYLE-arm assignment), MediaService (media-byte
+      // fetch for moderation, delegates to the inbound adapter), Scheduler, the engine
       // pipeline bridge (forwards an unregistered optional stage's event — see events.yaml
       // reply_pipeline.absent_stage_bridge), and each PlatformAdapter. They are exposed via
       // ModuleContext (or are pure engine wiring) and may touch a whitelisted set of events
@@ -394,7 +432,7 @@ interfaces:
         language?: string;
         contentType?: 'article' | 'docs' | 'faq' | 'product' | 'changelog' | 'rss' | 'crawl' | 'note';
         sourceTrust?: 'owned' | 'partner' | 'rss' | 'crawl' | 'user_file';
-        workspacePriority?: number;
+        workspacePriority?: number;   // per-SOURCE ranking prior, same for every workspace binding this source (not per-binding — knowledge.yaml priority_scope)
         metadata?: Record<string, unknown>;
         createdAt: Date;
         updatedAt: Date;
@@ -415,7 +453,7 @@ interfaces:
         sourceTrust: 'owned' | 'partner' | 'rss' | 'crawl' | 'user_file';
         updatedAt: Date;
         freshnessAt?: Date;
-        workspacePriority: number;
+        workspacePriority: number;   // per-SOURCE ranking prior (see knowledge.yaml priority_scope)
       }
   MemberEvent:
     desc: Member join/leave, normalized by the adapter.

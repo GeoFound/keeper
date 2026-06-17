@@ -10,7 +10,7 @@ data_model:
       -- Owner /forget purges all rows for a user_id (forget_purges_raw); the opt_out
       -- keyword does NOT purge here (it only stops relationship memory).
       CREATE TABLE messages (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY,                      -- PLATFORM-QUALIFIED identity `<platform>:<channel_id>:<platform_message_id>` (globally unique). NOT the bare platform_message_id: Telegram message ids are per-CHAT and collide across channels. (Same components as correlationId minus the `corr:` prefix.)
         workspace_id TEXT NOT NULL,
         correlation_id TEXT,                      -- envelope correlationId, for tracing
         platform TEXT NOT NULL,
@@ -56,8 +56,9 @@ data_model:
       CREATE TABLE reply_feedback (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,                 -- attribution scope: bot_message_id is a per-CHAT platform id, so a reply/reaction is matched by (channel_id, bot_message_id), never bot_message_id alone (it collides across channels in a multi-channel workspace)
         correlation_id TEXT,                      -- links the whole reply journey
-        bot_message_id TEXT NOT NULL,
+        bot_message_id TEXT NOT NULL,             -- bare platform message id of the bot reply, unique only WITHIN channel_id
         bot_reply_text TEXT,
         reply_count INTEGER DEFAULT 0,
         reaction_count INTEGER DEFAULT 0,
@@ -78,9 +79,11 @@ data_model:
         measured_at DATETIME
       );
       -- Index for the engaged-metric attribution lookup (modules.yaml evolution.primary_metric):
-      -- match a subsequent human reply/quote (message.clean.replyTo.messageId) or reaction to a
-      -- tracked bot_message_id within the attribution window.
-      CREATE INDEX ix_reply_feedback_botmsg ON reply_feedback (workspace_id, bot_message_id);
+      -- match a subsequent human reply/quote (message.clean.channelId + replyTo.messageId) or
+      -- reaction (reaction.received.channelId + messageId) to a tracked bot reply within the
+      -- attribution window. Keyed by (workspace_id, channel_id, bot_message_id) so a per-chat
+      -- bot_message_id cannot mis-attribute across channels.
+      CREATE INDEX ix_reply_feedback_botmsg ON reply_feedback (workspace_id, channel_id, bot_message_id);
     style_memory: |
       CREATE TABLE style_memory (
         workspace_id TEXT PRIMARY KEY,
@@ -230,6 +233,36 @@ data_model:
         proactive_paused_until DATETIME,         -- /quiet: proactive off, moderation stays
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+    channel_members: |
+      -- Per-(workspace,channel,user) presence read-model. This is what makes the
+      -- new_user_link_delay / new_user_media_delay moderation rules ENFORCEABLE: those rules
+      -- restrict a user for the first N minutes of presence, which needs a persisted join /
+      -- first-seen timestamp (member.joined is a transient event; channel_state holds only
+      -- aggregates). Sole writer is the SocialContext channel_state updater (it already
+      -- consumes member.joined / member.left / message.clean — see contracts SocialContext):
+      --   * member.joined -> set joined_at + first_seen_at (if absent) + status='active'
+      --   * first message.clean from a user with no row -> create row with first_seen_at=now
+      --     (fallback when the bot joined AFTER the user, so joined_at is unknown/missed)
+      --   * EVERY message.clean -> bump last_seen_at (presence recency)
+      --   * member.left -> set left_at + status='left'
+      -- Read by Moderation via ctx.social (memberPresence). "New user" for the link/media
+      -- delay = no row yet (this is the first observation) OR now - first_seen_at < the
+      -- configured delay; using first_seen_at (earliest of join or first message) keeps the
+      -- fresh-account fail-safe conservative for accounts that joined before the bot.
+      CREATE TABLE channel_members (
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        joined_at DATETIME,                      -- from member.joined; NULL if joined before the bot / event missed
+        first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP, -- earliest of join or first observed message (the new-user clock)
+        last_seen_at DATETIME,
+        left_at DATETIME,
+        status TEXT DEFAULT 'active',            -- active|left
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (workspace_id, channel_id, user_id)
+      );
+      CREATE INDEX ix_channel_members_recent
+        ON channel_members (workspace_id, channel_id, first_seen_at);
     workspace_runtime_state: |
       -- Durable operational state for holds that are not human /pause: cost read-only,
       -- missing required platform rights, adapter auth/access failures, and safety holds.
@@ -276,7 +309,7 @@ data_model:
         language TEXT,
         content_type TEXT,
         source_trust TEXT DEFAULT 'owned',       -- owned|partner|rss|crawl|user_file
-        workspace_priority REAL DEFAULT 1.0,
+        workspace_priority REAL DEFAULT 1.0,     -- per-SOURCE ranking prior, identical for every workspace binding this source (not per-(workspace,source) — knowledge.yaml priority_scope)
         chunk_count INTEGER,
         content_hash TEXT,
         created_at DATETIME,
@@ -315,7 +348,7 @@ data_model:
         canonical_url TEXT,
         content_type TEXT,
         source_trust TEXT DEFAULT 'owned',
-        workspace_priority REAL DEFAULT 1.0,
+        workspace_priority REAL DEFAULT 1.0,     -- per-SOURCE ranking prior (see knowledge_items.workspace_priority / knowledge.yaml priority_scope)
         content_hash TEXT NOT NULL,
         embedding_model TEXT NOT NULL,
         embedding_dim INTEGER NOT NULL,
@@ -326,12 +359,21 @@ data_model:
       CREATE INDEX ix_knowledge_chunks_source
         ON knowledge_chunks (source_id, item_id);
     knowledge_vectors: |
-      -- sqlite-vec virtual table created with the configured embedding dimension during
-      -- migration (e.g. float[1536] for text-embedding-3-small). knowledge_vector_map
-      -- links sqlite rowid back to knowledge_chunks; queries must pre-filter candidate
-      -- chunk_ids by allowed source_id before/during KNN, never post-filter the global top-K.
+      -- sqlite-vec virtual table. The dimension is NOT a literal — the migration TEMPLATES
+      -- it from config llm.models.embedding's dimension (embedding_dim), i.e. the DDL emitted
+      -- at migration time is `embedding float[${embedding_dim}]`. The 1536 shown below is ONLY
+      -- an illustrative value for text-embedding-3-small; a different embedding model changes
+      -- both the literal AND requires a full re-embed (see knowledge.yaml embedding_compatibility).
+      -- knowledge_vector_map links sqlite rowid back to knowledge_chunks; queries must
+      -- pre-filter candidate chunk_ids by allowed source_id before/during KNN, never
+      -- post-filter the global top-K.
+      -- DIMENSION IS FIXED AT CREATE TIME: changing the embedding model to one with a
+      -- different dimension is a FORWARD-ONLY SCHEMA MIGRATION (DROP + re-CREATE this table
+      -- with the new float[${new_dim}] + clear knowledge_vector_map + full re-embed), NOT a
+      -- plain re-insert — you cannot store a 3072-dim vector in a float[1536] table. See
+      -- knowledge.yaml embedding_compatibility.dimension_change_is_a_schema_migration.
       CREATE VIRTUAL TABLE knowledge_vectors USING vec0(
-        embedding float[1536]
+        embedding float[${embedding_dim}]   -- templated at migration from config (e.g. 1536 for text-embedding-3-small)
       );
     knowledge_vector_map: |
       -- Stable mapping between sqlite-vec rowid and knowledge_chunks.id. Keeping source_id
@@ -503,8 +545,16 @@ data_model:
       -- the daily digest counts (spam blocked, black-tier escalations), and abuse stats.
       -- For black-tier media hits this is the ONLY record kept — tier + reason, NEVER the
       -- media bytes (never_store_flagged_media).
+      -- IDEMPOTENCY: this table is ALSO the execute-once ledger for admin actions (the
+      -- outbox-equivalent for non-send actions). The CONTROL BOT executor, on consuming a
+      -- moderation.violation, atomically CLAIMS the deterministic action_key (INSERT; UNIQUE
+      -- conflict => already executed => skip) BEFORE the platform delete/ban/mute, so a
+      -- replayed/redelivered moderation.violation (reconnect/crash) never double-acts. This
+      -- complements the approval_items.status guard (which stops a double owner-approval) with
+      -- execution-level idempotency.
       CREATE TABLE moderation_actions (
         id INTEGER PRIMARY KEY,
+        action_key TEXT NOT NULL,                -- deterministic execute-once key `mod:<correlationId>:<action>:<target_message_id|target_user_id>`; UNIQUE -> replayed violation is a no-op
         workspace_id TEXT NOT NULL,
         channel_id TEXT,
         target_user_id TEXT,
@@ -515,8 +565,10 @@ data_model:
         modality TEXT,                           -- text|media
         reason TEXT,                             -- logged, NEVER shown in-channel (silent)
         escalated BOOLEAN DEFAULT FALSE,         -- true for black-tier owner DM
+        status TEXT DEFAULT 'executed',          -- claimed|executed|failed (claimed before the platform call, executed on confirm)
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE UNIQUE INDEX ux_moderation_actions_key ON moderation_actions (action_key);
       CREATE INDEX ix_moderation_actions_target
         ON moderation_actions (workspace_id, target_user_id, created_at);
     event_journal: |

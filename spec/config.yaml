@@ -44,7 +44,7 @@ config_files:
       warmup_start_fraction: 0.2    # day-1 cap = this fraction of the full ceiling, linearly to 1.0 by warmup_days
       flood_wait_retreat_threshold: 3   # this many FLOOD_WAITs within the window -> RETREAT
       flood_wait_window_minutes: 30
-      retreat_cooldown_minutes: 120 # RETREAT duration: proactive off, reactive throttled/paused; folds into posture==stay_silent
+      retreat_cooldown_minutes: 120 # RETREAT duration: proactive AND reactive off (folds into posture==stay_silent, like /pause — most conservative anti-ban stance)
       session_string_env: "TELEGRAM_SESSION_STRING"  # full-account credential — top-tier secret, dev-secret only
     scheduler:                      # node-cron; missed ticks catch up once on restart.
       # CRONS ARE EVALUATED PER WORKSPACE in that workspace's persona.timezone (NOT

@@ -174,7 +174,12 @@ operations:
       (folded into retention.sweep_due) archives/prunes rows that are BOTH terminal
       (sent/dropped/failed) AND older than reply.max_staleness + a safety margin — past
       that window no live trigger can reference them, so pruning preserves the idempotency
-      guarantee while bounding table growth.
+      guarantee while bounding table growth. EXCEPTION: kind='notice' rows are NEVER pruned.
+      The member-notice disclosure is a ONCE-EVER, pinned per-channel obligation, and a
+      future member.joined can still re-trigger it — so its outbox row is the durable
+      "already disclosed" guard (one tiny row per channel) and pruning it would let the
+      one-time notice re-post. Every other kind (reply/welcome/proactive_post/activity/
+      digest/dm) is per-trigger and prunes normally.
     crash_safety: >-
       On restart the bot reconciles the outbox: a 'pending' row whose trigger is still
       within reply.max_staleness is retried ONCE (the dedupeKey makes the retry safe —
@@ -198,7 +203,7 @@ operations:
       normal Bot-API flood limits (429 retry_after) — it is disposable and not bound by
       account_survival. Both still go through the one outbox (idempotency unchanged).
   retention:
-    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning), AND prunes event_journal rows older than observability.journal_retention_days; owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
+    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT kind='notice', the durable once-ever disclosure guard, which is never pruned), AND prunes event_journal rows older than observability.journal_retention_days; owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
     data_layers: >-
       Privacy and traceability are separated into three layers:
         - audit skeleton: event name, time, workspaceId, correlationId, causationId,
@@ -245,7 +250,18 @@ operations:
       sampling, when enabled, is per-event-type, never mid-journey.
     why: a one-operator product is unrunnable if the operator can't see what it did or why; visibility is a floor, not a feature.
   owner_control_supremacy:
-    rule: Owner /pause and /quiet (channel_state.paused_until) fold into RoomRead.posture == stay_silent, so they override EVERY proactive and reactive path through the single room-read gate. The kill switch cannot be bypassed by any module. Owner-directed DMs (digest, proposals, /status) set suppressIfKillSwitch=false so the kill switch never blinds the owner.
+    rule: >-
+      The owner has TWO levers, deliberately distinct, both read through the single
+      room-read gate. /pause (channel_state.paused_until) forces RoomRead.posture ==
+      stay_silent, overriding EVERY proactive AND reactive path. /quiet
+      (channel_state.proactive_paused_until) is narrower: it sets RoomRead.proactiveAllowed
+      = false WITHOUT changing posture, so it gags every PROACTIVE path while reactive
+      replies and moderation keep running (proactive-only). proactiveAllowed is false
+      whenever posture==stay_silent OR proactive_paused_until is in the future, so /pause,
+      account RETREAT, and /quiet all close the proactive gate, but only /pause + RETREAT
+      also close the reactive gate (see contracts RoomRead). The kill switch cannot be
+      bypassed by any module. Owner-directed DMs (digest, proposals, /status) set
+      suppressIfKillSwitch=false so neither lever ever blinds the owner.
   dual_identity:
     rule: >-
       Telegram is operated by TWO cooperating adapters, deliberately split along the
@@ -308,7 +324,7 @@ operations:
       - global_account_ceiling: a per-account daily + per-minute send ceiling across ALL channels and DMs (the send_queue's second ceiling), well under Telegram's observed account flood thresholds.
       - flood_wait_obedience: every MTProto FLOOD_WAIT is honored in full; repeated FLOOD_WAITs within a window trip RETREAT.
       - human_pacing: jittered delays + typing simulation + no consecutive bursts; the same humanize pacing the persona wants doubles as anti-detection.
-      - retreat_on_risk: on FLOOD_WAIT recurrence, a peer-flood/spam warning, or an auth/anomaly signal, the account enters RETREAT — proactive output stops entirely, reactive output throttles hard or pauses — and the owner is notified out-of-band. Retreat folds into RoomRead.posture==stay_silent so every module obeys it through the one gate (like the kill switch).
+      - retreat_on_risk: on FLOOD_WAIT recurrence, a peer-flood/spam warning, or an auth/anomaly signal, the account enters RETREAT — ALL output stops (proactive AND reactive). Retreat folds into RoomRead.posture==stay_silent (and therefore proactiveAllowed=false), so every module obeys it through the one gate exactly like /pause — the most-conservative anti-ban stance, not a partial throttle. The owner is notified out-of-band via the control bot.
       - no_mass_dm: DMs (funnel) are the single highest ban risk on a user account; they stay governance-gated (L1) AND additionally bounded by a low per-day account DM cap, never bulk.
     why: a banned owner account is the one unrecoverable failure; no feature is worth it.
 
@@ -380,7 +396,7 @@ invariants:
   - Member suppression is first-class; do-not-reply, do-not-DM, and do-not-remember requests, owner mute-for-user, complaints, negative reactions, and no-response signals suppress future replies/DMs/memory and can auto-quiet the workspace.
   - Member message retention is disclosed (member notice); owner /forget purges a user's raw messages, while the opt-out keyword stops relationship memory.
   - User data is retention-bounded and erasable on demand (owner /forget, user opt-out); relationship memory is opt-in and never recalls an opted-out user.
-  - Owner /pause and /quiet override every proactive and reactive path (kill switch cannot be bypassed).
+  - Owner /pause overrides every proactive AND reactive path (posture==stay_silent); /quiet suppresses ONLY proactive (RoomRead.proactiveAllowed=false) while reactive replies and moderation continue; the kill switch cannot be bypassed.
   - Platform-unsupported OPTIONAL rich capabilities (poll/pin/reaction visibility) auto-degrade silently. Required safety/admin capabilities (control-bot delete + restrict, userbot membership/auth) are hard preconditions or fail-closed runtime holds; they never silently degrade.
   - Telegram runs as TWO identities: a USERBOT (owner's user account, MTProto) is the community face + chat plane (plain member, reads by membership, chats as the owner, NO admin actions, sole inbound source of message.received); a CONTROL BOT (Bot API) is the group-admin moderation EXECUTOR + the owner's control plane (inline-button approvals, /commands, digest) and never chats to members.
   - Every privileged admin action (delete/mute/ban) is executed by the CONTROL BOT, never by the userbot; the owner's personal account performs no admin action. The control bot accepts control input ONLY from the owner user_id; members can never command it. All owner input enters through the ONE authenticated event control.owner_action (emitted by the control bot only for the owner, consumed only by the Approval Service); no adapter calls a module directly and no other event carries owner commands.
@@ -581,8 +597,8 @@ quality_gates:
       enforces: account-survival
       check: >-
         On the USERBOT: a simulated FLOOD_WAIT is honored in full (no early retry); recurring
-        FLOOD_WAITs within the window trip RETREAT (posture==stay_silent -> zero proactive,
-        throttled/paused reactive) and an out-of-band owner notice via the control bot. The
+        FLOOD_WAITs within the window trip RETREAT (posture==stay_silent -> zero proactive AND
+        zero reactive, like /pause) and an out-of-band owner notice via the control bot. The
         per-account global ceiling holds across multiple channels. A freshly configured account
         ramps under the warm-up curve. Assert the userbot performs NO admin action (delete/ban/
         mute never originate from the userbot adapter — they are the control bot's).
@@ -612,7 +628,10 @@ quality_gates:
       enforces: kill-switch
       check: >-
         With channel_state.paused_until in the future, no proactive or reactive message is emitted
-        (RoomRead.posture == stay_silent); /quiet stops proactive while moderation still acts.
+        (RoomRead.posture == stay_silent). With channel_state.proactive_paused_until in the future
+        (/quiet), RoomRead.proactiveAllowed == false so every proactive send is suppressed while
+        reactive replies AND moderation still act and posture is unchanged. Assert the two levers are
+        independent: /quiet does not silence a reactive reply, /pause silences both.
     - id: approval_safe_defaults
       enforces: approval-safe-defaults
       check: >-
@@ -682,7 +701,8 @@ quality_gates:
         Static check: no module under src/modules/** references a PlatformAdapter send method; every
         non-reply send is an outbound.requested emission. Runtime: an outbound.requested with a dedupeKey
         already in the outbox is dropped (no double-send); a proactive send with suppressIfKillSwitch is
-        suppressed under posture==stay_silent while an owner DM (suppressIfKillSwitch=false) still goes.
+        suppressed whenever NOT RoomRead.proactiveAllowed (/pause, /quiet, or account RETREAT) while an
+        owner DM (suppressIfKillSwitch=false) still goes.
     - id: pipeline_failure_abort
       enforces: pipeline-failure
       check: >-

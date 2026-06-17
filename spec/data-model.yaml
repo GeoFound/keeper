@@ -9,6 +9,12 @@ data_model:
       -- Raw message log. Aged out by retention.sweep_due past message_retention_days.
       -- Owner /forget purges all rows for a user_id (forget_purges_raw); the opt_out
       -- keyword does NOT purge here (it only stops relationship memory).
+      -- WRITER: the Workspace Router writes/updates this canonical row on message.routed
+      -- (post-routing, so workspace_id is known and NOT NULL holds); a genuine edit UPDATES
+      -- the existing row in place (is_edit, edit_of, edited_at). A message from a channel
+      -- bound to no workspace never reaches routing, so it writes nothing here (zero spend,
+      -- zero side effects — unbound_channel_drop). Pre-routing replay dedup lives in
+      -- inbound_updates (written by the ingest adapter), not here.
       CREATE TABLE messages (
         id TEXT PRIMARY KEY,                      -- PLATFORM-QUALIFIED identity `<platform>:<channel_id>:<platform_message_id>` (globally unique). NOT the bare platform_message_id: Telegram message ids are per-CHAT and collide across channels. (Same components as correlationId minus the `corr:` prefix.)
         workspace_id TEXT NOT NULL,
@@ -20,8 +26,9 @@ data_model:
         sender_name TEXT,                         -- UNTRUSTED display string (never an instruction)
         text TEXT,
         media_type TEXT,                          -- image|video|file|sticker (NULL for text)
+        media_url TEXT,                           -- TRANSIENT platform reference (e.g. Telegram file id/path) used for media moderation + edit re-moderation; NOT a re-host. NULL for text. The BYTES are never stored, and for a black-tier hit this ref is cleared too — only a tier+reason audit row in moderation_actions remains (never_store_flagged_media).
         -- NOTE: black-tier-flagged media bytes are NEVER stored; only an audit row in
-        -- moderation logs records tier+reason. media_url here is a transient platform ref, not a re-host.
+        -- moderation_actions records tier+reason (and media_url above is cleared on a black-tier hit).
         is_edit BOOLEAN DEFAULT FALSE,            -- this row is an edit (re-moderated, never re-replied)
         edit_of TEXT,                             -- original platform_message_id this edit replaces
         is_bot_reply BOOLEAN DEFAULT FALSE,
@@ -41,6 +48,11 @@ data_model:
       -- (Telegram update id / edit_date / pts) and proceeds to re-moderation. Multiple
       -- edits to the same platform_message_id must each pass once; replaying the same edit
       -- revision is the no-op.
+      -- WRITER: the inbound (userbot) Platform Adapter / engine ingest CLAIMS this row
+      -- (INSERT) BEFORE emitting message.received; a UNIQUE conflict => this update is a
+      -- replay => the adapter does NOT emit message.received (no double-journey). This guard
+      -- is pre-routing, so it carries NO workspace_id (the canonical messages row, written
+      -- later by the Workspace Router, does).
       CREATE TABLE inbound_updates (
         id TEXT PRIMARY KEY,                         -- upd:<platform>:<channel>:<message>:<kind>:<identity>
         platform TEXT NOT NULL,
@@ -154,16 +166,22 @@ data_model:
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     activities: |
+      -- Activity Planner/Executor DOMAIN table: the plan + its EXECUTION lifecycle. It does
+      -- NOT own approval authority — owner approval for L1 types (giveaway/cost_bearing) lives
+      -- in approval_items (the single persistent decision store). This table links to that row
+      -- by source_item_ref/source_correlation_id for traceability but never duplicates the
+      -- approval message id / owner decision (one source of truth). status here is EXECUTION
+      -- state, not approval state. executed_at is stamped on outbound.sent (kind:'activity').
       CREATE TABLE activities (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
         type TEXT NOT NULL,
         plan TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        approval_message_id TEXT,
-        owner_response TEXT,
+        status TEXT DEFAULT 'planned',            -- planned|awaiting_approval|scheduled|executed|cancelled|rejected (EXECUTION lifecycle; approval decision lives in approval_items)
+        source_correlation_id TEXT,               -- links the planning journey for /trace
+        source_item_ref TEXT,                     -- approval_items.item_ref when this type needed L1 approval (else NULL)
         scheduled_at DATETIME,
-        executed_at DATETIME,
+        executed_at DATETIME,                     -- stamped when outbound.sent confirms the activity send
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     approval_items: |
@@ -485,10 +503,10 @@ data_model:
         evidence_json TEXT,                      -- why this is a lead; shown to owner
         suppression_reason TEXT,
         suppression_until DATETIME,
-        last_owner_decision TEXT,                -- approved|rejected|ignored|amended
+        last_owner_decision TEXT,                -- approved|rejected|ignored|amended — denormalized mirror, learned from the lead.approved/rejected event (the AUTHORITATIVE owner-decision row is in approval_items, not here)
         no_response_at DATETIME,
-        approval_message_id TEXT,                -- owner approval of the DM (autonomy L1)
-        dm_sent_at DATETIME,
+        source_item_ref TEXT,                    -- approval_items.item_ref for the DM's L1 approval (the owner-decision authority; this table no longer duplicates the approval message id)
+        dm_sent_at DATETIME,                     -- stamped when outbound.sent confirms the lead DM (kind:'dm' to the lead); the no_response timer starts here, not at approval
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX ix_leads_subject
@@ -500,6 +518,10 @@ data_model:
       -- max_staleness is retried ONCE (dedupe_key makes it safe — no double send), past
       -- staleness it is marked 'dropped'. This is what makes a mid-flight crash neither
       -- double-send nor silently lose a reply.
+      -- PRUNING: terminal rows older than delivery.outbox_prune_after_days are swept
+      -- (idempotent_delivery.outbox_pruning), EXCEPT kind='notice' — the once-ever pinned
+      -- member-notice disclosure, whose row is the durable per-channel "already disclosed"
+      -- guard a future member.joined can still reference, so it is NEVER pruned.
       CREATE TABLE outbox (
         dedupe_key TEXT PRIMARY KEY,             -- KIND-NAMESPACED (idempotent_delivery.dedupe_key_namespace): replies use `reply:<correlationId>`, proactive sends use OutboundMessage.dedupeKey (`<kind>:<...>`, e.g. welcome:<ch>:<user>). The namespace is what keeps the reply and proactive key spaces from colliding in this shared PK.
         workspace_id TEXT NOT NULL,
@@ -536,7 +558,7 @@ data_model:
         flood_wait_count INTEGER DEFAULT 0,      -- FLOOD_WAITs in the current window
         flood_window_started_at DATETIME,
         last_flood_wait_seconds INTEGER,
-        retreat_until DATETIME,                  -- in RETREAT while now < this (proactive off, reactive throttled)
+        retreat_until DATETIME,                  -- in RETREAT while now < this (proactive AND reactive off, like /pause)
         session_valid BOOLEAN DEFAULT TRUE,      -- false -> out-of-band owner auth alert
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );

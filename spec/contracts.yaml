@@ -347,13 +347,17 @@ interfaces:
       // outbound.sent) and RESETS consecutive_bot_messages on the next human message — this
       // is what makes the "never talk to itself" cap real. The CONTROL columns
       // (paused_until, proactive_paused_until) are owned + written by the Approval Service
-      // (the kill switch) and only READ here when computing posture — a one-way read-model
-      // handoff, not shared mutable state. This is what folds /pause + /quiet into
-      // posture==stay_silent for every path.
+      // (the kill switch) and only READ here when computing posture/proactiveAllowed — a
+      // one-way read-model handoff, not shared mutable state. The mapping is deliberate and
+      // NOT symmetric: paused_until (/pause) forces posture=='stay_silent' (so BOTH the
+      // reactive and proactive gates close); proactive_paused_until (/quiet) leaves posture
+      // alone and only sets proactiveAllowed=false (so proactive is gagged while reactive
+      // replies + moderation continue). This is how /quiet is "proactive-only" and /pause is
+      // "everything" through ONE room-read.
       // ACCOUNT SURVIVAL: posture is ALSO forced to stay_silent while the account is in
       // RETREAT (account_health.retreat_until in the future — see overview
       // operations.account_survival), so an anti-ban retreat silences every proactive and
-      // reactive path through the same one gate, exactly like the kill switch.
+      // reactive path (proactiveAllowed becomes false with it), exactly like /pause.
       interface SocialContext {
         assess(channelId: string): Promise<RoomRead>;
         // Per-member presence, backing the new_user_link_delay / new_user_media_delay
@@ -368,6 +372,15 @@ interfaces:
       // It is updated from explicit member phrases ("别回复我", "别私信我", "不要记住我"),
       // owner control commands, and complaint/no-response signals. Modules READ it before
       // replying, remembering, or proposing DMs; they do not share mutable state with each other.
+      // COMPLAINT DETECTION DEGRADES GRACEFULLY w.r.t. the sentiment_analysis flag (default
+      // OFF): the ALWAYS-AVAILABLE complaint signals are negative reactions (emoji on a bot
+      // message) and explicit complaint/opt-out PHRASES — these alone drive recordNegativeSignal,
+      // the negative_feedback_quiet_threshold quiet posture, and "suppress marketing during
+      // complaints" with sentiment OFF. sentiment_analysis only ADDS free-text sentiment on
+      // replies-to-the-bot as an EXTRA complaint source (and the evolution complaint_rate
+      // guardrail, which degrades to neutral when off). So the complaint-suppression loop is
+      // real at the conservative default launch; turning sentiment on widens recall, it is
+      // never a prerequisite.
       interface SuppressionService {
         isSuppressed(workspaceId: string, userId: string, scope: 'reply' | 'dm' | 'memory' | 'all'): Promise<boolean>;
         suppress(input: { workspaceId: string; userId: string; scope: 'reply' | 'dm' | 'memory' | 'all'; reason: string; expiresAt?: Date }): Promise<void>;
@@ -378,6 +391,17 @@ interfaces:
         phase: 'seed' | 'spark' | 'grow' | 'mature';        // community lifecycle
         temperature: 'silent' | 'calm' | 'lively' | 'heated' | 'argument';
         posture: 'engage_fully' | 'engage_lightly' | 'observe_only' | 'stay_silent';
+        // TWO INDEPENDENT GATES. `posture` governs the REACTIVE path (Intent Router):
+        // stay_silent stops reactive replies; the others scale reply probability. It is
+        // forced to stay_silent by /pause and by account RETREAT (the hard kill switch).
+        // `proactiveAllowed` is the SEPARATE gate every PROACTIVE path reads. It is
+        // false whenever posture==stay_silent (so /pause + RETREAT also gag proactive)
+        // OR proactive_paused_until is in the future (so /quiet gags proactive WITHOUT
+        // touching posture — reactive replies + moderation keep running). This is why
+        // /quiet is "proactive-only" and /pause is "everything": they write different
+        // channel_state columns and are read through different RoomRead gates. Derivation:
+        //   proactiveAllowed = posture != 'stay_silent' && now >= (proactive_paused_until ?? 0)
+        proactiveAllowed: boolean;        // the SINGLE gate all proactive sends consult (kill switch, /quiet, RETREAT)
         memberCount: number;
         activeMembers24h: number;
         messages24h: number;

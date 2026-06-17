@@ -8,7 +8,13 @@ modules:
   workspace_router:
     subscribes: [message.received]
     publishes: [message.routed, outbound.requested]
-    role: Resolve channel -> workspace + allowed content sources.
+    role: >-
+      Resolve channel -> workspace + allowed content sources, then emit message.routed.
+      It is ALSO the writer of the canonical `messages` row: on a successful resolve it
+      inserts the row (workspace_id now known, so the NOT NULL holds), and a genuine edit
+      (isEdit) UPDATES that row in place rather than inserting. An unbound channel is dropped
+      here BEFORE any write (no messages row, no spend — see unbound_channel). The pre-routing
+      replay guard (inbound_updates) is the ingest adapter's, not the router's.
     unbound_channel:   # anyone can add a Telegram bot to an arbitrary group — guard the front door
       rule: >-
         If channelId resolves to NO configured workspace, the message is DROPPED at
@@ -152,14 +158,24 @@ modules:
       channel+user) — the welcome comes from the persona (userbot), in-channel.
     member_notice:   # privacy disclosure (decided: notice + tiered delete)
       rule: >-
-        On the FIRST join after a workspace enables privacy.member_notice (and as a
-        pinned message), the bot posts a short disclosure — that an assistant operates
-        here, that messages may be retained up to message_retention_days, and how to
-        opt out of relationship memory (the opt_out_keyword) — emitted as
-        outbound.requested(kind:'notice'). This gives the message-retention a lawful,
-        transparent basis. The notice text lives in assets/ (content), not code.
+        When a workspace has privacy.member_notice enabled, the bot posts ONCE per channel a
+        short, pinned disclosure — that an assistant operates here, that messages may be
+        retained up to message_retention_days, and how to opt out of relationship memory (the
+        opt_out_keyword) — emitted as outbound.requested(kind:'notice', via:'userbot',
+        dedupeKey:`notice:<channel>`). This gives message-retention a lawful, transparent
+        basis. The notice text lives in assets/ (content), not code.
+      once_ever: >-
+        The dedupeKey `notice:<channel>` makes it once-ever per channel: the outbox NEVER
+        prunes kind='notice' rows (overview idempotent_delivery.outbox_pruning), so a later
+        join cannot re-post it. Welcome emits it on the FIRST member.joined it sees, AND the
+        Onboarding Wizard emits the SAME keyed notice at go-live (see onboarding_wizard) so an
+        ALREADY-POPULATED channel does not wait for the next join to be disclosed — whichever
+        fires first wins and the other is a no-op outbox-dedup hit. A purely hand-edited
+        workspace with no wizard go-live and no new joins posts on its next observed join
+        (acceptable: retention's lawful basis is the pinned notice, which appears as soon as
+        either trigger fires).
     guards:
-      - obeys the kill switch: a welcome is proactive, so suppressIfKillSwitch=true (RoomRead.posture==stay_silent -> no welcome).
+      - obeys the kill switch: a welcome is proactive, so suppressIfKillSwitch=true (suppressed at the adapter when NOT RoomRead.proactiveAllowed — /pause, /quiet, or account RETREAT).
       - seed/spark aware: still welcomes (1:1 warmth is wanted early) but counts toward consecutive_bot_messages so it cannot monologue.
       - silent on its own failure (no AI-leak); a missed welcome is never retried noisily.
 
@@ -244,13 +260,15 @@ modules:
         Proactive share is suppressed unless it is genuinely safe + wanted, via the SAME
         room-read every proactive path uses: it reads ctx.social.assess(channelId) and only
         composes when phase >= grow (never seed/spark — a tiny/empty room must not be
-        marketed to, mirroring cold-revival) and posture != stay_silent/observe_only. It
+        marketed to, mirroring cold-revival), RoomRead.proactiveAllowed is true (so /pause,
+        /quiet, and account RETREAT all gag it before any LLM spend), and posture !=
+        observe_only. It
         ALSO honors marketing.limits (max_mentions_per_day, min_gap_hours — counted in
         marketing_log) and brand_safety.never_mention_in (complaint/argument/tense). Then it
         emits outbound.requested(kind:'proactive_post', via:'userbot',
         suppressIfKillSwitch=true, dedupeKey:`marketing_share:<channel>:<workspace-local-date>`).
-        suppressIfKillSwitch=true means the kill switch + account RETREAT still gag it at the
-        adapter even if it composed. It NEVER calls the adapter directly and NEVER bypasses
+        suppressIfKillSwitch=true means the adapter's proactiveAllowed gate (/pause, /quiet,
+        OR account RETREAT) still gags it even if it composed. It NEVER calls the adapter directly and NEVER bypasses
         the send_queue (the same de-AI humanize post-processing as Persona/Atmosphere).
     limits:
       max_mentions_per_day: 3
@@ -303,26 +321,37 @@ modules:
       - randomize (occasionally drop trailing period, add an emoji)
 
   activity_planner:
-    subscribes: [activity.due, activity.approved, activity.rejected]
+    subscribes: [activity.due, activity.approved, activity.rejected, message.clean, outbound.sent]
     publishes: [activity.proposed, outbound.requested]
     role: >-
-      Planner + Executor in ONE registered module. The Planner proposes on the
-      activity.due scheduler tick (the trigger for PERIODIC types — topic_day/quiz — fired
-      per-workspace in its own timezone) and on event-driven cues it derives from its own
-      inputs: auto for no-approval types, else activity.proposed -> owner. The Executor
-      consumes activity.approved (and runs auto-approved types directly) and emits the
-      activity message(s) via outbound.requested(kind:'activity', suppressIfKillSwitch=true) —
-      it does NOT call the adapter directly. activity.rejected returns an owner ❌ to the
-      Planner so it drops/reschedules the proposal rather than leaving it pending. Polls go
-      out as OutgoingMessage.poll (auto-degrades if the platform lacks polls).
+      Planner + Executor in ONE registered module. The Planner has TWO trigger sources:
+      (1) the activity.due scheduler tick — the trigger for PERIODIC types (topic_day/quiz),
+      fired per-workspace in its own timezone; and (2) EVENT-DRIVEN cues observed from
+      message.clean for the opportunistic types (ai_news_discussion, poll_survey) — it reads
+      ctx.social.assess + ctx.conversation to detect a hot/surging topic (the same room-read
+      Atmosphere uses, but for an activity opportunity, not cold-revival), debounced by the
+      activity_types cooldowns so a busy room cannot spam proposals. Either source: auto for
+      no-approval types, else activity.proposed -> owner. The Executor consumes
+      activity.approved (and runs auto-approved types directly) and emits the activity
+      message(s) via outbound.requested(kind:'activity', suppressIfKillSwitch=true) — it does
+      NOT call the adapter directly. activity.rejected returns an owner ❌ to the Planner so it
+      drops/reschedules the proposal rather than leaving it pending. Polls go out as
+      OutgoingMessage.poll (auto-degrades if the platform lacks polls).
+    execution_tracking: >-
+      The Executor learns its send actually went out by consuming outbound.sent (filtered to
+      its own kind:'activity' dedupeKeys) and stamps activities.executed_at + status='executed'
+      then. The outbox remains the authority for whether a send happened; this is the module's
+      domain-table mirror so the digest/owner can see which planned activities actually ran.
+      It is read-only w.r.t. other modules' sends (it ignores outbound.sent for other kinds).
     approval_flow: Bot plans -> DM owner -> owner replies ✅/❌/📝 -> Bot executes/adjusts
     activity_types:
-      - { type: ai_news_discussion, trigger: big news, approval: false }
-      - { type: poll_survey,        trigger: hot topic, approval: false }
-      - { type: topic_day,          trigger: periodic,  approval: false }
-      - { type: quiz,               trigger: periodic,  approval: false }
-      - { type: giveaway,           trigger: planned,   approval: true }
-      - { type: cost_bearing,       trigger: planned,   approval: true }
+      # trigger_source names the WIRED input that fires each type (no type is left unwired):
+      - { type: ai_news_discussion, trigger: hot/surging topic, trigger_source: message.clean (event-driven), approval: false }
+      - { type: poll_survey,        trigger: hot topic,         trigger_source: message.clean (event-driven), approval: false }
+      - { type: topic_day,          trigger: periodic,          trigger_source: activity.due (scheduler tick), approval: false }
+      - { type: quiz,               trigger: periodic,          trigger_source: activity.due (scheduler tick), approval: false }
+      - { type: giveaway,           trigger: planned,           trigger_source: activity.due (scheduler tick) -> L1 proposal, approval: true }
+      - { type: cost_bearing,       trigger: planned,           trigger_source: activity.due (scheduler tick) -> L1 proposal, approval: true }
 
   atmosphere:
     subscribes: [message.clean, member.left, atmosphere.cold, content_calendar.due]
@@ -367,7 +396,7 @@ modules:
         - never run a poll/quiz below min_participants_for_poll
         - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself)
         - in seed phase, only broadcast value — never simulate dialogue
-        - if posture == stay_silent (e.g. argument), do nothing
+        - if NOT RoomRead.proactiveAllowed (/pause, /quiet, or account RETREAT) or posture == stay_silent, do nothing
 
     # In grow/mature phases the classic cold-revival applies:
     behavior_table:
@@ -574,9 +603,10 @@ modules:
           (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided,
           lead.approved, or moderation.violation(approved) for an L1 mute/ban); a 📝 amend
           carries amendText.
-        - command /pause|/quiet|/resume: WRITE channel_state.paused_until /
-          proactive_paused_until (the kill switch — the one control-owned write to
-          channel_state; SocialContext only READS these for posture, see contracts).
+        - command /pause|/quiet|/resume: WRITE channel_state.paused_until (/pause ->
+          posture stay_silent) / proactive_paused_until (/quiet -> proactiveAllowed=false
+          only) (the kill switch — the one control-owned write to channel_state;
+          SocialContext only READS these for posture/proactiveAllowed, see contracts).
         - command /status|/why|/trace: compose from the event_journal (+ read-model tables) -> outbound.requested(kind:'dm', via:'control'); /trace <id> renders the full ordered correlationId story.
         - command /forget <user|me>: resolve userId + workspaceId -> emit user.forget.
         - command /setup, or owner text during an active interview, or a confirm on the
@@ -612,7 +642,7 @@ modules:
       controls:    # the KILL SWITCH + visibility — owner-only operational commands
         - "/pause [scope] [duration]   -> bot goes FULLY silent in scope (sets channel_state.paused_until)"
         - "/resume [scope]"
-        - "/quiet 2h                   -> stop PROACTIVE only; moderation stays on (proactive_paused_until)"
+        - "/quiet 2h                   -> stop PROACTIVE only (sets proactive_paused_until -> RoomRead.proactiveAllowed=false); reactive replies + moderation keep running; posture unchanged"
         - "/status                     -> what the bot is doing + pending items + today's counts (read from the event_journal + read-model tables)"
         - "/why <messageId>            -> explain a recent action/reply from the event_journal (the full trace for that message's correlationId, rendered human-readable)"
         - "/trace <id>                 -> the complete ordered story of one correlationId (every event + decision + failure for that message), the control-bot mirror of `just trace <id>`"
@@ -621,9 +651,12 @@ modules:
         - "/unmute-bot-for-user <id>   -> clears owner-set member_suppression for that user; owner-only."
         - "/setup                      -> starts the onboarding interview (emits onboarding.input(start))"
     pause_is_authoritative: >-
-      paused_until / proactive_paused_until are folded into SocialContext: while
-      paused, RoomRead.posture == stay_silent, so EVERY module already obeys it
-      through the one room-read gate. The kill switch cannot be bypassed.
+      paused_until / proactive_paused_until are folded into SocialContext, but NOT the same
+      way: paused_until (/pause) forces RoomRead.posture == stay_silent (every reactive AND
+      proactive path stops); proactive_paused_until (/quiet) sets RoomRead.proactiveAllowed
+      == false WITHOUT changing posture (only proactive stops; reactive replies + moderation
+      continue). Both are read through the one room-read gate, so EVERY module obeys them
+      without bespoke checks. The kill switch cannot be bypassed.
     correlation: each proposal stores approval_message_id; reply matched by reply-to first, else explicit #id.
     timeout:
       safe_defaults:
@@ -709,7 +742,7 @@ modules:
       only "write a new article".
 
   funnel:
-    subscribes: [message.clean, reply.sent, reaction.received, lead.approved]
+    subscribes: [message.clean, reply.sent, reaction.received, lead.approved, outbound.sent]
     publishes: [lead.identified, outbound.requested]
     feature_flag: funnel        # default OFF
     role: >-
@@ -737,6 +770,12 @@ modules:
         authorizes only that one DM, not an ongoing sequence.
       - a DM send attempt checks member_suppression(scope=dm|all) immediately before enqueue,
         so a late opt-out beats an earlier approval.
+    dm_tracking: >-
+      The Funnel learns its approved DM actually went out by consuming outbound.sent (filtered
+      to its own kind:'dm' dedupeKeys / dmUserId == the lead), and only then stamps
+      leads.dm_sent_at + stage='dm_sent'. The outbox is the authority for delivery; this is the
+      funnel's domain-table mirror (so a no_response timer starts from a real send, not an
+      approval). It ignores outbound.sent for the owner's digest/DM kinds and other producers.
 
   onboarding_wizard:
     trigger: first run / owner /setup on the control bot
@@ -760,6 +799,14 @@ modules:
       a fresh explicit confirm and a new diff, and thereafter config/** is human-owned
       again. The config loader supports hot-reload (see config.yaml) so the new workspace
       goes live without a restart.
+    go_live_notice: >-
+      The moment a workspace is brought live through the wizard, if privacy.member_notice is
+      enabled the wizard emits the member-notice disclosure once —
+      outbound.requested(kind:'notice', via:'userbot', dedupeKey:`notice:<channel>`) for each
+      bound channel — so an already-populated channel is disclosed at go-live rather than
+      waiting for the next join. It is the SAME keyed notice Welcome would post, so the outbox
+      dedup (kind='notice' is never pruned) guarantees exactly one per channel regardless of
+      which trigger fires first (see welcome_module.member_notice.once_ever).
     preconditions_check: >-
       Before marking a workspace live, the wizard calls verifyAccess on BOTH adapters and
       refuses to finish if the USERBOT is not a member of the channel (hard stop) or the

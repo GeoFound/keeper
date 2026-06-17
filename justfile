@@ -97,6 +97,16 @@ verify-step step:
     fi
     echo "REMINDER: a green gate also requires .evidence/step-{{step}}.md with the commands + output."
 
+# Credential-gated REAL smoke for a step (real_smoke / real_runtime evidence).
+# Split from `verify-step` so the local loop stays fast + offline (adapter contract
+# simulator) while the real path is proven once with secrets via dev-secret. Records
+# redacted evidence; failures block a production launch, not local spec iteration.
+# Usage: just verify-real step-2   (see spec/acceptance.yaml real_evidence_layering,
+# evidence_types.real_smoke; production_readiness.telegram_real_e2e is the full matrix.)
+verify-real target:
+    @echo "verify-real {{target}}: credential-gated live smoke — not implemented yet (build_order step 2 wires the real runner; run under dev-secret, never with plaintext keys)"
+    @exit 1
+
 # Regression ratchet: every step 1..N (plus architecture gates) must still pass
 # before step N+1 may start. Usage: just verify-through 5
 verify-through n:

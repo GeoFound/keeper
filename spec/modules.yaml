@@ -69,6 +69,14 @@ modules:
       control bot (✅ -> moderation.violation(mute|ban) executed by the control bot, ❌/ttl
       -> drop). Black-tier escalation doubles as the ban approval item. delete_spam needs
       no approval. The userbot has no admin capability to invoke here.
+    execution_idempotency: >-
+      Admin actions are the outbox's non-send counterpart: the CONTROL BOT executor CLAIMS a
+      deterministic moderation_actions.action_key (`mod:<correlationId>:<action>:<target>`;
+      UNIQUE) BEFORE the platform delete/ban/mute and skips on conflict, so a replayed/
+      redelivered moderation.violation after a reconnect/crash never double-acts (deletes are
+      naturally idempotent; a double-ban/mute is not, so this guard matters). This is distinct
+      from and complementary to approval_items.status (which prevents a double owner-approval):
+      one guards the decision, the other guards the execution. See data-model moderation_actions.
     edited_messages:   # an edit can turn a clean message into a violation after the fact
       rule: >-
         message.routed carrying UnifiedMessage.isEdit=true is RE-MODERATED with the
@@ -100,6 +108,16 @@ modules:
       detect:
         vision_classifier: best_effort   # multimodal classifier over fetched media; runs as SAFETY (not gated by the generative breaker), but is itself budget-aware: see media_budget
         scope: "detectable black-tier — explicit sexual content, gore/graphic violence, terror/weapons. On a hit -> delete + ban + moderation.escalated (same as text black-tier)."
+        byte_access: >-
+          Moderation obtains the bytes ONLY through ctx.media.fetch(channelId, {mediaUrl,
+          mediaType}) (the MediaService infra read-model — see contracts MediaService), which
+          delegates to the inbound (userbot) adapter's fetchMedia; a module never calls the
+          adapter directly (zero_coupling) and the bytes can only be downloaded with the
+          userbot's MTProto session anyway. It then hands the bytes to ctx.llm's vision
+          classifier (safety lane). A ctx.media.fetch failure (download error/timeout) FAILS
+          CLOSED exactly like a classifier error — the media is held / treated as a violation
+          candidate (safety_holds, reason_code=provider_outage|media_cap), never passed clean.
+          The bytes are transient and NEVER persisted (never_store_flagged_media).
       csam:
         rule: >-
           A best-effort LLM classifier is NOT a reliable or lawful CSAM detector
@@ -109,14 +127,15 @@ modules:
           deletes + bans on any black-tier vision hit, and escalates to the owner so
           a human can report to the platform. CSAM handling = platform + owner report.
       new_user_media_delay: "untrusted/new users cannot post media for the first N minutes (config moderation.new_user_media_delay_minutes), mirroring new_user_link_delay — most drive-by image abuse comes from fresh accounts."
+      new_user_clock: "Both new_user_*_delay rules read presence from ctx.social.memberPresence(channelId, userId) (backed by the channel_members table, written by the SocialContext updater on member.joined/left + first message.clean — see contracts SocialContext + data-model channel_members). A user is 'new' when there is NO row yet (this very message is the first observation) OR now - first_seen_at < the configured delay. Using first_seen_at (earliest of join or first message) keeps the fail-safe correct even when the bot joined AFTER the user (joined_at unknown). This is the persisted clock that makes the delay enforceable rather than guesswork."
       never_store_flagged_media: "media that trips the black-tier vision classifier is deleted and its bytes are NEVER written to disk/db; only a tier+reason audit row is kept (no media payload)."
       media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, workspace enters media_hold_mode: ALL further unscanned media (new AND established users) is held/blocked/silent-deleted per config rather than scanned — safety never silently degrades to allow. Owner sees 'media safety scanning unavailable; media temporarily held' rather than a generic budget error."
     rules:
       - { feature: anti_spam,            behavior: "ad links / repeated messages / bulk joins -> silent delete NOW (auto); mute proposed to owner (L1)" }
       - { feature: hard_block,           behavior: "black-tier hit (text OR media) -> silent delete NOW (auto) + DM owner (moderation.escalated) proposing the ban (L1). Detection+delete NOT tunable; ban awaits owner ✅." }
       - { feature: flood_control,        behavior: "many messages in short window -> temporary mute proposed to owner (L1); the flood itself is also rate-limited by ignoring further triggers" }
-      - { feature: new_user_link_delay,  behavior: new users cannot post links for first N minutes }
-      - { feature: new_user_media_delay, behavior: new users cannot post media for first N minutes (media abuse fail-safe) }
+      - { feature: new_user_link_delay,  behavior: "new users cannot post links for first N minutes (new-user clock = ctx.social.memberPresence / channel_members; see new_user_clock)" }
+      - { feature: new_user_media_delay, behavior: "new users cannot post media for first N minutes (media abuse fail-safe; same new-user clock as new_user_link_delay)" }
       - { feature: audit_log,            behavior: "every action writes a moderation_actions row (tier+reason, no media bytes) — powers /why + digest counts" }
     # NOTE: welcoming new members moved OUT of moderation into its own welcome_module
     # (moderation subscribes message.routed only; member.joined was never wired here).
@@ -204,20 +223,35 @@ modules:
       that is Atmosphere/Activity. This module is reactive-only.
 
   marketing:
-    subscribes: [reply.needed]
-    publishes: [reply.enriched]
+    subscribes: [reply.needed, marketing.share_due]
+    publishes: [reply.enriched, outbound.requested]
     passthrough: >-
-      Pipeline stage — MUST ALWAYS emit reply.enriched. When the marketing
+      As a reply-pipeline stage it MUST ALWAYS emit reply.enriched. When the marketing
       feature is off, the topic is not relevant, or a daily/gap limit is hit, it
       emits reply.enriched with marketing.recommend=false and the draft otherwise
       unchanged. It MUST NOT swallow the event (doing so would break the chain;
       the pipeline_passthrough gate asserts this).
     principle: No ads. Provide "useful recommendations", organically.
     strategies:
-      - { strategy: in_conversation_recommendation, frequency: when topic-relevant, example: "对了我之前写过一篇对比几个模型的" }
-      - { strategy: proactive_share,                frequency: 1-2x per day,         example: "刚看到一个挺有意思的事" }
-      - { strategy: post_answer_followup,           frequency: occasional,           example: "详细的我在站上写过" }
-      - { strategy: activity_embed,                 frequency: during activities,    example: "这次送的是我们的 XX 产品" }
+      # Each strategy names its concrete mechanism so none is left unwired:
+      - { strategy: in_conversation_recommendation, frequency: when topic-relevant, example: "对了我之前写过一篇对比几个模型的", mechanism: "REPLY PIPELINE — set ReplyDraft.marketing on reply.needed -> reply.enriched (reactive)" }
+      - { strategy: proactive_share,                frequency: 1-2x per day,         example: "刚看到一个挺有意思的事",            mechanism: "PROACTIVE — on the marketing.share_due scheduler tick (its OWN per-workspace-tz cron, NOT content_calendar.due, which Atmosphere owns), compose a persona-styled share -> outbound.requested(kind:'proactive_post', via:'userbot', suppressIfKillSwitch=true)" }
+      - { strategy: post_answer_followup,           frequency: occasional,           example: "详细的我在站上写过",                   mechanism: "REPLY PIPELINE — same reply.enriched path as in_conversation_recommendation" }
+      - { strategy: activity_embed,                 frequency: during activities,    example: "这次送的是我们的 XX 产品",            mechanism: "Activity content carries the marketing angle: the Activity Executor composes it inside the activity message — Marketing does NOT emit its own send for this" }
+    proactive_share:
+      trigger: marketing.share_due   # dedicated per-workspace-tz scheduler tick (bot.yaml scheduler.marketing_share_cron); decouples proactive marketing from Atmosphere's content_calendar.due so the two never double-post
+      gating: >-
+        Proactive share is suppressed unless it is genuinely safe + wanted, via the SAME
+        room-read every proactive path uses: it reads ctx.social.assess(channelId) and only
+        composes when phase >= grow (never seed/spark — a tiny/empty room must not be
+        marketed to, mirroring cold-revival) and posture != stay_silent/observe_only. It
+        ALSO honors marketing.limits (max_mentions_per_day, min_gap_hours — counted in
+        marketing_log) and brand_safety.never_mention_in (complaint/argument/tense). Then it
+        emits outbound.requested(kind:'proactive_post', via:'userbot',
+        suppressIfKillSwitch=true, dedupeKey:`marketing_share:<channel>:<workspace-local-date>`).
+        suppressIfKillSwitch=true means the kill switch + account RETREAT still gag it at the
+        adapter even if it composed. It NEVER calls the adapter directly and NEVER bypasses
+        the send_queue (the same de-AI humanize post-processing as Persona/Atmosphere).
     limits:
       max_mentions_per_day: 3
       min_gap_hours: 2
@@ -381,12 +415,14 @@ modules:
         Bernoulli outcome (collapses the old got_reply/was_quoted/got_emoji positives).
         This is the metric arms are compared on.
       attribution: >-
-        Observed from the bus, not polled: a reply/quote is a subsequent message.clean whose
-        replyTo.messageId == a tracked bot_message_id (this is why Evolution subscribes
-        message.clean); a positive reaction is a reaction.received on that bot_message_id.
-        The match must land within attribution_window_minutes. reply_feedback is indexed on
-        (workspace_id, bot_message_id) for this lookup (data-model ix_reply_feedback_botmsg);
-        engaged + measured_at are written there, keyed back to the styleVariant arm.
+        Observed from the bus, not polled: a reply/quote is a subsequent message.clean in the
+        SAME channel whose replyTo.messageId == a tracked bot_message_id (this is why Evolution
+        subscribes message.clean); a positive reaction is a reaction.received on that
+        (channel, bot_message_id). The match must land within attribution_window_minutes.
+        reply_feedback is indexed on (workspace_id, channel_id, bot_message_id) for this lookup
+        (data-model ix_reply_feedback_botmsg) — channel-scoped because a Telegram message id is
+        per-chat and would otherwise mis-attribute across channels; engaged + measured_at are
+        written there, keyed back to the styleVariant arm.
     guardrail_metrics:   # each is a rate; a challenger that worsens ANY of these beyond tolerance is VETOED regardless of primary lift
       - { metric: complaint_rate,    detect: "reflection-time sentiment on human messages replying to the bot (needs sentiment_analysis; degrade to neutral if off)" }
       - { metric: member_left_rate,  detect: "member.left correlated with a recent bot message in-channel" }
@@ -510,7 +546,8 @@ modules:
       //   if (!engine.isRegistered('cross-promotion'))
       //     bus.bridge('reply.enriched' -> 'reply.ready');  // forward unchanged
       // When CrossPromotionModule is registered, the bridge is not installed and the module
-      // owns reply.ready. Marketing.publishes stays [reply.enriched] either way.
+      // owns reply.ready. Marketing never emits reply.ready either way (its publishes are
+      // [reply.enriched, outbound.requested] — the latter is its proactive_share path, not the pipeline).
     approval_preview_example: |
       🔔 跨站推荐审批 #7
       📍 来源群：AI交流群
@@ -611,10 +648,19 @@ modules:
         via:'control', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
         bot is never silenced by /pause or account RETREAT). Contents: messages sent, reply rate, spam blocked,
         black-tier escalations (text+media), safety/media holds by reason+TTL,
-        command_attempts, suppression changes/complaint spikes, unbound-channel notices,
+        command_attempts, suppression changes/complaint spikes,
         repeated content gaps, pending items, evolution status, and repeated
         pipeline-stage failures (read from the pipeline_failures table — errors, timeouts,
         and watchdog hang-aborts). Owner's window into the black box.
+      system_notices_section: >-
+        Unbound-channel and adapter credential/access notices are NOT workspace-scoped — they
+        are emitted live as their own owner DM (outbound.requested kind:'notice',
+        workspaceId='__system__') the moment they happen. The daily digest ALSO carries a
+        rolled-up "system notices since last digest" section, sourced from event_journal rows
+        WHERE workspace_id='__system__' (so a missed live notice still surfaces once daily).
+        Because these are cross-workspace, the digest emits this section ONCE — attached to the
+        first/primary workspace's digest DM (or its own __system__-scoped digest DM when several
+        workspaces exist), never duplicated per workspace.
     sending: >-
       ALL owner-facing sends (proposals, escalations, digest, /status, /why replies)
       go out via outbound.requested(kind:'dm'|'digest', via:'control', dmUserId=owner) —
@@ -727,12 +773,18 @@ modules:
   # Scheduler is a SYSTEM SERVICE (services/scheduler.ts), not a Module. It owns
   # cron + missed-tick policy and emits ticks consumed by modules:
   #   evolution.reflection_due, knowledge.sync_due, digest.due,
-  #   retention.sweep_due, content_calendar.due, activity.due.
-  # TIMEZONE: cron expressions in bot.yaml are evaluated PER WORKSPACE in that
-  #   workspace's persona.timezone, NOT in server-local time. So "digest 09:00"
-  #   fires at 09:00 for each workspace's own timezone — the Scheduler emits one tick
-  #   per (workspace, job) at the workspace-local time. (knowledge.sync_due is global/
-  #   per-source — it has no human-facing local time.)
+  #   retention.sweep_due, content_calendar.due, activity.due, marketing.share_due.
+  # TIMEZONE: the per-WORKSPACE crons (reflection/digest/retention/content_calendar/
+  #   activity/marketing_share) in bot.yaml are evaluated PER WORKSPACE in that workspace's
+  #   persona.timezone, NOT in server-local time. So "digest 09:00" fires at 09:00 for
+  #   each workspace's own timezone — the Scheduler emits one tick per (workspace, job)
+  #   at the workspace-local time, each carrying that workspaceId.
+  # SCOPE: knowledge.sync_due is SOURCE-SCOPED, not workspace-scoped — the Scheduler
+  #   fires one tick PER SOURCE on that source's own sync interval (sources.yaml
+  #   sync.interval_minutes; bot.yaml scheduler.sync_cron is the default when a source
+  #   omits its own). The tick carries ScheduledTick.sourceId with an empty workspaceId
+  #   (it has no human-facing local time and a source may serve many workspaces — see
+  #   events.yaml envelope.rules source-scoped class).
   # Missed-tick policy: on restart, a tick whose window passed fires once (catch-up),
   # except retention which always runs the full sweep.
 
@@ -751,9 +803,12 @@ feature_flags:
     funnel: false             # DM lead funnel — opt-in
     content_gap: true         # passive observer, no user-visible action
     digest: true              # owner daily digest via the control bot
-    analytics: false
-    sentiment_analysis: false
-    auto_faq: false
+    sentiment_analysis: false # consumed by evolution.guardrail_metrics.complaint_rate (degrades to neutral when off)
+    # RESERVED — no consuming module yet (kept as forward-declared switches so a future
+    # module can ship behind a default-OFF flag without a config migration). They are inert
+    # today: nothing reads them, so toggling them changes nothing. Do NOT treat as wired.
+    analytics: false          # RESERVED (future metrics/insights surface)
+    auto_faq: false           # RESERVED (future auto-FAQ answering)
   minimum_launch_profile: >-
     First launch is conservative by default: evolution, funnel, cross_promotion, and
     user_memory are OFF; proactive frequency is low; polls are off until the community

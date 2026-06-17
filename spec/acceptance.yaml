@@ -82,7 +82,7 @@ steps:
     capabilities:
       - { id: bus_delivers,        must: "a published event reaches a registered subscriber; non-module producers are whitelisted", ev: integration, gate: declared_events_only }
       - { id: declared_events,     must: "emit/subscribe outside a module's declared set throws in dev/test", ev: unit, gate: declared_events_only }
-      - { id: envelope_conformance,must: "every emission validates against its Zod schema + non-empty correlationId/workspaceId", ev: unit, gate: envelope_conformance }
+      - { id: envelope_conformance,must: "every emission validates against its Zod schema + non-empty correlationId; non-empty workspaceId required except the scope-deferred pair (message.received/control.owner_action) and the source-scoped pair (knowledge.sync_due/knowledge.updated), which instead require a non-empty payload sourceId; a workspace-scoped event with empty workspaceId and a source-scoped event with empty sourceId are both rejected", ev: unit, gate: envelope_conformance }
       - { id: config_load,         must: "config loads + Zod-validates; invalid config fails fast; hard_block=false rejected", ev: unit, gate: hard_floor_immutable }
       - { id: config_uniqueness,   must: "duplicate workspace ids, source ids, channel bindings, missing content_sources, bad id charset, and reserved __system__ workspace bindings are rejected at load/reload", ev: unit, gate: config_uniqueness }
       - { id: llm_output_isolation,must: "LLM gateway returns advisory typed data only; parsed outputs cannot emit bus events, mutate config/db, call adapters, or choose autonomy except through policy wrappers", ev: static, gate: llm_output_isolation }
@@ -123,7 +123,7 @@ steps:
       - { id: edit_delivery,    must: "an edited update fixture arrives as UnifiedMessage{isEdit:true, editOf}; replay of the same edit revision is deduped, a later edit revision re-moderates", ev: adapter_contract, gate: telegram_adapter_evidence_ladder }
       - { id: verify_access,    must: "verifyAccess per adapter: userbot isMember (hard stop if not), control bot isAdmin+delete+restrict (hard stop if missing); NO privacy-mode; invalid userbot session -> out-of-band alert via control bot; invalid control-bot token -> unhealthy process + redacted log/CLI health error; no crash loop", ev: adapter_contract, gate: userbot_access }
       - { id: live_smoke,       must: "credential-gated smoke proves real userbot login, real send/receive, real control-bot callback, real edit delivery, and real verifyAccess once; output is recorded in .evidence without secrets", ev: real_smoke, gate: telegram_adapter_evidence_ladder, real: true }
-      - { id: media_fetch,      must: "fetchMedia returns bytes for moderation; bytes not persisted by the adapter", ev: integration }
+      - { id: media_fetch,      must: "ctx.media.fetch returns bytes for moderation by delegating to the inbound (userbot) adapter's fetchMedia; no module calls the adapter directly (zero_coupling); bytes are not persisted; a fetch failure surfaces so Moderation can fail closed", ev: integration }
       - { id: degrade,          must: "unsupported capabilities (poll/pin) auto-degrade silently", ev: unit }
     verify: just verify-step 2
 
@@ -138,7 +138,7 @@ steps:
       - { id: indirect_injection,must: "a poisoned chunk ('ignore instructions/system:') cannot alter identity/boundaries or trigger an action; chunks delimited+labeled untrusted", ev: redteam, gate: indirect_injection }
       - { id: untrusted_input,   must: "a crafted display name / username / replyTo.text cannot become an instruction", ev: redteam, gate: untrusted_input }
       - { id: incremental_sync,  must: "re-sync dedups by content_hash; only changed items re-embed", ev: unit }
-      - { id: sync_cursor,       must: "source_sync_state persists cursor/since checkpoints; a restart resumes paginated sync without skipping or duplicating items", ev: integration }
+      - { id: sync_cursor,       must: "knowledge.sync_due fires PER SOURCE (carrying ScheduledTick.sourceId, empty workspaceId — source-scoped envelope); source_sync_state persists cursor/since checkpoints; a restart resumes paginated sync without skipping or duplicating items", ev: integration }
       - { id: embedding_compat,  must: "embedding model/dimension mismatch marks sources full_reembed_required and blocks stale vectors from query until re-embedded under ingest budget", ev: integration }
       - { id: freshness_trust,   must: "retrieval ranking and answer grounding use sourceTrust, freshness/updatedAt, contentType, canonicalUrl, and workspacePriority; stale or low-trust hits are downgraded or surfaced as gaps", ev: unit, gate: knowledge_freshness_trust }
       - { id: content_gap,       must: "a query with top score < min_score emits content_gap.detected (no asker identity)", ev: unit }
@@ -166,9 +166,11 @@ steps:
       - { id: black_media,      must: "black-tier image/video => delete NOW (auto) + ban proposed + escalate; flagged media bytes never written to disk/db", ev: redteam, gate: media_black_floor }
       - { id: gray_tolerated,   must: "gray-tier under permissive => never deleted", ev: llm_fixture, gate: hard_floor_immutable }
       - { id: spam_flood,       must: "ad/repeat/bulk => silent delete NOW (auto); mute PROPOSED to owner (L1); flood => mute proposed", ev: integration }
+      - { id: new_user_delay,   must: "a user with no channel_members row or first_seen_at within new_user_link/media_delay_minutes cannot post links/media (enforced via ctx.social.memberPresence); after the window an established user is unrestricted; presence is written on member.joined and on first message.clean when join was missed", ev: integration }
       - { id: mute_ban_l1,      must: "mute/ban never auto-execute: emitted as moderation.escalated(proposed); only owner ✅ on the control bot triggers moderation.violation(approved); ❌/ttl => no action", ev: integration, gate: no_self_escalation }
       - { id: control_executor, must: "every executed moderation action (delete/mute/ban) is performed by the CONTROL BOT (group admin); none originate from the userbot", ev: integration, gate: dual_identity_routing }
-      - { id: fail_closed,      must: "classifier/vision error/timeout/garbage => message held or treated as violation candidate, NEVER passed as clean", ev: integration, gate: moderation_failclosed }
+      - { id: action_idempotent, must: "a replayed/redelivered moderation.violation (same correlationId+action+target) executes the admin action EXACTLY ONCE — the executor claims moderation_actions.action_key (UNIQUE) before the platform call; no double-ban/double-mute across a reconnect/crash", ev: crash_injection, gate: moderation_failclosed }
+      - { id: fail_closed,      must: "text/vision classifier error/timeout/garbage OR a ctx.media.fetch download failure => message held or treated as violation candidate, NEVER passed as clean", ev: integration, gate: moderation_failclosed }
       - { id: edit_remoderate,  must: "clean→edited-to-black => violation; edited-to-clean => message.clean", ev: integration, gate: edited_remoderation }
       - { id: silent_actions,   must: "every admin action is silent (nothing posted in-channel)", ev: integration }
       - { id: audit_log,        must: "every action writes a moderation_actions row (tier+reason, no media bytes)", ev: integration }
@@ -208,11 +210,12 @@ steps:
     name: Marketing / Atmosphere / Activity / Evolution
     capabilities:
       - { id: marketing_limits,  must: "max_mentions_per_day + min_gap_hours survive a restart; never mention during complaint/argument", ev: integration }
+      - { id: marketing_proactive_share, must: "the proactive_share strategy fires on the marketing.share_due tick in the workspace tz, ONLY when phase>=grow and posture allows, within max_mentions_per_day/min_gap_hours, and sends via outbound.requested(kind:'proactive_post', via:'userbot', suppressIfKillSwitch=true) — suppressed under seed/spark, stay_silent, or account RETREAT; it never calls the adapter directly; it does NOT double-post with Atmosphere's content_calendar.due", ev: integration }
       - { id: suppression_quiet, must: "repeated complaints/negative reactions from multiple users automatically reduce reply/proactive frequency or set quiet posture before evolution can optimize engagement", ev: integration, gate: suppression_complaint_loop }
       - { id: cold_start,        must: "seed phase: broadcast only, no reactive chat, no poll below min_participants; consecutive bot messages capped", ev: integration, gate: cold_start_no_cringe }
       - { id: cold_revival,      must: "atmosphere cold-trigger fires once per cooldown and sends via outbound (suppressed under stay_silent)", ev: integration }
       - { id: periodic_activity, must: "periodic activity types (topic_day/quiz) are triggered by the activity.due scheduler tick in the workspace timezone; activity.rejected returns the proposal to the planner (dropped/rescheduled, not left pending)", ev: integration }
-      - { id: engaged_attribution, must: "the primary metric 'engaged' is observed from the bus — a subsequent human message.clean whose replyTo.messageId == a tracked bot reply (or a positive reaction.received on it) within attribution_window writes engaged + measured_at to reply_feedback (indexed by bot_message_id), keyed to the reply's styleVariant arm", ev: integration }
+      - { id: engaged_attribution, must: "the primary metric 'engaged' is observed from the bus — a subsequent human message.clean in the SAME channel whose replyTo.messageId == a tracked bot reply (or a positive reaction.received on that channel+message) within attribution_window writes engaged + measured_at to reply_feedback (indexed by (workspace_id, channel_id, bot_message_id) so per-chat ids never mis-attribute across channels), keyed to the reply's styleVariant arm", ev: integration }
       - { id: one_experiment,    must: "at most one running experiment per dimension (DB unique index holds); a power-underpowered challenger is QUEUED, not run", ev: unit }
       - { id: bandit_alloc,      must: "ctx.styling.assign serves the arm via Thompson allocation routing more traffic to the better arm as the Beta posteriors diverge, with challenger share clamped to [floor,cap]; assignment is deterministic per correlationId (reproducible under replay) and is what Persona stamped onto ReplyDraft.styleVariant", ev: unit }
       - { id: gated_promotion,   must: "challenger promoted ONLY when P(challenger>champion)>=promote_prob AND min_exposure met AND no guardrail worse than champion beyond tolerance; a reaction-farming variant that lifts primary but worsens complaint/churn is VETOED", ev: unit }

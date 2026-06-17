@@ -55,6 +55,7 @@ config_files:
       digest_cron: "0 9 * * *"      # owner daily digest 09:00 (workspace-local)
       retention_sweep_cron: "0 3 * * *"
       activity_cron: "0 12 * * *"   # periodic-activity planning tick (topic_day/quiz); emits activity.due (workspace-local)
+      marketing_share_cron: "0 13 * * *"  # periodic PROACTIVE marketing share (strategy proactive_share); emits marketing.share_due (workspace-local). Frequency is bounded by marketing.max_mentions_per_day + min_gap_hours; gated by phase>=grow + posture (low-touch by default)
     platforms:
       telegram:
         # TWO identities (overview operations.dual_identity).
@@ -87,7 +88,7 @@ config_files:
         endpoint: "https://mysite.com/api/content-feed"
         trust: "owned"                 # owned|partner|rss|crawl|user_file
         freshness_max_days: 30
-        workspace_priority: 1.0
+        workspace_priority: 1.0        # per-SOURCE ranking prior, applied uniformly to every workspace that binds this source (NOT per-(workspace,source) — see knowledge.yaml priority_scope)
         content_type: "site"
         auth: { type: "bearer", token_env: "SITE_MAIN_TOKEN" }
         sync: { interval_minutes: 30 }
@@ -121,9 +122,9 @@ config_files:
           funnel: false
           content_gap: true
           digest: true
-          analytics: false
           sentiment_analysis: false
-          auto_faq: false
+          analytics: false                     # RESERVED — no consuming module yet (inert switch; see modules.yaml feature_flags)
+          auto_faq: false                      # RESERVED — no consuming module yet (inert switch)
         persona:
           name: "展展"
           identity: "owner"

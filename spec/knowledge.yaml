@@ -101,6 +101,16 @@ source_quality:
       if every good hit is stale, emit content_gap.detected(stale_source_hit=true).
     - canonicalUrl is preserved for /why and digest so the owner sees which source backed a reply.
     - workspacePriority lets the owner prefer official docs over a broad feed without breaking isolation.
+  priority_scope: >-
+    DECIDED SEMANTICS: workspacePriority is a per-SOURCE prior, declared ONCE on the source
+    (sources.yaml workspace_priority) and carried onto that source's knowledge_items/chunks. It
+    is therefore IDENTICAL for every workspace that binds the source — despite the historical
+    name it is NOT a per-(workspace, source) override. This is intentional and sufficient for a
+    single-operator product where each source is defined once by the owner; modelling a distinct
+    priority per binding would add a per-binding config surface and a query-time join for no real
+    single-operator benefit. If multi-tenant per-binding priority is ever needed, it is a future
+    extension (a priority map on the workspace→source binding), not a silent reinterpretation of
+    this column.
   gate: knowledge_freshness_trust (overview quality_gates) — fixtures prove stale/low-trust sources do not outrank fresh authoritative sources at equal relevance, and stale-only answers surface as gaps.
 
 embedding_compatibility:
@@ -112,6 +122,17 @@ embedding_compatibility:
     not silently mis-scored. Stale chunks are marked via source_sync_state.full_reembed_required and
     excluded from KnowledgeService.search until their knowledge_chunks + knowledge_vectors rows have been
     rebuilt with the new model/dimension.
+  dimension_change_is_a_schema_migration: >-
+    CRITICAL: a re-embed alone is NOT sufficient when the new model has a DIFFERENT DIMENSION. The
+    sqlite-vec virtual table is declared `vec0(embedding float[${embedding_dim}])` with the dimension
+    FIXED AT CREATE TIME (data-model knowledge_vectors) — you cannot insert a 3072-dim vector into a
+    float[1536] table. So a dimension change is a FORWARD-ONLY SCHEMA MIGRATION, executed in one
+    transaction: (1) DROP and re-CREATE knowledge_vectors with the new `float[${new_dim}]`; (2) clear
+    knowledge_vector_map; (3) re-embed every chunk and repopulate both. A same-dimension model swap (rare)
+    still requires a full re-embed but no table re-create. The migration runs under the ingest budget and
+    leaves KnowledgeService.search returning zero rows for not-yet-rebuilt sources (full_reembed_required)
+    rather than querying a half-rebuilt index. This is the documented path for the production_readiness
+    data_durability "forward-only migration" gate applied to the vector store.
 
 # Content-gap reverse signal: what the community asks that the KB can't answer.
 content_gap_detection:

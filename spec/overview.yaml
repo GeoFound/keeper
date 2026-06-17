@@ -4,7 +4,7 @@
 # =============================================================================
 
 meta:
-  name: ai-community-engine
+  name: keeper
   version: v5
   runtime_target: node
   language: typescript
@@ -151,7 +151,10 @@ operations:
       dedup actually protect against redelivery: MTProto/long-poll reconnects after a
       crash REPLAY un-acknowledged updates, and a freshly-minted correlationId would
       sail past the outbox and double-reply. The inbound is also recorded in `messages`
-      (PK = platform message id) before pipeline work, so a replayed update is a no-op
+      (PK = the PLATFORM-QUALIFIED identity `<platform>:<channelId>:<platform_message_id>`,
+      which is globally unique — NOT the bare platform_message_id, because Telegram message
+      ids are per-CHAT and reuse the same number across different chats, so a bare id would
+      collide across channels) before pipeline work, so a replayed update is a no-op
       insert, not a second journey. AN EDIT IS NOT A REPLAY: it shares the platform_message_id
       but the platform marks it (Telegram edit_date / GramJS edit event), so the adapter sets
       isEdit=true ONLY for a genuine edit. The replay guard keys on the concrete platform update
@@ -349,7 +352,7 @@ invariants:
   - New capability = new file + one registration line; existing modules' behavior untouched.
   - Cross-promotion is gated (flag + approval + tone + rate limit).
   - Each module consumes only its declared events and emits only its declared events.
-  - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except the two resolved-later exceptions message.received and control.owner_action) and a payload that validates against its declared schema.
+  - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except (a) the two resolved-later exceptions message.received and control.owner_action, and (b) the source-scoped content-sync events knowledge.sync_due and knowledge.updated, which operate on a content SOURCE that may fan out to many workspaces and instead carry a non-empty payload sourceId — isolation for these is enforced downstream by the RAG source_id filter, never by the envelope) and a payload that validates against its declared schema.
   - Every reply-pipeline stage passes through (emits its output event) when disabled; the chain never breaks.
   - Persona immutable boundaries are hard-coded; evolution may tune only the STYLE section, and only via a gated, reversible experiment.
   - The black-tier content floor (illegal/harmful) is non-tunable; neither config nor evolution can loosen it. Gray-tier (legal-but-distasteful) is tolerated by default.
@@ -425,11 +428,14 @@ quality_gates:
       check: >-
         A bus middleware validates every emission against the event's Zod payload schema
         and asserts a non-empty correlationId, plus a non-empty workspaceId for EVERY event
-        EXCEPT the two whose scope is not yet resolved at emit time — message.received and
-        control.owner_action (see events.yaml envelope.rules); for those two an empty
-        workspaceId is allowed and a non-empty one is required on everything they cause
-        downstream. Test feeds malformed payloads and asserts rejection, and asserts a
-        non-exception event with empty workspaceId is rejected.
+        EXCEPT (a) the two whose scope is not yet resolved at emit time — message.received and
+        control.owner_action — for which an empty workspaceId is allowed and a non-empty one is
+        required on everything they cause downstream; and (b) the two SOURCE-SCOPED content-sync
+        events knowledge.sync_due and knowledge.updated, for which an empty workspaceId is allowed
+        but a non-empty payload sourceId is REQUIRED instead (see events.yaml envelope.rules).
+        Test feeds malformed payloads and asserts rejection, asserts a non-exception
+        workspace-scoped event with empty workspaceId is rejected, and asserts a source-scoped
+        event with empty sourceId is rejected.
     - id: config_uniqueness
       enforces: config-identity
       check: >-

@@ -145,8 +145,12 @@ interfaces:
       operations.dual_identity), each implementing this interface:
         • telegram-userbot (MTProto/GramJS, the owner's USER account): the COMMUNITY
           face + chat plane. Chats AS the owner (no bot badge), reads ALL group messages
-          by membership (NO privacy-mode concept), plain MEMBER. It is the SOLE emitter of
-          message.received (onMessage/member/reaction wired here). Its outbound methods
+          by membership (NO privacy-mode concept), plain MEMBER. It is the SOLE emitter of the
+          RAW pre-routing channel signals message.received, inbound.member_joined,
+          inbound.member_left, inbound.reaction (onMessage/member/reaction wired here) — all
+          with an EMPTY workspaceId, since the adapter is workspace-unaware; the Workspace Router
+          resolves each to its workspace-stamped event (message.routed / member.joined /
+          member.left / reaction.received). Its outbound methods
           send community messages + lead DMs. Its admin methods (delete/ban/mute) are
           ABSENT/throw — the userbot performs no admin action. ACCOUNT SURVIVAL (overview)
           is enforced here: FLOOD_WAIT obedience, per-account ceiling, warm-up, RETREAT.

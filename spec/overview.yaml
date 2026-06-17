@@ -368,7 +368,7 @@ invariants:
   - New capability = new file + one registration line; existing modules' behavior untouched.
   - Cross-promotion is gated (flag + approval + tone + rate limit).
   - Each module consumes only its declared events and emits only its declared events.
-  - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except (a) the two resolved-later exceptions message.received and control.owner_action, and (b) the source-scoped content-sync events knowledge.sync_due and knowledge.updated, which operate on a content SOURCE that may fan out to many workspaces and instead carry a non-empty payload sourceId — isolation for these is enforced downstream by the RAG source_id filter, never by the envelope) and a payload that validates against its declared schema.
+  - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except (a) the resolved-later RAW adapter signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction, and control.owner_action — all resolved by the Workspace Router (member/reaction/message) or the Approval Service (owner action), so their workspace-stamped re-emissions (message.routed, member.joined, member.left, reaction.received) DO carry a non-empty workspaceId; and (b) the source-scoped content-sync events knowledge.sync_due and knowledge.updated, which operate on a content SOURCE that may fan out to many workspaces and instead carry a non-empty payload sourceId — isolation for these is enforced downstream by the RAG source_id filter, never by the envelope) and a payload that validates against its declared schema.
   - Every reply-pipeline stage passes through (emits its output event) when disabled; the chain never breaks.
   - Persona immutable boundaries are hard-coded; evolution may tune only the STYLE section, and only via a gated, reversible experiment.
   - The black-tier content floor (illegal/harmful) is non-tunable; neither config nor evolution can loosen it. Gray-tier (legal-but-distasteful) is tolerated by default.
@@ -401,7 +401,7 @@ invariants:
   - Telegram runs as TWO identities: a USERBOT (owner's user account, MTProto) is the community face + chat plane (plain member, reads by membership, chats as the owner, NO admin actions, sole inbound source of message.received); a CONTROL BOT (Bot API) is the group-admin moderation EXECUTOR + the owner's control plane (inline-button approvals, /commands, digest) and never chats to members.
   - Every privileged admin action (delete/mute/ban) is executed by the CONTROL BOT, never by the userbot; the owner's personal account performs no admin action. The control bot accepts control input ONLY from the owner user_id; members can never command it. All owner input enters through the ONE authenticated event control.owner_action (emitted by the control bot only for the owner, consumed only by the Approval Service); no adapter calls a module directly and no other event carries owner commands.
   - Account survival outranks throughput and applies to the USERBOT account: the per-account global send ceiling, FLOOD_WAIT obedience, cold-start warm-up, and retreat-on-risk are non-optional; a recurring flood signal forces RETREAT (posture==stay_silent) and notifies the owner out-of-band via the control bot.
-  - message.received is emitted ONLY by the userbot adapter; the control bot (though a group admin able to read) never re-ingests inbound, so no message is processed twice.
+  - The raw inbound adapter signals (message.received, inbound.member_joined, inbound.member_left, inbound.reaction) are emitted ONLY by the userbot adapter; the control bot (though a group admin able to read) never re-ingests inbound, so no message/member/reaction is processed twice. The workspace-resolved member.joined / member.left / reaction.received are emitted ONLY by the Workspace Router.
   - Owner-facing sends (digest, escalations, approvals, /status, /why) route to the control bot; community + lead-facing sends route to the userbot; routing is by audience, never ad hoc.
   - correlationId is derived deterministically from the platform message identity (never a fresh uuid), so a replayed/redelivered update is idempotent end-to-end — no double-reply across reconnects/crashes.
   - Moderation FAILS CLOSED: if the text/vision classifier errors, times out, or returns unparseable output, the message is held/treated as a violation candidate, never silently passed as clean. Budget/cap pressure can degrade availability but can never silently open the black floor.
@@ -444,14 +444,17 @@ quality_gates:
       check: >-
         A bus middleware validates every emission against the event's Zod payload schema
         and asserts a non-empty correlationId, plus a non-empty workspaceId for EVERY event
-        EXCEPT (a) the two whose scope is not yet resolved at emit time — message.received and
+        EXCEPT (a) the RAW adapter signals whose scope is not yet resolved at emit time —
+        message.received, inbound.member_joined, inbound.member_left, inbound.reaction, and
         control.owner_action — for which an empty workspaceId is allowed and a non-empty one is
-        required on everything they cause downstream; and (b) the two SOURCE-SCOPED content-sync
-        events knowledge.sync_due and knowledge.updated, for which an empty workspaceId is allowed
-        but a non-empty payload sourceId is REQUIRED instead (see events.yaml envelope.rules).
-        Test feeds malformed payloads and asserts rejection, asserts a non-exception
-        workspace-scoped event with empty workspaceId is rejected, and asserts a source-scoped
-        event with empty sourceId is rejected.
+        required on everything they cause downstream (notably the router's resolved re-emissions
+        message.routed / member.joined / member.left / reaction.received MUST carry it); and
+        (b) the two SOURCE-SCOPED content-sync events knowledge.sync_due and knowledge.updated,
+        for which an empty workspaceId is allowed but a non-empty payload sourceId is REQUIRED
+        instead (see events.yaml envelope.rules). Test feeds malformed payloads and asserts
+        rejection, asserts a non-exception workspace-scoped event with empty workspaceId is
+        rejected (including a member.joined/member.left/reaction.received emitted with empty
+        workspaceId), and asserts a source-scoped event with empty sourceId is rejected.
     - id: config_uniqueness
       enforces: config-identity
       check: >-
@@ -587,8 +590,11 @@ quality_gates:
     - id: dual_identity_routing
       enforces: dual-identity
       check: >-
-        message.received is emitted ONLY by the userbot adapter (assert the control bot never
-        emits it even though it can read as admin — no double processing). moderation.violation
+        the raw inbound signals (message.received, inbound.member_joined, inbound.member_left,
+        inbound.reaction) are emitted ONLY by the userbot adapter (assert the control bot never
+        emits them even though it can read as admin — no double processing), and the
+        workspace-resolved member.joined/member.left/reaction.received are emitted ONLY by the
+        Workspace Router (never the adapter). moderation.violation
         is executed ONLY by the control bot (assert the userbot adapter exposes no admin send
         path — companion to the static unified_outbound check). outbound.requested routes by
         audience: owner-facing kinds (digest + dm to owner + approval) -> control bot; community

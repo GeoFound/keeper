@@ -26,8 +26,8 @@ events:
       }
     rules:
       - correlationId is DERIVED DETERMINISTICALLY from the platform message identity by the Platform Adapter (`corr:<platform>:<channelId>:<platform_message_id>`; for an edit, still the original/editOf message id), NEVER a fresh uuid. This is what makes outbox dedup protect against redelivery — a reconnect/crash that REPLAYS an update yields the SAME correlationId, so it is idempotent end-to-end. The inbound replay guard is separate: it keys on the concrete platform update identity (original message vs each edit revision, e.g. Telegram update id / edit_date), so repeated edits are re-moderated while replaying the same edit is a no-op. (See overview operations.idempotent_delivery.inbound_idempotency.) control.owner_action is keyed the same way off the owner's control-bot message/callback id (`corr:telegram:<owner_dm>:<message_or_callback_id>`), so a redelivered owner tap is also idempotent and never double-acts.
-      - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY message journey; it copies it onto message.routed and every downstream stage propagates it unchanged. Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
-      - Two events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: message.received (workspace not yet routed) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other workspace-scoped event MUST carry a non-empty workspaceId.
+      - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY inbound journey — it is the SOLE resolver of channelId -> workspace for EVERY raw adapter channel signal: it copies the resolved workspaceId onto message.routed (from message.received) AND onto member.joined / member.left / reaction.received (from the raw inbound.member_joined / inbound.member_left / inbound.reaction), then every downstream stage propagates it unchanged. The adapter stays workspace-unaware; an unbound channel is dropped at the router for member/reaction signals exactly as for messages (no member.*/reaction.received re-emit, no channel_members write). Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
+      - A FIXED set of RAW adapter events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: the userbot's pre-routing channel signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction (workspace not yet routed — the Workspace Router resolves them) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other workspace-scoped event — INCLUDING the resolved member.joined / member.left / reaction.received — MUST carry a non-empty workspaceId.
       - A SMALL fixed set of SOURCE-SCOPED infra events is NOT workspace-scoped at all: knowledge.sync_due and knowledge.updated operate on a content SOURCE that may be bound to MANY workspaces (and a sync may belong to none yet), so a single workspaceId is meaningless for them. They carry an EMPTY workspaceId and MUST instead carry a non-empty sourceId in their payload (ScheduledTick.sourceId for knowledge.sync_due — the Scheduler fires one tick PER SOURCE on that source's own interval; KnowledgeDelta.sourceId for knowledge.updated). Isolation for these is enforced downstream at RAG QUERY time by the source_id filter (see knowledge.yaml content_isolation), never by the envelope. This is the ONLY non-workspace, non-`__system__` scope class; every other event still requires a non-empty workspaceId. (The envelope_conformance gate asserts a source-scoped event with empty sourceId is rejected.)
       - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emission is outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false) with a kind-namespaced dedupeKey.
       - A consumer MUST ignore an event whose version it does not understand (forward-compatible).
@@ -38,11 +38,14 @@ events:
         validates against modules PLUS this whitelist (for BOTH produced and consumed
         events), never modules alone.
         PRODUCERS:
-          (a) Platform Adapter — the USERBOT adapter emits (message.received, member.*,
-              reaction.received, reply.sent, outbound.sent); the CONTROL BOT adapter emits
-              (outbound.sent for owner sends, and control.owner_action for EVERY authenticated
-              owner input — inline-button callbacks, slash commands, onboarding answers). The
-              control bot does NOT mint message.received (no re-ingest).
+          (a) Platform Adapter — the USERBOT adapter emits the RAW pre-routing channel signals
+              (message.received, inbound.member_joined, inbound.member_left, inbound.reaction —
+              all with an empty workspaceId, resolved by the Workspace Router) plus reply.sent,
+              outbound.sent; the CONTROL BOT adapter emits (outbound.sent for owner sends, and
+              control.owner_action for EVERY authenticated owner input — inline-button callbacks,
+              slash commands, onboarding answers). The adapter NEVER emits the workspace-resolved
+              member.*/reaction.received (those come from the router) and the control bot does NOT
+              mint message.received (no re-ingest).
           (b) Scheduler — the *.due ticks. The per-WORKSPACE ticks (evolution.reflection_due,
               digest.due, retention.sweep_due, content_calendar.due, activity.due,
               marketing.share_due) carry workspaceId and fire in each workspace's timezone;
@@ -74,9 +77,21 @@ events:
     - { event: message.clean,                version: 1, publisher: Moderation,                       consumers: [Context Manager, Intent Router, Atmosphere Monitor, Activity Planner, Evolution Tracker, User Memory, Funnel, SocialContext (channel_state updater)], payload: RoutedMessage }   # Evolution Tracker observes human replies/quotes to the bot here (the primary engaged metric); Funnel reads explicit-interest signals; Activity Planner detects hot/surging topics for event-driven activity types (ai_news_discussion/poll_survey)
     - { event: moderation.violation,         version: 1, publisher: "Moderation (auto delete) / Approval Service (approved mute|ban)", consumers: ["Platform Adapter (CONTROL BOT — the group-admin executor)"], payload: ModerationAction }   # control bot executes; delete is auto, mute/ban only after owner ✅. Execute-once: the executor claims moderation_actions.action_key (UNIQUE) before the platform call, so a replayed violation never double-acts (data-model moderation_actions)
     - { event: moderation.escalated,         version: 1, publisher: Moderation,                       consumers: [Approval Service],                                                  payload: ModerationAction }   # black-tier notify AND the L1 proposal for mute/ban (owner ✅ -> moderation.violation)
-    - { event: member.joined,                version: 1, publisher: Platform Adapter,                 consumers: [Welcome Module, SocialContext (channel_state updater)],              payload: MemberEvent }
-    - { event: member.left,                  version: 1, publisher: Platform Adapter,                 consumers: [Atmosphere Monitor, Evolution Tracker, User Memory, SocialContext (channel_state updater)], payload: MemberEvent }
-    - { event: reaction.received,            version: 1, publisher: Platform Adapter,                 consumers: [Evolution Tracker, Funnel],                                         payload: ReactionEvent }
+    # --- RAW adapter channel signals (workspace NOT yet resolved — empty workspaceId, like
+    #     message.received). The USERBOT adapter cannot mint workspaceId (it is workspace-
+    #     unaware); the Workspace Router resolves channelId -> workspace, drops unbound
+    #     channels, and re-emits the workspace-stamped member.*/reaction.received below. This
+    #     finishes the message.received -> message.routed pattern for member + reaction events
+    #     so no workspace-scoped event is ever emitted with an empty workspaceId. ---
+    - { event: inbound.member_joined,        version: 1, publisher: "Platform Adapter (USERBOT only)", consumers: [Workspace Router],                                                payload: MemberEvent }     # raw; empty workspaceId; resolved -> member.joined
+    - { event: inbound.member_left,          version: 1, publisher: "Platform Adapter (USERBOT only)", consumers: [Workspace Router],                                                payload: MemberEvent }     # raw; empty workspaceId; resolved -> member.left
+    - { event: inbound.reaction,             version: 1, publisher: "Platform Adapter (USERBOT only)", consumers: [Workspace Router],                                                payload: ReactionEvent }   # raw; empty workspaceId; resolved -> reaction.received
+    # --- workspace-resolved member/reaction events (workspaceId stamped by the Workspace
+    #     Router). These keep their established names + consumers; only their PRODUCER moved
+    #     from the adapter to the router (which is the sole minter of workspaceId). ---
+    - { event: member.joined,                version: 1, publisher: Workspace Router,                 consumers: [Welcome Module, SocialContext (channel_state updater)],              payload: MemberEvent }
+    - { event: member.left,                  version: 1, publisher: Workspace Router,                 consumers: [Atmosphere Monitor, Evolution Tracker, User Memory, SocialContext (channel_state updater)], payload: MemberEvent }
+    - { event: reaction.received,            version: 1, publisher: Workspace Router,                 consumers: [Evolution Tracker, Funnel],                                         payload: ReactionEvent }
     # --- control plane ingress (the SINGLE authenticated owner->bot input edge) ---
     - { event: control.owner_action,         version: 1, publisher: "Platform Adapter (CONTROL BOT — owner-authenticated input only)", consumers: [Approval Service],                  payload: OwnerAction }     # inline-button decisions, slash commands, onboarding answers; workspaceId resolved by Approval
     # --- ordered reply pipeline (see reply_pipeline below) ---
@@ -357,6 +372,17 @@ flows:
       - "Persona Engine: ctx.styling.assign(workspaceId, correlationId) -> {variant, stylePrompt} (Thompson draw over the running STYLE experiment, deterministic per correlationId; 'champion' if none); assemble prompt with that STYLE section -> call LLM -> post-process (de-AI) -> set text + styleVariant -> emit reply.generated"
       - Platform Adapter: delay + typing indicator + send via send_queue+outbox -> emit reply.sent (with styleVariant + correlationId)
       - Evolution Tracker: record reply.sent for feedback tracking
+  member_reaction_routing:   # the resolution path for raw adapter member/reaction signals
+    note: >-
+      Member joins/leaves and reactions enter as RAW signals with no workspace (the adapter is
+      workspace-unaware), exactly like message.received. The Workspace Router is the single
+      resolver: it stamps workspaceId and re-emits the established member.*/reaction.received
+      events the modules consume. An unbound channel is dropped here (no re-emit, no
+      channel_members write), symmetric with the unbound-message drop.
+    steps:
+      - "Platform Adapter (userbot): receive member join/leave or reaction -> MemberEvent/ReactionEvent -> emit inbound.member_joined | inbound.member_left | inbound.reaction (workspaceId empty)"
+      - "Workspace Router: resolve channelId -> workspace (drop if unbound) -> stamp workspaceId -> re-emit member.joined | member.left | reaction.received"
+      - "Consumers act on the resolved event: Welcome (member.joined), SocialContext (member.joined/left -> channel_members + counts), Atmosphere/Evolution/User Memory (member.left), Evolution/Funnel (reaction.received)"
   edited_message_handling:
     note: An edit is re-moderated, never re-replied. See envelope.rules (isEdit).
     steps:

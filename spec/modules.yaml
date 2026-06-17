@@ -6,22 +6,30 @@
 
 modules:
   workspace_router:
-    subscribes: [message.received]
-    publishes: [message.routed, outbound.requested]
+    subscribes: [message.received, inbound.member_joined, inbound.member_left, inbound.reaction]
+    publishes: [message.routed, member.joined, member.left, reaction.received, outbound.requested]
     role: >-
-      Resolve channel -> workspace + allowed content sources, then emit message.routed.
-      It is ALSO the writer of the canonical `messages` row: on a successful resolve it
-      inserts the row (workspace_id now known, so the NOT NULL holds), and a genuine edit
-      (isEdit) UPDATES that row in place rather than inserting. An unbound channel is dropped
-      here BEFORE any write (no messages row, no spend — see unbound_channel). The pre-routing
-      replay guard (inbound_updates) is the ingest adapter's, not the router's.
+      The SINGLE resolver of channelId -> workspace for EVERY raw adapter channel signal (the
+      adapter is workspace-unaware and never mints workspaceId). For a message it resolves
+      workspace + allowed content sources and emits message.routed; for the raw member/reaction
+      signals (inbound.member_joined / inbound.member_left / inbound.reaction) it stamps the
+      resolved workspaceId and re-emits the established member.joined / member.left /
+      reaction.received the modules consume (see events.yaml member_reaction_routing). It is
+      ALSO the writer of the canonical `messages` row: on a successful resolve it inserts the
+      row (workspace_id now known, so the NOT NULL holds), and a genuine edit (isEdit) UPDATES
+      that row in place rather than inserting. An unbound channel is dropped here BEFORE any
+      write — for a message: no messages row, no spend; for a member/reaction signal: no
+      re-emit and no channel_members write (see unbound_channel). The pre-routing replay guard
+      (inbound_updates) is the ingest adapter's, not the router's.
     unbound_channel:   # anyone can add a Telegram bot to an arbitrary group — guard the front door
       rule: >-
-        If channelId resolves to NO configured workspace, the message is DROPPED at
-        the router: no message.routed, no moderation, no LLM call, no DB write, ZERO
-        spend. An unbound channel can never consume budget, retrieve content, or
-        trigger any action. The bot only ever operates in explicitly configured
-        channels (action provenance starts at configuration).
+        If channelId resolves to NO configured workspace, the inbound signal is DROPPED at
+        the router: a message gets no message.routed, no moderation, no LLM call, no DB write,
+        ZERO spend; a raw member/reaction signal (inbound.member_joined/left/reaction) gets no
+        member.*/reaction.received re-emit and no channel_members write. An unbound channel can
+        never consume budget, retrieve content, update a read-model, or trigger any action. The
+        bot only ever operates in explicitly configured channels (action provenance starts at
+        configuration).
       owner_notice: >-
         The FIRST time the userbot is added to / sees an unknown channel it notifies the
         owner once ("added to <chat>; not configured — ignoring") via

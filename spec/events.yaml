@@ -19,6 +19,10 @@ events:
         causationId?: string;   // the eventId that directly caused this emission
         workspaceId: string;    // resolved isolation scope; set by Workspace Router,
                                 // guaranteed non-empty for every event downstream of message.routed
+        subjectUserId?: string; // set whenever the payload concerns a SPECIFIC member, so the
+                                // journaling middleware can stamp event_journal.subject_user_id
+                                // and /forget's subject sweep is COMPLETE, not a guess (see rules
+                                // + overview observability.redaction). Absent = not about one subject.
         name: string;           // the event name (matches catalog)
         version: number;        // payload schema version for this event name
         timestamp: Date;
@@ -48,8 +52,8 @@ events:
               mint message.received (no re-ingest).
           (b) Scheduler — the *.due ticks. The per-WORKSPACE ticks (evolution.reflection_due,
               digest.due, retention.sweep_due, content_calendar.due, activity.due,
-              marketing.share_due) carry workspaceId and fire in each workspace's timezone;
-              knowledge.sync_due is
+              marketing.share_due, lead.followup_due) carry workspaceId and fire in each
+              workspace's timezone; knowledge.sync_due is
               SOURCE-SCOPED — one tick per source on its own sync interval, carrying
               ScheduledTick.sourceId with an empty workspaceId (see envelope.rules).
           (c) Content Sync Pipeline + RAG/Knowledge service — knowledge.updated, content_gap.detected.
@@ -77,6 +81,9 @@ events:
               SuppressionService.
         These are infra, not peer modules; no module imports them.
       - An EDITED inbound message is NOT a new event name: the Platform Adapter re-emits message.received with UnifiedMessage.isEdit=true (and editOf set), so an edit flows the SAME route (Workspace Router -> Moderation) and is RE-MODERATED. Downstream reactive stages MUST NOT treat an edit as a fresh trigger (Intent Router never replies to an edit); the Context Manager updates the edited turn in place.
+      - SELF-INGEST EXCLUSION: the USERBOT adapter never emits message.received / inbound.member_* / inbound.reaction for an update whose sender is its OWN account (the bot's automated sends OR the owner's manual messages on that same account). It drops them before emit (overview operations.dual_identity.self_ingest_filter). bot-message accounting comes only from reply.sent/outbound.sent on the send path, never reconstructed from inbound — so the drop loses nothing.
+      - INBOUND LIFECYCLE (crash-safety, not just dedup): the userbot adapter CLAIMS an inbound_updates row as status='pending' before emitting message.received, and the engine flips it to 'committed' at the message's terminal guarded outcome (reply outbox row written, OR decision.no_reply journaled, OR moderation_actions key claimed / message.clean with no reactive send). Delivery is decided by status + the process in-flight set — a 'committed' conflict STOPS (true replay); a 'pending' conflict that is in THIS process's in-flight set STOPS (concurrent duplicate); a 'pending' conflict NOT in-flight here (claimed by a prior crashed process) RE-JOURNEYS — this lets a post-crash platform replay reprocess a message whose journey died, including before the messages row existed. On restart the engine ALSO re-drives pending rows that have a persisted messages row by re-emitting message.routed; a pending row with no messages row waits for platform redelivery; past staleness it is committed without re-drive. Re-journeys are safe via the downstream execute-once guards (outbox dedupeKey, moderation_actions key). This is pre-routing, so the inbound_updates row carries no workspaceId; the messages row written by the Workspace Router does. (overview operations.idempotent_delivery.inbound_crash_recovery.)
+      - SUBJECT STAMPING: any workspace-scoped event whose payload concerns a SPECIFIC member (message.routed/clean, member.joined/left, reaction.received, moderation.*, lead.*, user.forget, and any owner-facing send about a user) MUST set envelope.subjectUserId. The journaling middleware copies it to event_journal.subject_user_id (and sets contains_user_text when user text is in the digest), which is what makes /forget's subject sweep COMPLETE rather than best-effort (overview observability.redaction; data-model event_journal). subjectUserId is orthogonal to workspaceId and never relaxes the workspaceId rules above.
 
   # Event name -> payload type. Payload schemas are authoritative (Zod at runtime).
   catalog:
@@ -134,6 +141,7 @@ events:
     - { event: content_gap.detected,         version: 1, publisher: RAG Engine,                      consumers: [Content Gap],                                                       payload: ContentGap }      # KB could not answer
     - { event: lead.identified,              version: 1, publisher: Funnel,                          consumers: [Approval Service],                                                  payload: Lead }            # DM proposal -> owner (governance-gated)
     - { event: lead.approved,                version: 1, publisher: Approval Service,                consumers: [Funnel],                                                            payload: ApprovalDecision }   # owner ✅ -> Funnel sends the DM
+    - { event: lead.followup_due,            version: 1, publisher: Scheduler,                       consumers: [Funnel],                                                            payload: ScheduledTick }   # per-workspace tz tick; Funnel resolves leads whose dm_sent_at + no_response window elapsed with no reply -> mark no_response + long-lived suppression (absence-of-reply needs a timer; events alone can't observe it)
     - { event: user.forget,                  version: 1, publisher: Approval Service,                consumers: [User Memory, "Database service (user-scoped raw-record purge/redaction)"], payload: ForgetRequest }   # owner /forget — note+opt-out erased by User Memory, user-scoped raw records purged/redacted by the Database service
     - { event: onboarding.input,             version: 1, publisher: Approval Service,                consumers: [Onboarding Wizard],                                                 payload: OnboardingInput }  # Approval forwards owner control input that belongs to an active /setup session
 
@@ -363,13 +371,21 @@ reply_pipeline:
     FORCE-ABORTED (frees the slot, logs it, WRITES a pipeline_failures row with
     kind:'hang_aborted', counts it for the digest). This makes a hung stage observable
     and recoverable, not an invisible black hole. Gate: pipeline_watchdog.
+    deadline_budget_rule: >-
+      The whole-journey deadline MUST exceed the worst-case sum of per-stage timeouts, or it
+      would force-abort a LEGITIMATELY slow reply in which no single stage exceeded its own
+      stage_timeout. Invariant: pipeline_inflight_deadline_seconds >=
+      (number_of_pipeline_stages * pipeline_stage_timeout_seconds) + a margin — with 4 stages *
+      30s, config.yaml ships a 150s deadline (not the naive 45s, which would kill valid replies).
+      The config loader asserts this relationship so the two timeouts can never be set into
+      conflict. Both still sit under reply.max_staleness, so a stale trigger is dropped first.
 
 # Primary message-handling flow (reference sequence).
 flows:
   message_handling:
     steps:
-      - "Platform Adapter (userbot): receive platform message -> CLAIM the inbound_updates replay-guard row (INSERT; a UNIQUE conflict = replay -> STOP, do not re-emit) -> UnifiedMessage -> emit message.received (workspaceId empty)"
-      - "Workspace Router: resolve workspace + allowedSources -> mint workspaceId -> WRITE/UPDATE the canonical messages row (post-routing) -> emit message.routed (an unbound channel is dropped here with no write)"
+      - "Platform Adapter (userbot): receive platform message -> DROP if sender is the userbot's OWN account (self-ingest filter — bot sends + owner's manual messages) -> CLAIM the inbound_updates row status='pending' (INSERT). Delivery rule: committed conflict -> STOP (true replay); pending conflict in THIS process's in-flight set -> STOP (concurrent duplicate); pending conflict NOT in-flight (prior crashed process) -> re-journey (a platform replay carries the content even for a pre-routing crash). -> UnifiedMessage -> emit message.received (workspaceId empty). The engine flips the row to 'committed' at the terminal guarded outcome below; on restart it re-drives pending-in-window rows that HAVE a messages row, and leaves those without one to platform redelivery (overview inbound_crash_recovery)."
+      - "Workspace Router: resolve workspace + allowedSources -> mint workspaceId + subjectUserId(sender) -> WRITE/UPDATE the canonical messages row (post-routing) -> emit message.routed (an unbound channel is dropped here with no write)"
       - Moderation:
           on_violation: "emit moderation.violation(action:'delete', autonomy:'auto') -> Platform Adapter deletes NOW (silent); for mute/ban emit moderation.escalated(autonomy:'proposed') -> Approval Service -> owner ✅ -> moderation.violation(autonomy:'approved') executes"
           on_classifier_failure: "FAIL CLOSED — hold the message / treat as violation candidate; never emit message.clean"
@@ -406,7 +422,7 @@ flows:
       can never bypass them. No module owns a send path.
     steps:
       - "Producer (Welcome / Atmosphere Initiator / Activity Executor / Marketing proactive_share / Approval Service / Funnel / Onboarding): compose + humanize text -> emit outbound.requested (with dedupeKey, notBefore, suppressIfKillSwitch)"
-      - "Platform Adapter (selected by OutboundMessage.via — userbot for community/lead, control bot for owner): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, and correlationId so a restart can actually retry it; if dedupeKey already exists, drop (no double-send). If suppressIfKillSwitch and NOT RoomRead.proactiveAllowed (so /pause + account RETREAT via posture==stay_silent, OR /quiet via proactive_paused_until — see contracts RoomRead), mark dropped. Honor notBefore; send via the matching send_queue (userbot under the account_survival floor: FLOOD_WAIT obedience + per-account ceiling; control bot under Bot-API limits) -> mark outbox sent with platform_message_id -> emit outbound.sent"
+      - "Platform Adapter (selected by OutboundMessage.via — userbot for community/lead, control bot for owner): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, and correlationId (when a send has no inbound cause, a synthetic `corr:<kind>:<dedupeKey>` is used so the proactive send is still traceable via `just trace`) so a restart can actually retry it; if dedupeKey already exists, drop (no double-send). If suppressIfKillSwitch and NOT RoomRead.proactiveAllowed (so /pause + account RETREAT via posture==stay_silent, OR /quiet via proactive_paused_until — see contracts RoomRead), mark dropped. For a PROACTIVE/non-reply kind, the dequeue ALSO re-reads the live consecutive_bot_messages under the send queue's serialization and marks the row dropped (reason=consecutive_cap) if sending would exceed max_consecutive_bot_messages without an intervening human message — the ATOMIC enforcement of the 'never talk to itself' cap (overview send_queue.consecutive_bot_cap_enforcement); a reply is exempt. Honor notBefore; send via the matching send_queue (userbot under the account_survival floor: FLOOD_WAIT obedience + per-account ceiling; control bot under Bot-API limits) -> mark outbox sent with platform_message_id -> emit outbound.sent"
       - "SocialContext updater: on outbound.sent bump last_bot_message_at + consecutive_bot_messages; Evolution Tracker records proactive sends for timing/activity feedback"
   control_plane_ingress:   # how owner input reaches the bot — the single authenticated edge
     note: >-

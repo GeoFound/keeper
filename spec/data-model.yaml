@@ -42,17 +42,46 @@ data_model:
       CREATE UNIQUE INDEX ux_messages_platform_identity
         ON messages (platform, channel_id, platform_message_id);
     inbound_updates: |
-      -- Idempotency guard for inbound platform updates. This separates replayed updates
-      -- from genuine edits before any pipeline work starts. A replay hits this unique key
-      -- and stops; a genuine edit has update_kind='edit' plus a distinct update_identity
-      -- (Telegram update id / edit_date / pts) and proceeds to re-moderation. Multiple
-      -- edits to the same platform_message_id must each pass once; replaying the same edit
-      -- revision is the no-op.
-      -- WRITER: the inbound (userbot) Platform Adapter / engine ingest CLAIMS this row
-      -- (INSERT) BEFORE emitting message.received; a UNIQUE conflict => this update is a
-      -- replay => the adapter does NOT emit message.received (no double-journey). This guard
-      -- is pre-routing, so it carries NO workspace_id (the canonical messages row, written
-      -- later by the Workspace Router, does).
+      -- Idempotency + crash-recovery guard for inbound platform updates. This separates
+      -- replayed updates from genuine edits before any pipeline work starts, AND tracks each
+      -- update's processing lifecycle so a crash mid-journey COMPLETES instead of being lost.
+      -- A genuine edit has update_kind='edit' plus a distinct update_identity (Telegram update
+      -- id / edit_date / pts) and proceeds to re-moderation; multiple edits to the same
+      -- platform_message_id must each pass once; replaying the same edit revision is the no-op.
+      -- WRITER: the inbound (userbot) Platform Adapter / engine ingest CLAIMS this row (INSERT
+      -- status='pending') BEFORE emitting message.received. DELIVERY SEMANTICS are by status +
+      -- the process's in-flight set, NOT a blanket stop (the old blanket stop silently LOST a
+      -- message if the process died after the claim but before any durable downstream side
+      -- effect existed). For an arriving update U:
+      --   1. a 'committed' row exists  => true replay of fully-processed work => STOP (downstream
+      --      already happened and is guarded by outbox/moderation_actions).
+      --   2. a 'pending' row exists AND U is in THIS process's in-flight set => a concurrent
+      --      duplicate delivery of a journey still running here => STOP (the original finishes or
+      --      is re-driven; do not double-journey concurrently).
+      --   3. otherwise (no row, OR a 'pending' row NOT in this process's in-flight set — i.e.
+      --      claimed by a prior, since-crashed process) => (re)claim 'pending', add to in-flight,
+      --      and JOURNEY. This is what lets a post-crash PLATFORM REPLAY (MTProto replays un-acked
+      --      updates, and the replay carries the full content) reprocess a message whose journey
+      --      died — including the window BEFORE the messages row was written, which a restart
+      --      re-drive cannot reconstruct. Re-journeying is SAFE: every non-idempotent downstream
+      --      action is execute-once guarded (outbox dedupe_key, moderation_actions.action_key) and
+      --      the messages-row upsert dedups the write; read-model counters may be re-touched at
+      --      most once per crashed row, which is bounded and self-heals in the rolling windows.
+      -- COMMIT POINT: the engine flips status->'committed' (set committed_at) when the message
+      -- reaches its terminal, idempotently-guarded outcome — i.e. once EVERY non-idempotent side
+      -- effect is either done-and-guarded or decided-not-to-happen: a reply outbox row was written
+      -- (reply:<correlationId>), OR Intent Router journaled decision.no_reply, OR Moderation
+      -- claimed a moderation_actions.action_key / reached message.clean with no reactive send.
+      -- RESTART RE-DRIVE (covers a crash where the platform does NOT redeliver): on startup the
+      -- engine scans inbound_updates WHERE status='pending' AND received_at within
+      -- reply.max_staleness + margin, and for those that HAVE a persisted `messages` row RE-DRIVES
+      -- them by re-resolving + re-emitting message.routed, so a crash AFTER routing persisted but
+      -- before the commit point still completes without waiting on a platform replay. A pending
+      -- row with NO messages row (crash before routing) is left to platform redelivery (rule 3) —
+      -- its content was never stored, so there is nothing to re-drive and nothing was committed.
+      -- A 'pending' row older than the window is marked 'committed' WITHOUT re-drive (stale
+      -- trigger — mirrors the outbox stale-drop). This guard is pre-routing, so it carries NO
+      -- workspace_id (the canonical messages row, written later by the Workspace Router, does).
       CREATE TABLE inbound_updates (
         id TEXT PRIMARY KEY,                         -- upd:<platform>:<channel>:<message>:<kind>:<identity>
         platform TEXT NOT NULL,
@@ -61,9 +90,13 @@ data_model:
         update_kind TEXT NOT NULL,                   -- message|edit
         update_identity TEXT NOT NULL,               -- original message id, or per-edit revision/update id
         correlation_id TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',               -- pending|committed (lifecycle; drives conflict + restart re-drive)
         received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        committed_at DATETIME,                       -- set when the journey reaches its terminal guarded outcome
         UNIQUE(platform, channel_id, platform_message_id, update_kind, update_identity)
       );
+      CREATE INDEX ix_inbound_updates_pending
+        ON inbound_updates (status, received_at);
     reply_feedback: |
       CREATE TABLE reply_feedback (
         id INTEGER PRIMARY KEY,
@@ -407,19 +440,28 @@ data_model:
       CREATE INDEX ix_knowledge_vector_map_source
         ON knowledge_vector_map (source_id, vector_rowid);
     daily_budget_state: |
-      -- Atomic reserve-not-check budget state. LLMGateway updates this row BEFORE any
-      -- generative/ingest/media call, then reconciles to actual llm_usage after completion.
+      -- Atomic reserve-not-check budget state for the WORKSPACE-SCOPED lanes (generative +
+      -- safety/media). LLMGateway atomically RESERVES an estimate against the day's remaining
+      -- budget BEFORE the call, then reconciles on completion. RESERVATION RELEASE IS MANDATORY:
+      -- on ANY non-completing path (LLM error/timeout, pipeline abort, watchdog hang-abort, parse
+      -- failure) the reserved estimate is RELEASED (reserved -= estimate) and NO actual is
+      -- appended — otherwise a workspace with intermittent failures slowly buries its budget under
+      -- phantom reservations and trips to read_only/media_hold with no real spend. On success the
+      -- estimate is released and the ACTUAL is booked (reserved -= estimate; actual += real;
+      -- llm_usage row appended). So reserved is a transient in-flight ceiling that always returns
+      -- to ~0 between bursts. NOTE: the day row is created once per (workspace, day) via an
+      -- idempotent upsert (INSERT .. ON CONFLICT DO NOTHING) seeded from config budgets, so a
+      -- day-rollover race cannot create two rows. INGEST IS NOT HERE: ingest is source-scoped (a
+      -- source serves many workspaces) and lives in ingest_budget_state — see that table and
+      -- overview operations.cost_circuit_breaker.budget_lanes.
       CREATE TABLE daily_budget_state (
         workspace_id TEXT NOT NULL,
         day TEXT NOT NULL,                         -- YYYY-MM-DD in workspace timezone
         generative_budget_usd REAL NOT NULL,
-        ingest_budget_usd REAL NOT NULL,
         safety_budget_usd REAL NOT NULL,
         media_scan_cap INTEGER NOT NULL,
-        generative_reserved_usd REAL DEFAULT 0,
+        generative_reserved_usd REAL DEFAULT 0,    -- transient in-flight ceiling; released on success OR failure
         generative_actual_usd REAL DEFAULT 0,
-        ingest_reserved_usd REAL DEFAULT 0,
-        ingest_actual_usd REAL DEFAULT 0,
         safety_reserved_usd REAL DEFAULT 0,
         safety_actual_usd REAL DEFAULT 0,
         media_scans_reserved INTEGER DEFAULT 0,
@@ -428,6 +470,26 @@ data_model:
         read_only_until DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (workspace_id, day)
+      );
+    ingest_budget_state: |
+      -- SOURCE-SCOPED ingest budget lane. Knowledge sync is fired PER SOURCE (knowledge.sync_due
+      -- carries sourceId, empty workspaceId — events.yaml), and a source may be bound to MANY
+      -- workspaces, so ingest has NO single owner workspace and CANNOT draw from a per-workspace
+      -- lane. It is metered here, keyed by (source_id, day-in-server-tz — a source has no
+      -- human-facing local time). Same reserve-not-check + mandatory release-on-failure discipline
+      -- as daily_budget_state. Over the per-source ingest cap, that SOURCE's sync PAUSES and
+      -- resumes next day; it never touches any workspace's generative/safety lane, and a paused
+      -- source never blocks chat. A large FIRST sync and the full re-embed on a dimension change
+      -- (knowledge.yaml embedding_compatibility) both run under this lane.
+      CREATE TABLE ingest_budget_state (
+        source_id TEXT NOT NULL,
+        day TEXT NOT NULL,                         -- YYYY-MM-DD (server tz; a source has no workspace-local time)
+        ingest_budget_usd REAL NOT NULL,           -- per-source/day cap, defaulted from config llm.budget.ingest_daily_usd
+        ingest_reserved_usd REAL DEFAULT 0,        -- transient; released on success OR failure
+        ingest_actual_usd REAL DEFAULT 0,
+        paused_until DATETIME,                     -- set when the source's ingest cap is exhausted
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (source_id, day)
       );
     llm_usage: |
       -- Cost circuit breaker backing. Per workspace per day; LLMGateway checks the
@@ -640,8 +702,13 @@ data_model:
       -- so "why did nothing happen?" is answerable too. causation_id persists the causal
       -- graph the envelope models. payload_digest is REDACTED + size-capped: it NEVER contains
       -- the session string, bot token, API keys, or flagged-media bytes (gate: journal_no_secrets).
-      -- If user-scoped text appears, subject_user_id/channel/message metadata is set so /forget
-      -- can redact payload_digest/reason while preserving the trace skeleton. The privacy
+      -- SUBJECT STAMPING IS NON-OPTIONAL FOR /forget COMPLETENESS: subject_user_id is NOT guessed
+      -- by the middleware. EVERY workspace-scoped event whose payload concerns a specific member
+      -- MUST carry envelope.subjectUserId (events.yaml envelope.rules), and the journaling
+      -- middleware copies it (plus channel/message metadata) onto the row and sets
+      -- contains_user_text. Synthetic trace rows pass subjectUserId through ctx.logger.trace. A
+      -- row that omits subjectUserId is, by contract, NOT about a single subject — so /forget's
+      -- subject sweep (WHERE subject_user_id=?) is COMPLETE rather than best-effort. The privacy
       -- model is three-tiered: audit skeleton (event name/time/correlation/reason code) is
       -- retained for traceability, user payload digest is retention-/forget-bound, and raw
       -- message text lives in messages only with the shortest retention.

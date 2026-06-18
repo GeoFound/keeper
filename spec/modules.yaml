@@ -20,7 +20,10 @@ modules:
       that row in place rather than inserting. An unbound channel is dropped here BEFORE any
       write — for a message: no messages row, no spend; for a member/reaction signal: no
       re-emit and no channel_members write (see unbound_channel). The pre-routing replay guard
-      (inbound_updates) is the ingest adapter's, not the router's.
+      (inbound_updates) is the ingest adapter's, not the router's; but on a restart the engine
+      RE-DRIVES uncommitted-in-window inbound_updates rows by re-resolving + re-emitting
+      message.routed from the persisted messages row, so a crash mid-journey completes through
+      the router exactly as a fresh message would (overview idempotent_delivery.inbound_crash_recovery).
     unbound_channel:   # anyone can add a Telegram bot to an arbitrary group — guard the front door
       rule: >-
         If channelId resolves to NO configured workspace, the inbound signal is DROPPED at
@@ -61,6 +64,22 @@ modules:
       or queue moderation but can never silently open the black floor. (Gate:
       moderation_failclosed.) Use structured/JSON-schema output and treat a parse failure
       as classifier failure.
+    classification_cost_model: >-
+      Moderation runs on EVERY message.routed, so a naive "LLM-classify every message" both
+      blows cost and — because the SAFETY lane is intentionally tiny (safety_daily_usd) —
+      would EXHAUST that lane in a legitimately busy room and then fail closed on everything
+      (a self-DoS where normal traffic darkens the channel). So moderation, like the Intent
+      Router, runs a CHEAP DETERMINISTIC PRE-FILTER FIRST (moderation/content-filter rules):
+      spam_keywords, link/flood/bulk-join rules, new_user_link/media_delay, and obvious-clean
+      heuristics resolve the BULK of benign text with NO safety-lane LLM call. The vision
+      classifier and the LLM TEXT classifier are invoked ONLY for the survivors — media, and
+      text the rules flag as suspect/ambiguous (and the black-tier text check). This keeps
+      per-message moderation cost bounded and keeps the safety lane available for the messages
+      that actually need a model. Fail-closed still applies to every survivor that errors. When
+      the safety lane IS exhausted, only the survivors are affected (held per
+      safety_exhaustion_behavior); rule-clean traffic continues to flow, so a busy room does not
+      go dark from budget pressure alone. This deterministic floor is itself non-LLM, so it
+      keeps working under read_only and under safety-lane exhaustion.
     hold_queue:
       member_visibility: "silent — no in-channel explanation, no mechanism disclosure"
       ttl: "config.llm.budget.safety_hold_ttl_hours (default 24h)"
@@ -325,7 +344,7 @@ modules:
       - strip markdown (**bold**, - lists, ``` code ```)
       - strip enumerations (1. 2. 3.)
       - AI-leak check ("作为AI", "我是语言模型", model/vendor/system-prompt claims; only the approved one-line direct-automation disclosure is allowed)
-      - length check (if over threshold, ask LLM to condense)
+      - length check (if over threshold, ONE optional LLM condense call — it runs INSIDE the Persona stage_timeout and its estimated cost is included in the stage's generative reservation up front, so the condense can never bust the reserve or the stage deadline; if it errors/times out the stage fails closed and aborts like any other stage failure, never shipping a half-condensed draft)
       - randomize (occasionally drop trailing period, add an emoji)
 
   activity_planner:
@@ -402,7 +421,7 @@ modules:
           do:   [everything + evolution self-tuning]
       anti_cringe_rules:   # hard guards, enforced regardless of phase
         - never run a poll/quiz below min_participants_for_poll
-        - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself)
+        - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself). This producer-side check is a cheap PRE-GATE; the AUTHORITATIVE, race-free enforcement is at the userbot send-queue dequeue (overview send_queue.consecutive_bot_cap_enforcement), so concurrent proactive producers cannot collectively overshoot the cap.
         - in seed phase, only broadcast value — never simulate dialogue
         - if NOT RoomRead.proactiveAllowed (/pause, /quiet, or account RETREAT) or posture == stay_silent, do nothing
 
@@ -682,6 +701,12 @@ modules:
         A pending item not decided within proposal.ttl auto-resolves exactly once using
         the table above. New approval kinds MUST add an explicit safe default before they
         can be persisted; "default approve" is not a valid default.
+      ttl_source: >-
+        proposal.ttl is config.approvals.proposal_ttl_hours (bot.yaml; default 24h) with
+        optional per-type overrides in config.approvals.per_type_ttl_hours (e.g. a punitive
+        moderation_mute may use a shorter window). approval_items.expires_at is computed from
+        it at proposal creation (created_at + ttl) and is the single persisted deadline the
+        expiry sweep reads — so the timeout survives restarts and is applied exactly once.
     digest:
       on: digest.due
       action: >-
@@ -699,9 +724,13 @@ modules:
         workspaceId='__system__') the moment they happen. The daily digest ALSO carries a
         rolled-up "system notices since last digest" section, sourced from event_journal rows
         WHERE workspace_id='__system__' (so a missed live notice still surfaces once daily).
-        Because these are cross-workspace, the digest emits this section ONCE — attached to the
-        first/primary workspace's digest DM (or its own __system__-scoped digest DM when several
-        workspaces exist), never duplicated per workspace.
+        Because these are cross-workspace and __system__ has no timezone/cron of its own, the
+        digest emits this section ONCE per day, deterministically attached to the digest DM of
+        the PRIMARY workspace = the lexicographically-smallest workspace.id among configured
+        workspaces (a stable, restart-invariant choice), riding that workspace's digest.due
+        tick. It is never duplicated per workspace and never dropped because no workspace owns
+        it. (If a future need arises, a dedicated __system__ digest cron can replace this, but
+        the deterministic-attachment rule is the current single source of truth.)
     sending: >-
       ALL owner-facing sends (proposals, escalations, digest, /status, /why replies)
       go out via outbound.requested(kind:'dm'|'digest', via:'control', dmUserId=owner) —
@@ -750,7 +779,7 @@ modules:
       only "write a new article".
 
   funnel:
-    subscribes: [message.clean, reply.sent, reaction.received, lead.approved, outbound.sent]
+    subscribes: [message.clean, reply.sent, reaction.received, lead.approved, outbound.sent, lead.followup_due]
     publishes: [lead.identified, outbound.requested]
     feature_flag: funnel        # default OFF
     role: >-
@@ -785,6 +814,18 @@ modules:
       leads.dm_sent_at + stage='dm_sent'. The outbox is the authority for delivery; this is the
       funnel's domain-table mirror (so a no_response timer starts from a real send, not an
       approval). It ignores outbound.sent for the owner's digest/DM kinds and other producers.
+    no_response_detection: >-
+      Absence-of-reply CANNOT be observed from inbound events alone (no event fires for "the
+      lead never answered"), so it needs a TIMER. The Scheduler emits a per-workspace-tz
+      lead.followup_due tick (bot.yaml scheduler.lead_followup_cron); on it the Funnel scans its
+      own leads WHERE stage='dm_sent' AND dm_sent_at + no_response_downgrade window has elapsed
+      with no subsequent reply from the lead (a reply is detected via message.clean from that
+      user, or a DM reply where observable). For each, it sets leads.no_response_at and writes a
+      long-lived ctx.suppression.suppress({scope:dm, reason:'no_response', expiresAt: now +
+      no_response_downgrade_days}) so the lead is not re-proposed. A genuine reply before the
+      window clears the pending timer (the lead progresses, never gets the no_response
+      suppression). This is the wiring that makes funnel.safety_friction's "no-response creates
+      long-lived downgrade" enforceable rather than aspirational.
 
   onboarding_wizard:
     trigger: first run / owner /setup on the control bot
@@ -829,9 +870,10 @@ modules:
   # Scheduler is a SYSTEM SERVICE (services/scheduler.ts), not a Module. It owns
   # cron + missed-tick policy and emits ticks consumed by modules:
   #   evolution.reflection_due, knowledge.sync_due, digest.due,
-  #   retention.sweep_due, content_calendar.due, activity.due, marketing.share_due.
+  #   retention.sweep_due, content_calendar.due, activity.due, marketing.share_due,
+  #   lead.followup_due.
   # TIMEZONE: the per-WORKSPACE crons (reflection/digest/retention/content_calendar/
-  #   activity/marketing_share) in bot.yaml are evaluated PER WORKSPACE in that workspace's
+  #   activity/marketing_share/lead_followup) in bot.yaml are evaluated PER WORKSPACE in that workspace's
   #   persona.timezone, NOT in server-local time. So "digest 09:00" fires at 09:00 for
   #   each workspace's own timezone — the Scheduler emits one tick per (workspace, job)
   #   at the workspace-local time, each carrying that workspaceId.

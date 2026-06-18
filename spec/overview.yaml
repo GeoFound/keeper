@@ -108,6 +108,18 @@ operations:
       N concurrent calls all observe "under budget" and overshoot; reserving makes the
       bound real, not advisory. The budget is therefore a HARD ceiling even under burst
       concurrency (worst case overshoot = one in-flight call's estimate, not N).
+    release_on_failure: >-
+      A reservation is a TRANSIENT in-flight hold that MUST be unwound on EVERY exit path,
+      not just success. On success: reserved -= estimate, actual += real, append llm_usage.
+      On ANY non-completing path — LLM error/timeout, parse-failure-as-classifier-failure, a
+      pipeline stage abort, or a watchdog hang-abort that strands an in-flight call — the
+      estimate is RELEASED (reserved -= estimate) and NO actual is booked. Without this, a
+      workspace with intermittent provider errors silently buries its day budget under phantom
+      reservations and trips to read_only/media_hold with little real spend. The reserve+release
+      pair is owned by the LLMGateway around the call (try/finally), so no module can leak a
+      reservation. This applies identically to the safety/media lanes and the source-scoped
+      ingest lane (ingest_budget_state). The day row is created with an idempotent upsert so a
+      day-rollover race cannot double-seed it.
     generative_only: >-
       The breaker bounds GENERATIVE OUTPUT only — reactive replies, proactive posts,
       reflection. It NEVER disables SAFETY or receive: moderation (incl. the media
@@ -115,25 +127,37 @@ operations:
       running read-only. Otherwise an exhausted budget would silently open the
       black-tier floor — unacceptable.
     ingest_behavior: >-
-      Embedding/ingest (knowledge sync) shares llm_usage but is deferrable: when the
-      workspace is over budget, ingest PAUSES and resumes next day rather than tripping
-      replies — and a large FIRST sync runs under its own bound so day-one indexing
-      can't starve the chat budget (see budget.ingest_daily_usd).
+      Embedding/ingest (knowledge sync) appends to llm_usage but is metered in a SEPARATE,
+      SOURCE-SCOPED lane (ingest_budget_state), NOT a per-workspace lane — because
+      knowledge.sync_due fires PER SOURCE (empty workspaceId) and a source may be bound to
+      many workspaces, so there is no single workspace whose budget could own a shared-source
+      re-embed. Ingest is deferrable: when a SOURCE is over its per-source ingest cap, THAT
+      source's sync PAUSES and resumes next day rather than tripping any workspace's replies —
+      and a large FIRST sync (and the full re-embed on a dimension change) run under this same
+      bound so day-one indexing can't starve chat (see budget.ingest_daily_usd, applied
+      per-source/day).
     budget_lanes: >-
-      Budgets are three explicit lanes, never one fuzzy pool:
-        - generative/chat: replies, proactive posts, reflection; can trip read_only.
-        - ingest: embedding/sync; can pause and resume later.
-        - safety: moderation classifiers/vision; has its own daily USD/call cap and can
-          enter safety_hold/media_hold_mode, but never silently allows unscanned content.
-      Safety does not borrow from chat, and chat exhaustion does not stop safety. Owner
-      status names the lane that failed.
+      Budgets are explicit lanes, never one fuzzy pool, split by SCOPE:
+        - generative/chat (per WORKSPACE/day): replies, proactive posts, reflection; can trip
+          read_only.
+        - safety (per WORKSPACE/day): moderation classifiers/vision; its own daily USD/call cap;
+          can enter safety_hold/media_hold_mode, but never silently allows unscanned content.
+        - ingest (per SOURCE/day): embedding/sync; can pause that source and resume later; lives
+          in ingest_budget_state, not daily_budget_state, because a source is shared across
+          workspaces.
+      Safety does not borrow from chat, chat exhaustion does not stop safety, and a paused
+      shared source never blocks any workspace's chat. Owner status names the lane (and, for
+      ingest, the source) that failed.
     safety_exhaustion_behavior: >-
       If safety_daily_usd or media_scan_daily_cap is exhausted, the owner sees
       "media safety scanning unavailable; media temporarily held" and the workspace
       records workspace_runtime_state.mode=safety_hold/media_hold_mode. For media this
-      means unscanned media is held or silently deleted according to config; for text it
-      means the bot does not treat the message as clean or reply to it. This is an
-      availability degradation, not a safety bypass.
+      means unscanned media is held or silently deleted according to config. For text, only
+      the SURVIVORS that actually needed the LLM classifier (suspect/ambiguous text the rule
+      pre-filter flagged — see modules.yaml moderation.classification_cost_model) are held /
+      not treated as clean; rule-clean benign text still flows, so a legitimately busy room
+      does NOT go dark from safety-lane exhaustion. This is a bounded availability degradation
+      on the ambiguous tail, not a safety bypass and not a whole-room outage.
     multi_channel_note: >-
       The budget is per WORKSPACE, not per channel — a workspace binding several
       channels shares one daily budget (one noisy channel can throttle the rest; this
@@ -180,12 +204,36 @@ operations:
       "already disclosed" guard (one tiny row per channel) and pruning it would let the
       one-time notice re-post. Every other kind (reply/welcome/proactive_post/activity/
       digest/dm) is per-trigger and prunes normally.
+    inbound_crash_recovery: >-
+      The outbox only protects sends that already reached 'pending'. The window BEFORE that —
+      ingest -> moderation -> intent -> pipeline, before any outbox row exists — is covered by
+      the inbound_updates LIFECYCLE (data-model inbound_updates). The adapter CLAIMS the row as
+      status='pending' before emitting message.received; the engine flips it to 'committed' only
+      at the terminal idempotently-guarded outcome (a reply outbox row written, OR Intent Router
+      journaled decision.no_reply, OR Moderation claimed a moderation_actions key / reached
+      message.clean with no reactive send). DELIVERY is decided by status + the process in-flight
+      set, not a blanket stop: (1) committed -> STOP (true replay); (2) pending AND in THIS
+      process's in-flight set -> STOP (concurrent duplicate); (3) otherwise — no row, or a
+      pending row claimed by a prior since-crashed process -> JOURNEY. Rule 3 is what lets a
+      post-crash PLATFORM REPLAY (MTProto replays un-acked updates, carrying the full content)
+      reprocess a message whose journey died — including the window BEFORE the messages row was
+      written, which a restart re-drive cannot reconstruct. Re-journeying is safe because every
+      downstream non-idempotent action is execute-once guarded (outbox dedupeKey,
+      moderation_actions action_key). On restart the engine ALSO RE-DRIVES pending rows (within
+      reply.max_staleness) that HAVE a persisted `messages` row by re-emitting message.routed, so
+      a crash after routing persisted completes even if the platform never replays; a pending row
+      with no messages row is left to platform redelivery (rule 3); a pending row past staleness
+      is committed without re-drive (stale trigger). Together this closes the gap where the old
+      blanket-stop guard + the messages-row PK blocked any reprocessing of a message whose journey
+      crashed before the outbox — with neither loss, nor double-journey, nor deadlock.
     crash_safety: >-
       On restart the bot reconciles the outbox: a 'pending' row whose trigger is still
       within reply.max_staleness is retried ONCE (the dedupeKey makes the retry safe —
       no double-send); a 'pending' row past staleness is marked 'dropped' (don't answer
       a 10-min-old line). This is strictly better than record-then-hope: it neither
-      double-sends nor silently loses a reply to a mid-flight crash.
+      double-sends nor silently loses a reply to a mid-flight crash. Together with
+      inbound_crash_recovery above, BOTH halves of the journey (pre-outbox inbound and the
+      send itself) survive a mid-flight crash with neither loss nor duplication.
     stale_drop: a reply whose trigger is older than reply.max_staleness is dropped at any stage (the staleness guard is pipeline-wide, see events failure_policy).
   send_queue:
     rule: >-
@@ -202,6 +250,18 @@ operations:
       infrastructure. The CONTROL BOT queue (moderation execution + owner DMs) follows
       normal Bot-API flood limits (429 retry_after) — it is disposable and not bound by
       account_survival. Both still go through the one outbox (idempotency unchanged).
+    consecutive_bot_cap_enforcement: >-
+      The "never talk to itself" cap (max_consecutive_bot_messages) is enforced ATOMICALLY at
+      the ONE send chokepoint, not by each producer. Multiple proactive producers (Atmosphere,
+      Marketing share, Activity, Welcome) can each read consecutive_bot_messages=under-cap
+      concurrently and would all fire — so the producer-side check is a cheap pre-gate only.
+      The AUTHORITATIVE check happens at dequeue in the userbot send queue (already serialized
+      for the per-account ceiling): for a PROACTIVE/non-reply kind (suppressIfKillSwitch=true),
+      it re-reads the live consecutive_bot_messages under that serialization and DROPS the send
+      (marks the outbox row 'dropped', reason=consecutive_cap) if sending it would exceed
+      max_consecutive_bot_messages without an intervening human message. A REPLY is exempt: it
+      answers a human turn that just reset the counter, so it never monologues. This makes the
+      cold_start_no_cringe invariant a hard guarantee rather than a racy best-effort.
   retention:
     rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT kind='notice', the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning); owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
     data_layers: >-
@@ -240,8 +300,14 @@ operations:
       flagged-media BYTES NEVER enter the journal or logs (gate: journal_no_secrets); long
       text is truncated. Message text MAY appear (it aids tracing) but every journal row that
       contains user-scoped text carries subject_user_id/channel/message metadata so /forget can
-      redact its payload_digest while preserving the trace skeleton. The journal is also pruned
-      by retention.sweep_due past observability.journal_retention_days.
+      redact its payload_digest while preserving the trace skeleton. This metadata is NOT
+      guessed by the middleware: any workspace-scoped event whose payload concerns a specific
+      member MUST set envelope.subjectUserId (events.yaml envelope.rules), and the middleware
+      copies it onto the row (synthetic trace rows pass it via ctx.logger.trace). A row with no
+      subjectUserId is, by contract, not about one subject — so the /forget subject sweep is
+      COMPLETE, not best-effort, and cannot miss a user-text row that merely forgot to stamp the
+      subject. The journal is also pruned by retention.sweep_due past
+      observability.journal_retention_days.
     no_hot_loop_stall: >-
       Journaling is on the path of EVERY event, so it must never stall the connection: rows
       are written through a BATCHED async buffer off the receive/send critical path (WAL),
@@ -276,6 +342,20 @@ operations:
           mute/ban). ALSO the owner's private remote: it DMs the owner digest/escalations/
           approval items with inline ✅/❌/📝 buttons and receives the owner's decisions +
           /commands. It NEVER chats to members and never emits message.received.
+    self_ingest_filter: >-
+      The userbot IS the owner's user account and runs as a plain MEMBER, so MTProto delivers
+      its OWN outgoing messages back as updates, and the owner may ALSO be typing manually on
+      that same account. THREE message classes share one physical sender_id (the account):
+      (a) the bot's automated sends, (b) the owner's manual messages, (c) genuine member
+      messages. The userbot adapter MUST DISCARD any inbound update whose sender is the
+      userbot's own account (classes a + b) BEFORE emitting message.received — it never
+      moderates, routes, or replies to itself or to the owner's own typing, which would
+      otherwise cause reply-to-self loops, self-moderation, and miscounted room state.
+      reply.sent / outbound.sent are emitted from the SEND path (the outbox confirm), NEVER
+      reconstructed from inbound, so dropping all self-account inbound loses no bot-message
+      accounting. consecutive_bot_messages is therefore driven only by real sends and reset
+      only by a non-self human message. (The control bot already emits no message.received;
+      this rule is the userbot's symmetric self-exclusion.)
     why: >-
       A userbot cannot be the control plane (you cannot DM your own account; user
       accounts have no inline buttons). Putting all admin actions on the bot keeps the
@@ -299,6 +379,17 @@ operations:
           auto-degrade; required safety/admin rights do not.
       verifyAccess() reports, per adapter, { isMember, isAdmin, missingRights[] } (no
       canReadAll/privacy-mode field).
+    runtime_membership_loss: >-
+      Preconditions are also a RUNTIME concern, not only a go-live check. If the USERBOT is
+      kicked/banned from a single channel after launch (it stops receiving that channel's
+      updates, or a send/read raises CHAT_FORBIDDEN/USER_NOT_PARTICIPANT), the bot does NOT
+      fail silently: it marks that channel's workspace_runtime_state degraded (reason=
+      userbot_not_member) and alerts the owner out-of-band via the control bot, exactly as a
+      lost control-bot admin right does — until membership is restored. This is distinct from
+      an account-wide ban (account_survival RETREAT): a single-channel kick degrades only that
+      channel, the rest of the account keeps operating. Symmetric coverage: control-bot rights
+      loss -> safety_hold/read-only; userbot membership loss -> per-channel degrade + owner
+      alert; neither is ever a quiet stop.
     session_validity: >-
       The userbot's hard stop is AUTH: an invalid/expired/revoked SESSION STRING means the
       owner's account cannot connect at all. The control bot's hard stop is an invalid bot
@@ -344,7 +435,7 @@ operations:
 # Build order. Implement strictly top-to-bottom; each step independently verifiable.
 # Cross-cutting infra (operations above) is folded into the steps that first need it.
 build_order:
-  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox) + cost_circuit_breaker generative-only (LLMGateway) + send_queue (unified outbound) + observability (journaling bus middleware -> event_journal with causationId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
+  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox + inbound_updates pending->committed lifecycle with restart re-drive) + cost_circuit_breaker generative-only (LLMGateway, reserve+release-on-failure; per-source ingest lane) + send_queue (unified outbound; atomic consecutive-bot cap at dequeue) + observability (journaling bus middleware -> event_journal with causationId + subjectUserId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
   - { step: 2, name: Telegram Dual Adapter,        deliverable: "TWO adapters: telegram-userbot (MTProto/GramJS on the owner's account, session-string auth — the SOLE inbound source; community sends + lead DMs; account_survival floor: per-account ceiling + FLOOD_WAIT obedience + warm-up + retreat) and telegram-control (Bot API/grammY, group admin — executes moderation.violation; owner DMs with inline ✅/❌/📝 buttons + /command + callback handling). Deterministic correlationId from platform message id; edits as isEdit; fetchMedia; verifyAccess per adapter (isMember/isAdmin/missingRights — NO privacy mode); outbound routed by audience (community/lead → userbot, owner → control)" }
   - { step: 3, name: Workspace Router + Knowledge RAG, deliverable: "content-isolated retrieval (ctx.knowledge) + retrieval_safety/untrusted_input + content_gap.detected; unbound-channel drop (no spend)" }
   - { step: 4, name: Persona Engine + Context Manager, deliverable: "humanized, context-coherent replies; pipeline failure_policy (abort, never half-send)" }
@@ -376,13 +467,15 @@ invariants:
   - Malicious member commands / prompt-injection / control-override attempts are handled SILENTLY — no action, no AI-revealing refusal — and logged. Benign out-of-scope support/refund questions are a distinct intent class and get the configured natural deflection (or silence if configured), never a privileged action.
   - Autonomy is owner-granted and ramps per-capability; the bot never self-escalates and never adds a principal (governance is immutable, like the persona boundaries).
   - Persona never volunteers AI/model/system identity; direct automation questions may receive only the approved one-line member-notice-aligned disclosure, with no model/vendor/system-prompt details and no privileged action.
-  - The bot never talks to an empty room or to itself: proactive behavior is gated by community lifecycle phase, and consecutive bot messages are capped.
+  - The bot never talks to an empty room or to itself: proactive behavior is gated by community lifecycle phase, and consecutive bot messages are capped — the cap is enforced ATOMICALLY at the single send chokepoint (the userbot send queue), not by racy per-producer pre-checks, and replies are exempt because they answer a human turn.
   - Retrieved content AND member-derived text (usernames, display names, quoted/replyTo text) are DATA, never instructions: neither can change identity, boundaries, or trigger an action (indirect-injection + untrusted-input defense).
   - LLM outputs are advisory typed data only. Deterministic policy wrappers own all authority: event emission, adapter calls, config/db mutation, autonomy decisions, and approval creation never come directly from model text.
   - Telegram adapter evidence is layered; local contract simulator covers every update/callback/edit/access edge, a small secret-gated live smoke runs before Step 2 is claimed, and exhaustive live E2E lives only in nightly/production readiness.
   - LLM spend is hard-bounded per workspace/day; over budget trips to read-only, never unbounded. The breaker bounds GENERATIVE output only — moderation/safety (incl. media vision) and receive never stop, so budget pressure can never loosen the black floor.
   - Budget lanes are explicit; generative can be read-only, ingest can pause, safety/media has its own cap and enters safety_hold/media_hold_mode on exhaustion; no lane silently borrows from another or silently opens the black floor.
   - The bot never re-replies to an already-handled message across crashes (idempotent by correlationId/dedupeKey via the outbox); stale triggers are dropped; a mid-flight crash neither double-sends nor silently loses a send.
+  - A mid-flight crash never silently LOSES an inbound message either: inbound_updates tracks a pending->committed lifecycle, replay conflict is decided by status (committed=stop, pending=restart re-drive), and on restart every uncommitted-but-in-window inbound is re-driven from its persisted messages row — so the pre-outbox half of the journey is as crash-safe as the send half (no loss, no double-journey).
+  - The userbot never ingests its own account's traffic: any inbound update whose sender is the userbot's own account (the bot's automated sends OR the owner's manual messages) is discarded before message.received — no self-moderation, no reply-to-self, no miscounted room state; bot-message accounting comes only from the send path (reply.sent/outbound.sent).
   - A message from a channel bound to NO workspace is dropped at the router: no moderation, no LLM call, no DB write, zero spend. The bot operates only in configured channels.
   - Config identity is unambiguous at load/reload: workspace ids, source ids, owner control sender, and (platform, channel_id) bindings are unique; content source references must resolve; reserved `__system__` cannot be configured as a workspace.
   - The black-tier floor applies to MEDIA, not just text: a best-effort vision classifier removes+bans on detectable black-tier images/video; flagged media bytes are never persisted. (CSAM is escalated to the owner for platform report, not claimed as auto-detected.)
@@ -397,7 +490,7 @@ invariants:
   - Member message retention is disclosed (member notice); owner /forget purges a user's raw messages, while the opt-out keyword stops relationship memory.
   - User data is retention-bounded and erasable on demand (owner /forget, user opt-out); relationship memory is opt-in and never recalls an opted-out user.
   - Owner /pause overrides every proactive AND reactive path (posture==stay_silent); /quiet suppresses ONLY proactive (RoomRead.proactiveAllowed=false) while reactive replies and moderation continue; the kill switch cannot be bypassed.
-  - Platform-unsupported OPTIONAL rich capabilities (poll/pin/reaction visibility) auto-degrade silently. Required safety/admin capabilities (control-bot delete + restrict, userbot membership/auth) are hard preconditions or fail-closed runtime holds; they never silently degrade.
+  - Platform-unsupported OPTIONAL rich capabilities (poll/pin/reaction visibility) auto-degrade silently. Required safety/admin capabilities (control-bot delete + restrict, userbot membership/auth) are hard preconditions or fail-closed runtime holds; they never silently degrade. A runtime LOSS of either (control-bot rights revoked, or the userbot kicked from a channel) marks the affected workspace/channel degraded in workspace_runtime_state and alerts the owner via the control bot until restored — never a silent stop; a single-channel userbot kick degrades only that channel, distinct from an account-wide RETREAT.
   - Telegram runs as TWO identities: a USERBOT (owner's user account, MTProto) is the community face + chat plane (plain member, reads by membership, chats as the owner, NO admin actions, sole inbound source of message.received); a CONTROL BOT (Bot API) is the group-admin moderation EXECUTOR + the owner's control plane (inline-button approvals, /commands, digest) and never chats to members.
   - Every privileged admin action (delete/mute/ban) is executed by the CONTROL BOT, never by the userbot; the owner's personal account performs no admin action. The control bot accepts control input ONLY from the owner user_id; members can never command it. All owner input enters through the ONE authenticated event control.owner_action (emitted by the control bot only for the owner, consumed only by the Approval Service); no adapter calls a module directly and no other event carries owner commands.
   - Account survival outranks throughput and applies to the USERBOT account: the per-account global send ceiling, FLOOD_WAIT obedience, cold-start warm-up, and retreat-on-risk are non-optional; a recurring flood signal forces RETREAT (posture==stay_silent) and notifies the owner out-of-band via the control bot.
@@ -538,23 +631,38 @@ quality_gates:
     - id: safety_budget_media_hold
       enforces: safety-budget-lane
       check: >-
-        Exhaust generative, ingest, and safety/media lanes independently. Generative trips
-        read_only only for output; ingest pauses sync; safety/media exhaustion creates
-        workspace_runtime_state safety/media hold, writes safety_holds, blocks/silent-deletes
-        unscanned media per config, and owner status names media safety unavailability.
+        Exhaust the generative + safety/media lanes (per-workspace, daily_budget_state) and the
+        per-SOURCE ingest lane (ingest_budget_state) independently. Generative trips read_only
+        only for output; ingest exhaustion pauses ONLY that source's sync (no workspace chat
+        impact, and a source shared by many workspaces pauses once, not per-workspace);
+        safety/media exhaustion creates workspace_runtime_state safety/media hold, writes
+        safety_holds, blocks/silent-deletes unscanned media per config, and owner status names
+        media safety unavailability. Assert a reservation released on a failed call in EACH lane.
     - id: idempotent_delivery
       enforces: idempotency
       check: >-
         Replay the same inbound PLATFORM UPDATE (same platform_message_id) after a simulated
         crash/reconnect -> correlationId derives identically -> exactly one reply (outbox dedup
         hits). Assert correlationId is NOT a fresh uuid per receive. A trigger older than
-        reply.max_staleness produces no reply.
+        reply.max_staleness produces no reply. Assert the status-based delivery rule: a COMMITTED
+        conflict stops; a PENDING conflict in the same process's in-flight set is dropped (no
+        concurrent double-journey); a PENDING conflict from a prior (crashed) process re-journeys.
+        CRASH-AFTER-ROUTING: kill the process after the messages row is written but BEFORE any
+        outbox row exists; on restart the pending inbound is re-driven from its messages row ->
+        processed EXACTLY ONCE. CRASH-BEFORE-ROUTING: kill before the messages row is written,
+        then deliver the platform replay; it re-journeys via the not-in-flight rule and is
+        processed EXACTLY ONCE. Neither path loses the message nor double-replies — the gap the
+        old blanket-stop guard left open, closed without deadlock.
     - id: cost_breaker_reserve
       enforces: cost-bound
       check: >-
         Fire N concurrent generative calls against a budget with room for ~1: assert total
         spend does not exceed budget by more than one call's estimate (reserve-not-check), not
-        N calls. A plain read-then-call implementation fails this.
+        N calls. A plain read-then-call implementation fails this. RELEASE-ON-FAILURE: seed a
+        run of failing/timing-out generative calls and assert each RELEASES its reservation
+        (generative_reserved_usd returns to ~0, no actual booked) so phantom reservations never
+        accumulate the workspace into a false read_only; assert the same release on a pipeline
+        abort / watchdog hang-abort, and that the day row is upserted once under a rollover race.
     - id: moderation_failclosed
       enforces: moderation-failclosed
       check: >-

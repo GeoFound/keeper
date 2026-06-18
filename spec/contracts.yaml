@@ -155,6 +155,12 @@ interfaces:
           ABSENT/throw — the userbot performs no admin action. ACCOUNT SURVIVAL (overview)
           is enforced here: FLOOD_WAIT obedience, per-account ceiling, warm-up, RETREAT.
           Auth = SESSION STRING (full-account access), a top-tier secret.
+          SELF-INGEST FILTER (overview operations.dual_identity.self_ingest_filter): because
+          the userbot IS the owner's account, MTProto re-delivers its own sends AND the owner's
+          manual messages as updates; the adapter DISCARDS any inbound whose sender is its own
+          account BEFORE emitting message.received (no self-moderation / reply-to-self). It also
+          surfaces a runtime channel KICK (CHAT_FORBIDDEN/USER_NOT_PARTICIPANT) rather than going
+          silent — see overview runtime_membership_loss.
         • telegram-control (Bot API/grammY bot): the CONTROL plane + MOD executor. A group
           ADMIN; its admin methods EXECUTE every moderation.violation. ALSO the owner's
           remote: sendDirectMessage to the owner with inline ✅/❌/📝 buttons + callback
@@ -328,8 +334,13 @@ interfaces:
       // arms, updates Beta posteriors, promotes/rolls back) and the Persona module (which must
       // render the right STYLE arm per reply without importing Evolution). assign() reads the
       // single running STYLE experiment for the workspace and does a Thompson draw SEEDED by
-      // correlationId (so the assignment is deterministic + reproducible under replay, matching
-      // modules.yaml evolution.experiment.allocation), clamped to [challenger_ratio_floor,cap];
+      // correlationId, clamped to [challenger_ratio_floor,cap]. The seed makes ONE in-flight
+      // reply's assignment STABLE under an immediate crash-retry (same correlationId + same live
+      // posteriors -> same arm); it is NOT claimed to reproduce identically across LATER posterior
+      // states (the posteriors move as feedback lands). Attribution never depends on recomputing
+      // it: the assigned arm is STAMPED onto ReplyDraft.styleVariant -> ReplySent.styleVariant ->
+      // reply_feedback.style_variant, and Evolution attributes outcomes to that STORED arm. Matches
+      // modules.yaml evolution.experiment.allocation.
       // it returns 'champion' + the live STYLE prompt when no experiment is running. Persona
       // stamps the returned variant onto ReplyDraft.styleVariant so the adapter can carry it to
       // ReplySent and Evolution can attribute the engaged outcome to the correct arm.
@@ -351,7 +362,11 @@ interfaces:
       // outbound.sent to keep them current. Critically it increments
       // consecutive_bot_messages + last_bot_message_at on every bot send (reply.sent OR
       // outbound.sent) and RESETS consecutive_bot_messages on the next human message — this
-      // is what makes the "never talk to itself" cap real. The CONTROL columns
+      // MAINTAINS the counter the cap reads. The cap itself (max_consecutive_bot_messages) is
+      // ENFORCED ATOMICALLY at the userbot send queue's dequeue for proactive kinds (overview
+      // operations.send_queue.consecutive_bot_cap_enforcement), NOT by a racy per-producer
+      // pre-read; a producer's pre-check is a cheap optimization only, replies are exempt. The
+      // human-message reset here is what counts as "the room moved on". The CONTROL columns
       // (paused_until, proactive_paused_until) are owned + written by the Approval Service
       // (the kill switch) and only READ here when computing posture/proactiveAllowed — a
       // one-way read-model handoff, not shared mutable state. The mapping is deliberate and

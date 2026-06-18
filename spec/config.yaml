@@ -24,8 +24,8 @@ config_files:
       budget:                       # cost circuit breaker (operations.cost_circuit_breaker)
         daily_usd_per_workspace: 2.0
         on_exceed: "read_only"      # GENERATIVE output only; moderation/receive/safety stay on; DM owner
-        ingest_daily_usd: 1.0       # separate bound for embedding/sync so a big first sync can't starve chat
-        safety_daily_usd: 0.5       # separate safety lane for classifiers/vision; never borrowed by chat
+        ingest_daily_usd: 1.0       # PER-SOURCE/day bound for embedding/sync (ingest is SOURCE-scoped, not per-workspace — a source serves many workspaces; metered in ingest_budget_state). Over cap -> that source's sync pauses, never trips any workspace's chat.
+        safety_daily_usd: 0.5       # separate safety lane (per workspace/day) for classifiers/vision; never borrowed by chat. NOTE: moderation runs a deterministic rule pre-filter FIRST (modules.yaml moderation.classification_cost_model) so only suspect/ambiguous text + media consume this lane — a busy room does not exhaust it on benign traffic.
         media_scan_daily_cap: 200   # max vision moderation calls/day/workspace; over cap -> hold ALL unscanned media (fail-safe)
         media_hold_mode: "silent_delete_unscanned" # owner-visible status; no member-facing explanation
         safety_hold_ttl_hours: 24   # unresolved holds expire to safe default, never to clean
@@ -34,8 +34,14 @@ config_files:
       backoff: "exponential"        # honor MTProto FLOOD_WAIT in full (never retry early)
       reply_max_staleness_seconds: 600   # drop replies to messages older than this (pipeline-wide)
       pipeline_stage_timeout_seconds: 30 # a stage exceeding this aborts the reply (events failure_policy)
-      pipeline_inflight_deadline_seconds: 45 # in-flight supervisor force-aborts a draft that neither emits nor throws (overview pipeline_watchdog)
+      pipeline_inflight_deadline_seconds: 150 # whole-journey watchdog deadline. MUST be >= (pipeline stages × stage_timeout) + margin, else it force-aborts a legit slow reply where no single stage exceeded its own timeout: 4 stages × 30s = 120s + 30s margin = 150 (events inflight_supervisor.deadline_budget_rule; loader asserts the relation). Still < max_staleness.
       outbox_prune_after_days: 3    # prune terminal outbox rows older than max_staleness + margin (idempotent_delivery.outbox_pruning)
+    approvals:                      # owner-decision queue timeouts (modules.yaml approval_service.timeout.ttl_source)
+      proposal_ttl_hours: 24        # default proposal.ttl: an undecided approval_items row auto-resolves to its per-type safe default after this; expires_at = created_at + ttl
+      per_type_ttl_hours:           # optional per-type overrides; absent type uses proposal_ttl_hours
+        moderation_mute: 12         # punitive items expire sooner to a reject safe-default
+        moderation_ban: 12
+        lead_dm: 24
     account_survival:               # anti-ban floor (overview operations.account_survival) — posture: MOST CONSERVATIVE
       account_global_per_min: 12    # hard ceiling on sends across ALL channels+DMs combined (account-wide flood is stricter than per-channel)
       account_global_per_day: 800   # hard daily account-wide send ceiling
@@ -56,6 +62,7 @@ config_files:
       retention_sweep_cron: "0 3 * * *"
       activity_cron: "0 12 * * *"   # periodic-activity planning tick (topic_day/quiz); emits activity.due (workspace-local)
       marketing_share_cron: "0 13 * * *"  # periodic PROACTIVE marketing share (strategy proactive_share); emits marketing.share_due (workspace-local). Frequency is bounded by marketing.max_mentions_per_day + min_gap_hours; gated by phase>=grow + posture (low-touch by default)
+      lead_followup_cron: "0 * * * *"  # hourly funnel no-response sweep; emits lead.followup_due (workspace-local). Funnel marks dm_sent leads past the no_response window -> no_response + suppression (modules.yaml funnel.no_response_detection). Inert while funnel feature flag is OFF.
     platforms:
       telegram:
         # TWO identities (overview operations.dual_identity).
@@ -260,6 +267,8 @@ config_loading:
     - launch_profile: minimum with evolution/funnel/cross_promotion/user_memory enabled by default (owner must ramp these deliberately after first launch)
     - missing or non-numeric owner.approval_channel.user_id; there is exactly one owner control-plane sender unless a future delegated-principal spec adds more
     - any governance.autonomy raised at runtime, or a delegated principal added by anything but owner-authored config at load (no_self_escalation)
+    - delivery.pipeline_inflight_deadline_seconds < (reply-pipeline stage count × delivery.pipeline_stage_timeout_seconds) + margin (the watchdog would force-abort a legit slow reply — events inflight_supervisor.deadline_budget_rule); also reject either pipeline timeout >= reply_max_staleness_seconds
+    - a cross-promotion permission whose from_workspace/to_workspace does not resolve to a configured workspace, when cross_promotion is enabled for the source workspace (the sample ws-tool-site entry is illustrative/future and only validated once that workspace exists and the flag is on)
   identity_and_uniqueness: >-
     The loader builds one canonical binding map before any module starts:
     workspaceId -> workspace, sourceId -> source, and (platform, channel_id) -> exactly

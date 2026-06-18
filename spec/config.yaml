@@ -209,8 +209,11 @@ config_files:
             dm_opt_out_phrases: ["别私信我", "不要私信我", "别给我发私信"]
             memory_opt_out_phrase: "不要记住我"
             owner_mute_command: "/mute-bot-for-user"
-            negative_feedback_quiet_threshold: 3
+            negative_feedback_quiet_threshold: 3   # DISTINCT users complaining/negatively-reacting within the window -> auto-quiet posture
             negative_feedback_window_minutes: 60
+            # The shared "is this reaction negative?" classifier, used BOTH by the auto-quiet tally
+            # (data-model channel_negative_signals) and by evolution's reply_feedback.negative_reactions brake.
+            negative_reaction_emojis: ["👎", "💩", "🤮", "🖕", "😡", "🤬"]
         privacy:                              # operations.retention + right-to-delete
           message_retention_days: 90
           member_notice:                      # disclosure that gives retention a transparent basis

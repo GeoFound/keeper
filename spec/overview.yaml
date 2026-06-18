@@ -203,7 +203,7 @@ operations:
       normal Bot-API flood limits (429 retry_after) — it is disposable and not bound by
       account_survival. Both still go through the one outbox (idempotency unchanged).
   retention:
-    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT kind='notice', the durable once-ever disclosure guard, which is never pruned), AND prunes event_journal rows older than observability.journal_retention_days; owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
+    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT kind='notice', the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning); owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
     data_layers: >-
       Privacy and traceability are separated into three layers:
         - audit skeleton: event name, time, workspaceId, correlationId, causationId,
@@ -627,9 +627,15 @@ quality_gates:
     - id: suppression_complaint_loop
       enforces: complaint-suppression-loop
       check: >-
-        Phrases for reply/dm/memory opt-out create member_suppression rows and stop the
-        matching behavior; owner mute/unmute works through the control plane; repeated
-        complaint/negative-reaction signals set quiet posture and appear in /status/digest.
+        Phrases for reply/dm/memory opt-out create member_suppression rows (via the
+        SuppressionService accessor — no module writes the table directly) and stop the matching
+        behavior; owner mute/unmute works through the control plane. The CHANNEL auto-quiet path is
+        distinct: complaint/negative-reaction (per config negative_reaction_emojis) signals append
+        channel_negative_signals rows, and once DISTINCT users within
+        negative_feedback_window_minutes reach negative_feedback_quiet_threshold, SocialContext
+        derives a reduced-reply/observe_only posture (read-time, never writing channel_state), which
+        appears in /status/digest. Assert a single angry user repeating does NOT cross the threshold
+        (distinct-user counting) and that owner_mute/no_response signals do NOT auto-quiet a channel.
     - id: owner_pause_overrides
       enforces: kill-switch
       check: >-

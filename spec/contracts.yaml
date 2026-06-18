@@ -273,6 +273,8 @@ interfaces:
         knowledge: KnowledgeService;  // isolation-filtered RAG retrieval (read-model, infra not a peer module)
         styling: StyleService;        // STYLE-experiment arm assignment (read-model, infra not a peer module)
         media: MediaService;          // on-demand media-byte fetch for moderation (infra, not a peer module)
+        suppression: SuppressionService; // reply/dm/memory opt-out + complaint signals (read-model, infra not a peer module);
+                                      // the SOLE accessor of member_suppression — modules never touch that table directly
       }
       // MediaService is the SANCTIONED read path for media bytes. Media moderation
       // needs the raw bytes to run the vision classifier, but a module may NOT call a
@@ -362,6 +364,16 @@ interfaces:
       // RETREAT (account_health.retreat_until in the future — see overview
       // operations.account_survival), so an anti-ban retreat silences every proactive and
       // reactive path (proactiveAllowed becomes false with it), exactly like /pause.
+      // COMPLAINT AUTO-QUIET: posture also DEGRADES (toward observe_only / reduced reply
+      // probability) when the count of DISTINCT users in the per-(workspace,channel) tally that
+      // SuppressionService maintains in the channel_negative_signals table (data-model) reaches
+      // negative_feedback_quiet_threshold within negative_feedback_window_minutes. assess() READS
+      // that table at decision time (it never writes it, nor member_suppression) and derives the
+      // posture, EXACTLY as it already reads the Approval-owned channel_state control columns — a
+      // one-way read-model handoff. Distinct-user counting is deliberate: one member reacting
+      // angrily many times is not a quorum. This is the "repeated complaints from MULTIPLE members
+      // reduce frequency / set quiet posture" path of suppression_complaint_loop, independent of
+      // the owner's explicit /quiet (proactive_paused_until).
       interface SocialContext {
         assess(channelId: string): Promise<RoomRead>;
         // Per-member presence, backing the new_user_link_delay / new_user_media_delay
@@ -373,9 +385,25 @@ interfaces:
         memberPresence(channelId: string, userId: string): Promise<{ firstSeenAt: Date; joinedAt: Date | null; status: 'active' | 'left' } | null>;
       }
       // Suppression is a cross-cutting read-model owned by infra, not by a feature module.
-      // It is updated from explicit member phrases ("别回复我", "别私信我", "不要记住我"),
-      // owner control commands, and complaint/no-response signals. Modules READ it before
-      // replying, remembering, or proposing DMs; they do not share mutable state with each other.
+      // It is EXPOSED as ctx.suppression (like ctx.social/memory) and is the SOLE accessor of
+      // the member_suppression table — modules read/write through it, never via ad hoc db state
+      // (data-model member_suppression). It is updated from explicit member phrases ("别回复我",
+      // "别私信我", "不要记住我" — written by Intent Router), owner control commands (Approval
+      // /mute-bot-for-user), funnel rejection/no-response (Funnel), and complaint/negative-reaction
+      // signals. WIRING: SuppressionService is itself a whitelisted bus consumer (events.yaml
+      // envelope.rules + catalog) that subscribes message.clean + reaction.received to detect the
+      // two ALWAYS-AVAILABLE signals (complaint/opt-out phrases on message.clean, and a negative
+      // emoji — config negative_reaction_emojis — on a tracked bot message on reaction.received) and
+      // call recordNegativeSignal — so no feature module owns that detection. SIGNAL ROUTING is by
+      // shape: the channel-level 'complaint'/'negative_reaction' signals append a row to
+      // channel_negative_signals (the windowed auto-quiet tally); the per-USER intentional
+      // 'owner_mute'/'no_response' signals write a member_suppression row only and never auto-quiet a
+      // channel. The negative_feedback_quiet_threshold auto-quiet is NOT a write to the owner's
+      // /pause//quiet columns (Approval is their sole writer); it is reflected by SocialContext
+      // DERIVING a reduced-reply / observe_only posture from the DISTINCT-user count in
+      // channel_negative_signals — a one-way read-model handoff, like the channel_state control columns.
+      // Modules READ it before replying, remembering, or proposing DMs; they do not share mutable
+      // state with each other.
       // COMPLAINT DETECTION DEGRADES GRACEFULLY w.r.t. the sentiment_analysis flag (default
       // OFF): the ALWAYS-AVAILABLE complaint signals are negative reactions (emoji on a bot
       // message) and explicit complaint/opt-out PHRASES — these alone drive recordNegativeSignal,
@@ -390,6 +418,11 @@ interfaces:
         suppress(input: { workspaceId: string; userId: string; scope: 'reply' | 'dm' | 'memory' | 'all'; reason: string; expiresAt?: Date }): Promise<void>;
         clear(workspaceId: string, userId: string, scope?: 'reply' | 'dm' | 'memory' | 'all'): Promise<void>;
         recordNegativeSignal(workspaceId: string, channelId: string, userId: string, signal: 'complaint' | 'negative_reaction' | 'no_response' | 'owner_mute'): Promise<void>;
+        // Routes by signal SHAPE (see WIRING above): 'complaint'/'negative_reaction' append a
+        // timestamped row to channel_negative_signals (the windowed, DISTINCT-user auto-quiet tally
+        // SocialContext reads); 'owner_mute'/'no_response' are per-user and write member_suppression
+        // only. A channel-level signal never silences an individual; a per-user signal never
+        // auto-quiets a channel.
       }
       interface RoomRead {
         phase: 'seed' | 'spark' | 'grow' | 'mature';        // community lifecycle
@@ -416,7 +449,8 @@ interfaces:
       // INFRA SERVICES (constructed, not register()'d as Modules): EventBus, Database,
       // LLMGateway, SocialContext (also the channel_state writer), ConversationContext,
       // KnowledgeService (RAG), StyleService (STYLE-arm assignment), MediaService (media-byte
-      // fetch for moderation, delegates to the inbound adapter), Scheduler, the engine
+      // fetch for moderation, delegates to the inbound adapter), SuppressionService (member_suppression
+      // accessor + complaint-signal recorder, a whitelisted bus consumer), Scheduler, the engine
       // pipeline bridge (forwards an unregistered optional stage's event — see events.yaml
       // reply_pipeline.absent_stage_bridge), and each PlatformAdapter. They are exposed via
       // ModuleContext (or are pure engine wiring) and may touch a whitelisted set of events

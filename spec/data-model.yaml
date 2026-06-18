@@ -460,9 +460,16 @@ data_model:
         PRIMARY KEY (workspace_id, user_id)
       );
     member_suppression: |
-      -- Cross-feature suppression: reply, DM, memory, or all. Written by explicit member
-      -- phrases, owner control commands, and complaint/no-response signals. Read by Intent
-      -- Router, Funnel, User Memory, and SocialContext; never by ad hoc module state.
+      -- Cross-feature, PER-USER suppression: reply, DM, memory, or all. The SuppressionService
+      -- (ctx.suppression — see contracts SuppressionService) is the SOLE ACCESSOR: modules read via
+      -- isSuppressed() and write via suppress()/clear(), NEVER by touching this table directly (the
+      -- no-ad-hoc-state architecture gate). Rows originate from explicit member opt-out phrases
+      -- (Intent Router), owner /mute-bot-for-user (Approval), funnel rejection/no-response (Funnel),
+      -- and a member's own complaint/opt-out. NOTE: the CHANNEL-level auto-quiet tally (multi-user
+      -- complaint / negative reaction) is NOT stored here — this table is per-user and has no
+      -- channel_id — it lives in channel_negative_signals, which SocialContext reads to derive quiet
+      -- posture. The two per-USER intentional signals (owner_mute, no_response/rejected_dm) are
+      -- recorded here and never auto-quiet a whole channel.
       CREATE TABLE member_suppression (
         workspace_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
@@ -476,6 +483,37 @@ data_model:
       );
       CREATE INDEX ix_member_suppression_active
         ON member_suppression (workspace_id, scope, expires_at);
+    channel_negative_signals: |
+      -- Per-(workspace,channel) ROLLING tally of the two ALWAYS-AVAILABLE channel-level complaint
+      -- signals, and the ONLY backing for auto-quiet (suppression_complaint_loop). SuppressionService
+      -- is the SOLE WRITER: recordNegativeSignal() appends one timestamped row for
+      -- signal IN ('complaint','negative_reaction'). SocialContext is a READ-ONLY consumer: assess()
+      -- counts DISTINCT user_id within suppression.negative_feedback_window_minutes and, when that
+      -- count reaches suppression.negative_feedback_quiet_threshold, DERIVES a reduced-reply /
+      -- observe_only posture AT READ TIME — it never writes channel_state for this, nor this table.
+      -- That is a one-way read-model handoff, EXACTLY like the Approval Service owning
+      -- channel_state.paused_until / proactive_paused_until while SocialContext only reads them;
+      -- neither table's writer touches the other's. Counting DISTINCT users (not raw rows) is
+      -- deliberate: one member reacting angrily many times is not a quorum — "MULTIPLE members are
+      -- unhappy" is what sets quiet posture (acceptance suppression_quiet / suppression_controls).
+      -- SCOPE: the per-USER INTENTIONAL signals never land here — owner_mute (owner) and
+      -- no_response / rejected_dm (Funnel) are recorded ONLY as member_suppression rows; they are
+      -- not a room-temperature signal and must not auto-quiet a whole channel.
+      -- A reaction is "negative" per config suppression.negative_reaction_emojis (the same classifier
+      -- behind reply_feedback.negative_reactions). Append-only; rows older than the window carry no
+      -- live meaning and are pruned by retention.sweep_due (bounded growth).
+      CREATE TABLE channel_negative_signals (
+        id INTEGER PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,                    -- the complaining/reacting member; DISTINCT-user count crosses the threshold
+        signal TEXT NOT NULL,                     -- complaint|negative_reaction (channel-level only; never owner_mute/no_response)
+        bot_message_id TEXT,                      -- the bot message complained about / negatively reacted to, when applicable
+        source_correlation_id TEXT,               -- the journey that produced the signal (traceability into event_journal)
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX ix_channel_negative_signals_window
+        ON channel_negative_signals (workspace_id, channel_id, created_at);
     content_gaps: |
       -- Community -> content reverse signal. Paraphrased question, no asker identity.
       CREATE TABLE content_gaps (

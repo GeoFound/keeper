@@ -67,6 +67,14 @@ events:
               persisting eventId + correlationId + causationId. It only READS+records, never
               re-emits, so it cannot affect any flow; it is explicitly exempt from (and the sole
               exception to) the "consume only declared events" rule. See overview operations.observability.
+          (h) SuppressionService (member_suppression accessor) — consumes message.clean and
+              reaction.received to detect the two always-available complaint signals (complaint/
+              opt-out phrases on message.clean, and a negative emoji — config
+              negative_reaction_emojis — on a tracked bot message on reaction.received) and call
+              recordNegativeSignal. It only writes member_suppression (per-user opt-outs) and
+              channel_negative_signals (the per-(workspace,channel) windowed tally SocialContext
+              reads for auto-quiet posture); it never re-emits a bus event. See contracts
+              SuppressionService.
         These are infra, not peer modules; no module imports them.
       - An EDITED inbound message is NOT a new event name: the Platform Adapter re-emits message.received with UnifiedMessage.isEdit=true (and editOf set), so an edit flows the SAME route (Workspace Router -> Moderation) and is RE-MODERATED. Downstream reactive stages MUST NOT treat an edit as a fresh trigger (Intent Router never replies to an edit); the Context Manager updates the edited turn in place.
 
@@ -74,7 +82,7 @@ events:
   catalog:
     - { event: message.received,             version: 1, publisher: "Platform Adapter (USERBOT only — the control bot never re-ingests)", consumers: [Workspace Router],                          payload: UnifiedMessage }
     - { event: message.routed,               version: 1, publisher: Workspace Router,                 consumers: [Moderation],                                                        payload: RoutedMessage }
-    - { event: message.clean,                version: 1, publisher: Moderation,                       consumers: [Context Manager, Intent Router, Atmosphere Monitor, Activity Planner, Evolution Tracker, User Memory, Funnel, SocialContext (channel_state updater)], payload: RoutedMessage }   # Evolution Tracker observes human replies/quotes to the bot here (the primary engaged metric); Funnel reads explicit-interest signals; Activity Planner detects hot/surging topics for event-driven activity types (ai_news_discussion/poll_survey)
+    - { event: message.clean,                version: 1, publisher: Moderation,                       consumers: [Context Manager, Intent Router, Atmosphere Monitor, Activity Planner, Evolution Tracker, User Memory, Funnel, SocialContext (channel_state updater), SuppressionService (member_suppression accessor)], payload: RoutedMessage }   # Evolution Tracker observes human replies/quotes to the bot here (the primary engaged metric); Funnel reads explicit-interest signals; Activity Planner detects hot/surging topics for event-driven activity types (ai_news_discussion/poll_survey); SuppressionService detects explicit complaint/opt-out phrases -> recordNegativeSignal
     - { event: moderation.violation,         version: 1, publisher: "Moderation (auto delete) / Approval Service (approved mute|ban)", consumers: ["Platform Adapter (CONTROL BOT — the group-admin executor)"], payload: ModerationAction }   # control bot executes; delete is auto, mute/ban only after owner ✅. Execute-once: the executor claims moderation_actions.action_key (UNIQUE) before the platform call, so a replayed violation never double-acts (data-model moderation_actions)
     - { event: moderation.escalated,         version: 1, publisher: Moderation,                       consumers: [Approval Service],                                                  payload: ModerationAction }   # black-tier notify AND the L1 proposal for mute/ban (owner ✅ -> moderation.violation)
     # --- RAW adapter channel signals (workspace NOT yet resolved — empty workspaceId, like
@@ -91,7 +99,7 @@ events:
     #     from the adapter to the router (which is the sole minter of workspaceId). ---
     - { event: member.joined,                version: 1, publisher: Workspace Router,                 consumers: [Welcome Module, SocialContext (channel_state updater)],              payload: MemberEvent }
     - { event: member.left,                  version: 1, publisher: Workspace Router,                 consumers: [Atmosphere Monitor, Evolution Tracker, User Memory, SocialContext (channel_state updater)], payload: MemberEvent }
-    - { event: reaction.received,            version: 1, publisher: Workspace Router,                 consumers: [Evolution Tracker, Funnel],                                         payload: ReactionEvent }
+    - { event: reaction.received,            version: 1, publisher: Workspace Router,                 consumers: [Evolution Tracker, Funnel, SuppressionService (member_suppression accessor)],     payload: ReactionEvent }   # SuppressionService detects a negative emoji on a tracked bot message -> recordNegativeSignal('negative_reaction')
     # --- control plane ingress (the SINGLE authenticated owner->bot input edge) ---
     - { event: control.owner_action,         version: 1, publisher: "Platform Adapter (CONTROL BOT — owner-authenticated input only)", consumers: [Approval Service],                  payload: OwnerAction }     # inline-button decisions, slash commands, onboarding answers; workspaceId resolved by Approval
     # --- ordered reply pipeline (see reply_pipeline below) ---

@@ -4,6 +4,13 @@
 
 data_model:
   engine: sqlite
+  identity_rule: >-
+    Unless a column is explicitly named `native_*` or belongs to a pre-routing raw adapter
+    table that also carries a separate `platform`, core-table `channel_id` stores canonical
+    channel_uid (`<platform>:<nativeChannelId>`) and core-table `user_id` / `*_user_id`
+    stores canonical actor_uid (`<platform>:<nativeUserId>`). Config and adapters accept
+    native ids; Workspace Router normalization writes canonical ids into read-model/domain
+    tables. This avoids a future multi-platform identity migration.
   tables:
     messages: |
       -- Raw message log. Aged out by retention.sweep_due past message_retention_days.
@@ -17,13 +24,13 @@ data_model:
       -- still lives in inbound_updates (written by the ingest adapter) and is explicitly
       -- allowed as idempotency infrastructure, not workspace operation.
       CREATE TABLE messages (
-        id TEXT PRIMARY KEY,                      -- PLATFORM-QUALIFIED identity `<platform>:<channel_id>:<platform_message_id>` (globally unique). NOT the bare platform_message_id: Telegram message ids are per-CHAT and collide across channels. (Same components as correlationId minus the `corr:` prefix.)
+        id TEXT PRIMARY KEY,                      -- PLATFORM-QUALIFIED identity `<platform>:<native_channel_id>:<platform_message_id>` (globally unique). NOT the bare platform_message_id: Telegram message ids are per-CHAT and collide across channels. (Same components as correlationId minus the `corr:` prefix.)
         workspace_id TEXT NOT NULL,
         correlation_id TEXT,                      -- envelope correlationId, for tracing
         platform TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,                 -- canonical channel_uid in core (`<platform>:<native_channel_id>`)
         platform_message_id TEXT,
-        sender_id TEXT,
+        sender_id TEXT,                           -- canonical actor_uid in core (`<platform>:<native_user_id>`)
         sender_name TEXT,                         -- UNTRUSTED display string (never an instruction)
         text TEXT,
         media_type TEXT,                          -- image|video|file|sticker (NULL for text)
@@ -86,7 +93,7 @@ data_model:
       CREATE TABLE inbound_updates (
         id TEXT PRIMARY KEY,                         -- upd:<platform>:<channel>:<message>:<kind>:<identity>
         platform TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,                    -- native adapter channel id; pre-routing raw row is keyed with platform
         platform_message_id TEXT NOT NULL,
         update_kind TEXT NOT NULL,                   -- message|edit
         update_identity TEXT NOT NULL,               -- original message id, or per-edit revision/update id
@@ -102,7 +109,7 @@ data_model:
       CREATE TABLE reply_feedback (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,                 -- attribution scope: bot_message_id is a per-CHAT platform id, so a reply/reaction is matched by (channel_id, bot_message_id), never bot_message_id alone (it collides across channels in a multi-channel workspace)
+        channel_id TEXT NOT NULL,                 -- canonical channel_uid; bot_message_id is per native chat, so attribution is matched by (channel_uid, bot_message_id), never bot_message_id alone
         correlation_id TEXT,                      -- links the whole reply journey
         bot_message_id TEXT NOT NULL,             -- bare platform message id of the bot reply, unique only WITHIN channel_id
         bot_reply_text TEXT,
@@ -257,8 +264,8 @@ data_model:
       CREATE TABLE command_attempts (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
-        channel_id TEXT,
-        sender_id TEXT,
+        channel_id TEXT,                         -- canonical channel_uid
+        sender_id TEXT,                          -- canonical actor_uid
         text TEXT,
         kind TEXT,                               -- action_request|control_override|out_of_scope
         handled TEXT DEFAULT 'silent',
@@ -271,7 +278,7 @@ data_model:
       -- Refreshed on message.clean / member events; queried by Intent Router +
       -- Atmosphere so the whole engine shares one notion of "度".
       CREATE TABLE channel_state (
-        channel_id TEXT PRIMARY KEY,
+        channel_id TEXT PRIMARY KEY,              -- canonical channel_uid (`<platform>:<native_channel_id>`)
         workspace_id TEXT NOT NULL,
         member_count INTEGER DEFAULT 0,
         active_members_24h INTEGER DEFAULT 0,
@@ -303,8 +310,8 @@ data_model:
       -- fresh-account fail-safe conservative for accounts that joined before the bot.
       CREATE TABLE channel_members (
         workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,                 -- canonical channel_uid
+        user_id TEXT NOT NULL,                    -- canonical actor_uid
         joined_at DATETIME,                      -- from member.joined; NULL if joined before the bot / event missed
         first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP, -- earliest of join or first observed message (the new-user clock)
         last_seen_at DATETIME,
@@ -321,12 +328,24 @@ data_model:
       -- membership loss, and safety/media holds. This is MULTI-ROW by design: a workspace can
       -- be read_only for budget while one channel is degraded because the userbot was kicked.
       -- /status and the owner digest read active rows so a restart does not hide a degraded state.
+      -- SOLE ACCESSOR: the RuntimeStateService (ctx.runtime — contracts.yaml). No module or adapter
+      -- writes this table directly (table_ownership gate); module callers go through ctx.runtime and
+      -- infra callers (LLMGateway budget/safety exhaustion, the userbot/control adapters on
+      -- membership/rights/auth loss, AccountSurvival on account-wide retreat) through a direct engine
+      -- reference. enter() is an IDEMPOTENT upsert on the UNIQUE key below; on a no-active-row ->
+      -- active TRANSITION (only) it emits EXACTLY ONE out-of-band owner alert via
+      -- outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false,
+      -- dedupeKey=`system_notice:runtime:<id>`) — the single owner-alert path the spec promises for
+      -- every runtime hold, deduped so a flapping condition can't spam the owner; resolve() clears the
+      -- row. EXCEPTION: a control-bot TOKEN invalidity records its row here but cannot DM via the dead
+      -- control bot, so that one reason surfaces through process health, not a control-bot notice
+      -- (overview platform_prerequisites.session_validity; contracts RuntimeStateService).
       CREATE TABLE workspace_runtime_state (
         id TEXT PRIMARY KEY,                       -- runtime:<workspace>:<scope_type>:<scope_id>:<mode>:<reason>
         workspace_id TEXT NOT NULL,
         scope_type TEXT NOT NULL,                  -- workspace|channel|source|account
-        scope_id TEXT NOT NULL,                    -- workspace_id, channel_id, source_id, or account_id
-        channel_id TEXT,                           -- set when scope_type='channel'
+        scope_id TEXT NOT NULL,                    -- workspace_id, canonical channel_uid, source_id, or account_id
+        channel_id TEXT,                           -- canonical channel_uid when scope_type='channel'
         mode TEXT NOT NULL,                        -- read_only|safety_hold|media_hold|degraded|disabled|retreat
         reason TEXT NOT NULL,                      -- budget_exhausted|media_cap|missing_rights|userbot_not_member|invalid_session|...
         status TEXT DEFAULT 'active',              -- active|resolved
@@ -348,8 +367,8 @@ data_model:
       CREATE TABLE safety_holds (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
-        channel_id TEXT,
-        target_user_id TEXT,
+        channel_id TEXT,                          -- canonical channel_uid
+        target_user_id TEXT,                      -- canonical actor_uid
         platform_message_id TEXT,
         modality TEXT,                           -- text|media|mixed
         reason_code TEXT NOT NULL,               -- classifier_timeout|parse_error|media_cap|missing_rights|provider_outage
@@ -544,7 +563,7 @@ data_model:
       -- Stores a DISTILLED summary, never raw logs. Privacy-bounded + opt-out.
       CREATE TABLE user_memory (
         workspace_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,                    -- canonical actor_uid
         display_name TEXT,
         summary TEXT,                            -- distilled note, not transcripts
         topics TEXT,                             -- json array
@@ -566,7 +585,7 @@ data_model:
       -- recorded here and never auto-quiet a whole channel.
       CREATE TABLE member_suppression (
         workspace_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,                    -- canonical actor_uid
         scope TEXT NOT NULL,                      -- reply|dm|memory|all
         reason TEXT NOT NULL,                     -- phrase|owner_mute|complaint|negative_reaction|no_response|rejected_dm|opt_out
         source_correlation_id TEXT,
@@ -599,8 +618,8 @@ data_model:
       CREATE TABLE channel_negative_signals (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,                    -- the complaining/reacting member; DISTINCT-user count crosses the threshold
+        channel_id TEXT NOT NULL,                 -- canonical channel_uid
+        user_id TEXT NOT NULL,                    -- canonical actor_uid; DISTINCT-user count crosses the threshold
         signal TEXT NOT NULL,                     -- complaint|negative_reaction (channel-level only; never owner_mute/no_response)
         bot_message_id TEXT,                      -- the bot message complained about / negatively reacted to, when applicable
         source_correlation_id TEXT,               -- the journey that produced the signal (traceability into event_journal)
@@ -628,8 +647,8 @@ data_model:
       CREATE TABLE leads (
         id INTEGER PRIMARY KEY,
         workspace_id TEXT NOT NULL,
-        channel_id TEXT,
-        user_id TEXT NOT NULL,
+        channel_id TEXT,                          -- canonical channel_uid
+        user_id TEXT NOT NULL,                    -- canonical actor_uid
         stage TEXT DEFAULT 'identified',         -- identified|proposed|dm_sent|converted|dropped
         signal TEXT,
         evidence_json TEXT,                      -- why this is a lead; shown to owner
@@ -646,33 +665,63 @@ data_model:
     outbox: |
       -- Backs idempotent_delivery + send_queue for EVERY send (reply.generated AND
       -- outbound.requested). A row is written 'pending' BEFORE the platform call and
-      -- marked 'sent' on confirm. On restart the bot reconciles: a 'pending' row within
-      -- max_staleness is retried ONCE (dedupe_key makes it safe — no double send), past
-      -- staleness it is marked 'dropped'. This is what makes a mid-flight crash neither
-      -- double-send nor silently lose a reply.
+      -- moved to 'sending' with a lease immediately BEFORE the platform call. On confirm it
+      -- is marked 'sent'. On restart the bot reconciles by phase: 'pending' rows have not
+      -- called Telegram yet and may send if still fresh; expired 'sending' rows are unknown
+      -- remote outcomes and become 'ambiguous' on Telegram unless platform-specific
+      -- reconciliation proves otherwise. The engine never blindly retries an unknown remote
+      -- send; ambiguity is surfaced to owner trace/status/digest.
       -- PRUNING: terminal rows older than delivery.outbox_prune_after_days are swept
-      -- (idempotent_delivery.outbox_pruning), EXCEPT kind='notice' — the once-ever pinned
-      -- member-notice disclosure, whose row is the durable per-channel "already disclosed"
-      -- guard a future member.joined can still reference, so it is NEVER pruned.
+      -- (idempotent_delivery.outbox_pruning), EXCEPT member-notice rows
+      -- (kind='notice' AND dedupe_key prefixed `member_notice:`) — the once-ever pinned
+      -- disclosure, whose row is the durable per-channel "already disclosed" guard a future
+      -- member.joined can still reference, so it is NEVER pruned. System notices use
+      -- `system_notice:*` keys and prune normally.
       CREATE TABLE outbox (
         dedupe_key TEXT PRIMARY KEY,             -- KIND-NAMESPACED (idempotent_delivery.dedupe_key_namespace): replies use `reply:<correlationId>`, proactive sends use OutboundMessage.dedupeKey (`<kind>:<...>`, e.g. welcome:<ch>:<user>). The namespace is what keeps the reply and proactive key spaces from colliding in this shared PK.
         workspace_id TEXT NOT NULL,
         correlation_id TEXT,
         platform TEXT DEFAULT 'telegram',
         via TEXT NOT NULL,                       -- userbot|control (for Telegram); enough to pick the send queue on retry
-        channel_id TEXT,
-        dm_user_id TEXT,
+        channel_id TEXT,                         -- canonical channel_uid for channel sends
+        dm_user_id TEXT,                         -- canonical actor_uid for DMs
         kind TEXT NOT NULL,                      -- reply|proactive_post|welcome|activity|digest|dm|notice
         payload_json TEXT NOT NULL,              -- serialized OutgoingMessage; no secrets or media bytes; pruned with terminal rows
         suppress_if_kill_switch BOOLEAN DEFAULT TRUE,
-        status TEXT DEFAULT 'pending',           -- pending|sent|dropped|failed
+        ambiguity_policy TEXT DEFAULT 'at_most_once', -- at_most_once|retry_safe_duplicate
+        post_send_actions_json TEXT,             -- e.g. {"pin":true} for member notice; executed after sent
+        post_send_status_json TEXT,              -- per-action status/error, redacted
+        status TEXT DEFAULT 'pending',           -- pending|sending|sent|dropped|failed|ambiguous
         attempts INTEGER DEFAULT 0,
         not_before DATETIME,                     -- honor scheduled delay / quiet hours
         trigger_at DATETIME,                     -- for staleness reconciliation
+        send_started_at DATETIME,                -- set on pending -> sending before platform call
+        sending_lease_until DATETIME,             -- expired sending rows reconcile to ambiguous on Telegram
         platform_message_id TEXT,                -- set on 'sent'
         last_error TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         sent_at DATETIME
+      );
+    platform_actions: |
+      -- Execute-once ledger for non-send platform actions owned by Delivery/Platform infra,
+      -- currently the member-notice post-send pin. It is deliberately separate from
+      -- moderation_actions, whose ownership and semantics are moderation-specific.
+      -- A notice is sent by the userbot for persona continuity, but pinning is an admin
+      -- action and is executed by the CONTROL BOT. Missing pin rights when member_notice is
+      -- enabled is a go-live/runtime hold, not a silent downgrade.
+      CREATE TABLE platform_actions (
+        action_key TEXT PRIMARY KEY,              -- e.g. plat:<outbox.dedupe_key>:pin
+        workspace_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,                 -- canonical channel_uid
+        via TEXT NOT NULL,                        -- control for pin today
+        action TEXT NOT NULL,                     -- pin_message
+        target_message_id TEXT,                   -- platform message id produced by outbox send
+        source_dedupe_key TEXT,                   -- outbox row that caused this action
+        status TEXT DEFAULT 'claimed',            -- claimed|executed|failed|ambiguous
+        reason TEXT,
+        last_error TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        executed_at DATETIME
       );
     account_health: |
       -- Account-survival state for the USERBOT only (overview operations.account_survival;
@@ -710,8 +759,8 @@ data_model:
         id INTEGER PRIMARY KEY,
         action_key TEXT NOT NULL,                -- deterministic execute-once key `mod:<correlationId>:<action>:<target_message_id|target_user_id>`; UNIQUE -> replayed violation is a no-op
         workspace_id TEXT NOT NULL,
-        channel_id TEXT,
-        target_user_id TEXT,
+        channel_id TEXT,                          -- canonical channel_uid
+        target_user_id TEXT,                      -- canonical actor_uid
         target_message_id TEXT,
         action TEXT NOT NULL,                    -- delete|mute|ban (one per row; delete is auto, mute/ban logged when owner-approved)
         autonomy TEXT,                           -- auto|proposed|approved (mute/ban are owner-confirmed L1)
@@ -735,15 +784,16 @@ data_model:
       -- graph the envelope models. payload_digest is REDACTED + size-capped: it NEVER contains
       -- the session string, bot token, API keys, or flagged-media bytes (gate: journal_no_secrets).
       -- SUBJECT STAMPING IS NON-OPTIONAL FOR /forget COMPLETENESS: subject_user_id is NOT guessed
-      -- by the middleware. EVERY workspace-scoped event whose payload concerns a specific member
-      -- MUST carry envelope.subjectUserId (events.yaml envelope.rules), and the journaling
-      -- middleware copies it (plus channel/message metadata) onto the row and sets
-      -- contains_user_text. Synthetic trace rows pass subjectUserId through ctx.logger.trace. A
-      -- row that omits subjectUserId is, by contract, NOT about a single subject — so /forget's
-      -- subject sweep (WHERE subject_user_id=?) is COMPLETE rather than best-effort. The privacy
-      -- model is three-tiered: audit skeleton (event name/time/correlation/reason code) is
-      -- retained for traceability, user payload digest is retention-/forget-bound, and raw
-      -- message text lives in messages only with the shortest retention.
+      -- by the middleware. EVERY event whose payload concerns a specific member/actor MUST carry
+      -- envelope.subjectUserId (events.yaml envelope.rules), including raw pre-routing events
+      -- when sender/actor is known. Raw empty-workspace events are SKELETON ONLY: no message
+      -- text, display names, quoted text, owner free-text, media URL, or raw payload enters
+      -- payload_digest before routing/approval resolves scope. Synthetic trace rows pass
+      -- subjectUserId through ctx.logger.trace. A row that omits subjectUserId is, by contract,
+      -- NOT about a single subject and contains no user-scoped text. The privacy model is
+      -- three-tiered: audit skeleton (event name/time/correlation/reason code) is retained for
+      -- traceability, user payload digest is retention-/forget-bound, and raw message text lives
+      -- in messages only with the shortest retention.
       -- Written via a BATCHED async buffer off the receive/send critical path (better-sqlite3
       -- is synchronous — see tech_stack.database); pruned by retention.sweep_due past
       -- observability.journal_retention_days.
@@ -753,8 +803,8 @@ data_model:
         correlation_id TEXT,                     -- the spine: one message's whole journey shares this
         causation_id TEXT,                       -- the eventId that directly caused this (the causal edge)
         workspace_id TEXT,                       -- may be empty for pre-resolution events (message.received/control.owner_action)
-        subject_user_id TEXT,                    -- set when payload_digest/reason contains user-scoped text or user-specific state
-        channel_id TEXT,
+        subject_user_id TEXT,                    -- canonical actor_uid when payload_digest/reason contains user-scoped text or user-specific state
+        channel_id TEXT,                         -- canonical channel_uid once scoped; raw skeleton rows may carry only non-payload identity metadata
         platform_message_id TEXT,
         contains_user_text BOOLEAN DEFAULT FALSE,
         privacy_tier TEXT DEFAULT 'audit_skeleton', -- audit_skeleton|user_payload_digest
@@ -787,3 +837,40 @@ data_model:
         reason TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+  ownership:
+    # Enforced by overview.yaml quality_gates.architecture.table_ownership.
+    # "owner" is the only writer. Other modules read through owner-provided services/repos.
+    messages: Workspace Router
+    inbound_updates: Delivery/Ingest infra
+    reply_feedback: Evolution
+    style_memory: Evolution
+    evolution_log: Evolution
+    evolution_experiments: Evolution
+    shared_insights: Evolution
+    activities: Activity Planner
+    approval_items: Approval Service
+    marketing_log: Marketing
+    command_attempts: Intent Router
+    channel_state: SocialContext
+    channel_members: SocialContext
+    workspace_runtime_state: RuntimeStateService
+    safety_holds: Moderation
+    knowledge_items: Content Sync Pipeline
+    source_sync_state: Content Sync Pipeline
+    knowledge_chunks: Content Sync Pipeline
+    knowledge_vectors: Content Sync Pipeline
+    knowledge_vector_map: Content Sync Pipeline
+    daily_budget_state: LLMGateway
+    ingest_budget_state: LLMGateway
+    llm_usage: LLMGateway
+    user_memory: User Memory
+    member_suppression: SuppressionService
+    channel_negative_signals: SuppressionService
+    content_gaps: Content Gap
+    leads: Funnel
+    outbox: Delivery/Outbox
+    platform_actions: Delivery/Platform
+    account_health: AccountSurvival
+    moderation_actions: Control Bot executor
+    event_journal: Observability
+    pipeline_failures: Pipeline supervisor

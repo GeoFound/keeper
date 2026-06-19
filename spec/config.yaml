@@ -19,6 +19,7 @@ config_files:
         chat: "google/gemini-2.5-flash"
         classifier: "google/gemini-2.0-flash-lite"
         embedding: "openai/text-embedding-3-small"
+        embedding_dimension: 1536     # used to template sqlite-vec float[${embedding_dim}]; loader rejects missing/mismatched dimensions
         reflection: "google/gemini-2.5-flash"
         moderation_vision: "google/gemini-2.5-flash"   # multimodal; best-effort black-tier media (SAFETY, not gated by the breaker)
       budget:                       # cost circuit breaker (operations.cost_circuit_breaker)
@@ -266,15 +267,24 @@ config_loading:
     - any workspace.content_sources reference to a missing source.id, or any workspace/channel trying to use reserved workspaceId `__system__`
     - launch_profile: minimum with evolution/funnel/cross_promotion/user_memory enabled by default (owner must ramp these deliberately after first launch)
     - missing or non-numeric owner.approval_channel.user_id; there is exactly one owner control-plane sender unless a future delegated-principal spec adds more
+    - missing llm.models.embedding_dimension, non-positive dimension, or a dimension that conflicts with the model registry/current sqlite-vec table without a declared forward-only vector migration
+    - a go-live/precondition check that has privacy.member_notice.enabled=true while the control bot lacks pin-message rights for that channel; posted+pinned disclosure is required, so pin is not optional in that mode
     - any governance.autonomy raised at runtime, or a delegated principal added by anything but owner-authored config at load (no_self_escalation)
     - delivery.pipeline_inflight_deadline_seconds < (reply-pipeline stage count × delivery.pipeline_stage_timeout_seconds) + margin (the watchdog would force-abort a legit slow reply — events inflight_supervisor.deadline_budget_rule); also reject either pipeline timeout >= reply_max_staleness_seconds
     - a cross-promotion permission whose from_workspace/to_workspace does not resolve to a configured workspace, when cross_promotion is enabled for the source workspace (the sample ws-tool-site entry is illustrative/future and only validated once that workspace exists and the flag is on)
   identity_and_uniqueness: >-
     The loader builds one canonical binding map before any module starts:
-    workspaceId -> workspace, sourceId -> source, and (platform, channel_id) -> exactly
-    one workspace. Ambiguity is a hard startup/reload failure, not a best-effort choice.
+    workspaceId -> workspace, sourceId -> source, native (platform, channel_id) -> exactly
+    one workspace, and derived channel_uid -> exactly one workspace. Ambiguity is a hard
+    startup/reload failure, not a best-effort choice.
     This prevents cross-workspace content leaks, double processing, and wrong-owner
     approvals before implementation code has a chance to drift.
+  embedding_dimension: >-
+    The embedding dimension is an explicit config value because sqlite-vec fixes vector
+    dimension at table creation. The loader validates the configured model against a small
+    model registry (or a user-supplied override marked unsafe) and rejects a dimension mismatch
+    unless a forward-only vector migration is being run. This makes `embedding float[${embedding_dim}]`
+    deterministic at Step 1/3 instead of discovered halfway through ingest.
   hot_reload: >-
     config/** is watched; an edited workspace/source/persona is re-validated and swapped
     WITHOUT a restart (a long-lived bot must not drop its connection to pick up a tweak).
@@ -345,6 +355,7 @@ project_structure: |
   │   │   ├── database.ts
   │   │   ├── approval.ts
   │   │   ├── styling.ts                    # StyleService read-model: STYLE-arm assignment (ctx.styling)
+  │   │   ├── runtime-state.ts              # RuntimeStateService (ctx.runtime): workspace_runtime_state accessor + single deduped out-of-band runtime owner-alert emitter
   │   │   ├── observability.ts              # journal middleware (writes event_journal) + redaction + structured logger + trace/tail/inspect query API
   │   │   └── scheduler.ts
   │   ├── cli/

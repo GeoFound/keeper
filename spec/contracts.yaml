@@ -36,6 +36,32 @@ domain_model:
 # These are intentionally broad enough for step-by-step implementation, but concrete
 # enough that src/** can generate Zod schemas without inventing missing shapes.
 supporting_types:
+  IdentityTypes:
+    signature: |
+      // Native ids are accepted at adapter/config edges only. Inside core services,
+      // read-models, and DB tables, ids are platform-scoped so Telegram/Discord/App
+      // ids can never collide during long-term expansion.
+      type Platform = 'telegram' | 'discord' | 'app' | 'web';
+      type ChannelUid = string; // `${platform}:${nativeChannelId}`
+      type ActorUid = string;   // `${platform}:${nativeUserId}`
+      interface ChannelRef {
+        platform: Platform;
+        channelId: string;      // native platform channel id
+        channelUid: ChannelUid; // canonical core key
+      }
+      interface ActorRef {
+        platform: Platform;
+        userId: string;         // native platform user id
+        actorUid: ActorUid;     // canonical core key
+      }
+    rules: >-
+      Historical field names `channelId` and `userId` remain in many interfaces for readability,
+      but once an event is inside the core (after adapter normalization) those values MUST be
+      canonical platform-scoped ids unless the field is explicitly named `native*` or paired with
+      a `platform` column. Config/workspace bindings keep native (platform, channel_id); the loader
+      derives channelUid and rejects collisions. DB comments in data-model.yaml mark which columns
+      store canonical ids. This is a pre-implementation decision to keep multi-platform expansion
+      clean without a future identity migration.
   ConfigTypes:
     signature: |
       interface PersonaConfig {
@@ -312,21 +338,32 @@ interfaces:
       PRECONDITIONS (onboarding verifyAccess, per adapter): userbot must be a MEMBER
       (hard stop if not); control bot must be an ADMIN with delete+restrict rights
       (hard stop if missing — black-tier delete and L1 restrict cannot be claimed without
-      it). An invalid userbot session alerts the owner OUT-OF-BAND via the control bot (the
-      account is down); an invalid control-bot token cannot use the control bot, so it
-      surfaces as an unhealthy process + redacted stderr/newline-JSON/CLI health error;
-      neither crash-loops.
+      it), and when privacy.member_notice.enabled it must also have pin-message rights for
+      the disclosure notice. An invalid userbot session records a RuntimeStateService row
+      (mode=disabled/degraded, reason=invalid_session) which alerts the owner OUT-OF-BAND via the
+      control bot (the account is down); an invalid control-bot token cannot use the control bot,
+      so RuntimeStateService records the row but the owner surface is an unhealthy process +
+      redacted stderr/newline-JSON/CLI health error (the one alert reason that does NOT DM the
+      control bot — see contracts RuntimeStateService); neither crash-loops. Every such runtime
+      hold + its single owner alert goes through ctx.runtime / RuntimeStateService, never a direct
+      workspace_runtime_state write.
     signature: |
-      interface PlatformAdapter {
+      interface PlatformAdapterBase {
         readonly platform: string;
+        readonly identity: 'userbot' | 'control';
         // lifecycle
         start(): Promise<void>;      // validates credentials; auth failure is surfaced without crash-looping
         stop(): Promise<void>;
         // preflight — onboarding/health asserts the preconditions above. NOTE: a userbot
         // has no privacy-mode; there is no canReadAll field — membership grants full read.
         // Required Telegram preconditions: userbot isMember; control bot isAdmin with
-        // delete+restrict. Missing required rights blocks go-live rather than degrading.
+        // delete+restrict, plus pin when member_notice is enabled. Missing required rights blocks go-live rather than degrading.
         verifyAccess(channelId: string): Promise<{ isMember: boolean; isAdmin: boolean; missingRights: string[] }>;
+        // capability query
+        getCapabilities(): PlatformCapabilities;
+      }
+      interface ChatPlaneAdapter extends PlatformAdapterBase {
+        readonly identity: 'userbot';
         // inbound. correlationId is derived deterministically from the platform message
         // identity (corr:<platform>:<channelId>:<platform_message_id>), NOT a fresh uuid,
         // so a redelivered update after a reconnect/crash is idempotent (see overview
@@ -339,29 +376,43 @@ interfaces:
         // outbound
         sendMessage(channelId: string, content: OutgoingMessage): Promise<string>;
         sendTypingIndicator(channelId: string): Promise<void>;
-        // admin actions
+        sendDirectMessage?(userId: string, content: OutgoingMessage): Promise<string>;
+        // rich (optional; auto-degrade if unsupported)
+        sendPoll?(channelId: string, poll: PollData): Promise<string>;
+        // CRITICAL: no delete/ban/mute/pin methods exist on ChatPlaneAdapter. The userbot
+        // cannot even type-check as an admin executor.
+      }
+      interface AdminExecutorAdapter extends PlatformAdapterBase {
+        readonly identity: 'control';
+        // admin actions — CONTROL BOT only. These methods are absent from ChatPlaneAdapter.
         deleteMessage(channelId: string, messageId: string): Promise<void>;
         banUser(channelId: string, userId: string, duration?: number): Promise<void>;
         muteUser(channelId: string, userId: string, duration: number): Promise<void>;
-        // rich (optional; auto-degrade if unsupported)
-        sendPoll?(channelId: string, poll: PollData): Promise<string>;
         pinMessage?(channelId: string, messageId: string): Promise<void>;
-        sendDirectMessage?(userId: string, content: OutgoingMessage): Promise<string>;
-        // capability query
-        getCapabilities(): PlatformCapabilities;
       }
+      interface OwnerControlAdapter extends PlatformAdapterBase {
+        readonly identity: 'control';
+        sendDirectMessage(userId: string, content: OutgoingMessage): Promise<string>;
+        onOwnerAction(handler: (action: OwnerAction) => void): void;
+      }
+      type TelegramUserbotAdapter = ChatPlaneAdapter;
+      type TelegramControlAdapter = AdminExecutorAdapter & OwnerControlAdapter;
+      type PlatformAdapter = ChatPlaneAdapter | TelegramControlAdapter;
   UnifiedMessage:
     desc: Normalized inbound message format; the platform-agnostic boundary.
     signature: |
       interface UnifiedMessage {
         id: string;
         platform: string;
-        channelId: string;
+        channelId: string;    // canonical channelUid inside core; adapter raw/native id is kept in raw only
         // NOTE: no workspaceId here. The adapter does not know workspaces.
         // Workspace Router resolves channelId -> workspace and emits message.routed
         // (RoutedMessage) carrying the resolved workspace; workspaceId then lives
         // on the event envelope for every downstream event.
         sender: { id: string; username?: string; displayName?: string; isAdmin: boolean; };
+        // sender.id is canonical actorUid inside core. If a platform-native id is needed for
+        // adapter calls, it is recovered through the adapter's platform mapping, not treated as
+        // a cross-platform key.
         content: { text?: string; mediaType?: 'image'|'video'|'file'|'sticker'; mediaUrl?: string; };
         replyTo?: { messageId: string; senderId: string; text?: string; };
         isEdit?: boolean;        // true when this is an edit of an earlier message (re-moderate, never re-reply)
@@ -398,7 +449,9 @@ interfaces:
       }
       interface ModuleContext {
         bus: EventBus;
-        db: Database;
+        db: Database;              // guarded by table ownership (data-model ownership + table_ownership gate).
+                                   // Modules may not mutate arbitrary tables through raw SQL; shared
+                                   // state is accessed through ctx services/repositories.
         llm: LLMGateway;         // enforces per-workspace token BUDGET + circuit breaker (see operations).
                                  // ALSO exposes the multimodal SAFETY call used by Moderation's
                                  // vision classifier: classifyMedia(bytes, mime, ...) accepts the raw
@@ -424,6 +477,10 @@ interfaces:
         media: MediaService;          // on-demand media-byte fetch for moderation (infra, not a peer module)
         suppression: SuppressionService; // reply/dm/memory opt-out + complaint signals (read-model, infra not a peer module);
                                       // the SOLE accessor of member_suppression — modules never touch that table directly
+        runtime: RuntimeStateService; // durable operational holds (read_only/safety_hold/media_hold/degraded/
+                                      // missing_rights/invalid_session/retreat) + the single out-of-band owner
+                                      // alert path (infra, not a peer module); the SOLE accessor of
+                                      // workspace_runtime_state — modules never touch that table directly
       }
       // MediaService is the SANCTIONED read path for media bytes. Media moderation
       // needs the raw bytes to run the vision classifier, but a module may NOT call a
@@ -582,6 +639,46 @@ interfaces:
         // only. A channel-level signal never silences an individual; a per-user signal never
         // auto-quiets a channel.
       }
+      // RuntimeStateService is cross-cutting infra (like SuppressionService) — NOT a peer
+      // module — exposed as ctx.runtime, and is the SOLE ACCESSOR of the workspace_runtime_state
+      // table (data-model workspace_runtime_state). It is the single answer to TWO gaps that
+      // otherwise had no owner: (1) WHO writes a durable operational hold, and (2) WHO emits the
+      // "out-of-band owner alert via the control bot" the spec promises for every such hold. Both
+      // module callers (Moderation media/safety/missing-rights holds, Welcome/onboarding
+      // missing-pin holds — via ctx.runtime) and infra callers (LLMGateway budget read_only +
+      // safety/media exhaustion; the userbot/control adapters' membership/rights/auth loss;
+      // AccountSurvival's account-wide retreat — via a direct engine reference) go through THIS
+      // service; no module or adapter writes workspace_runtime_state directly (table_ownership gate).
+      // BEHAVIOR: enter() is an IDEMPOTENT upsert keyed by the row's UNIQUE
+      // (workspace_id, scope_type, scope_id, mode, reason) — re-entering an already-active
+      // condition is a no-op. On a no-active-row -> active TRANSITION (and only then), it emits
+      // EXACTLY ONE out-of-band owner alert as outbound.requested(kind:'notice', via:'control',
+      // suppressIfKillSwitch=false, dedupeKey=`system_notice:runtime:<id>`) so a flapping
+      // condition cannot spam the owner; the daily digest separately rolls up still-active rows
+      // (Approval Service reads ctx.runtime.active()). resolve() clears the row (status='resolved')
+      // when the condition lifts and may emit a single "restored" notice. workspaceId on the alert
+      // is the affected workspace when known (read_only/safety_hold/media_hold/degraded-channel) and
+      // the reserved `__system__` scope for account/adapter-auth conditions that precede or span
+      // workspace resolution (invalid_session, account retreat). EXCEPTION — a control-bot TOKEN
+      // invalidity cannot be alerted via the control bot (the bot itself is down): enter() still
+      // records the row, but that reason's owner surface is the process health / stderr / CLI path
+      // already specified (overview platform_prerequisites.session_validity), NOT a control-bot DM.
+      // It is a whitelisted bus PRODUCER of outbound.requested only (events.yaml envelope.rules);
+      // it never re-emits a workspace-domain event and no module imports it.
+      interface RuntimeStateService {
+        enter(input: {
+          workspaceId: string;                 // affected workspace, or '__system__' for account/adapter-auth scope
+          scopeType: 'workspace' | 'channel' | 'source' | 'account';
+          scopeId: string;                     // workspace_id | canonical channel_uid | source_id | account_id
+          channelId?: string;                  // canonical channel_uid when scopeType==='channel'
+          mode: 'read_only' | 'safety_hold' | 'media_hold' | 'degraded' | 'disabled' | 'retreat';
+          reason: string;                      // budget_exhausted|media_cap|missing_rights|missing_pin_rights|userbot_not_member|invalid_session|provider_outage|...
+          until?: Date;
+          details?: Record<string, unknown>;   // redacted; never secrets/media bytes
+        }): Promise<void>;                     // idempotent; emits ONE owner alert only on no-row -> active transition
+        resolve(input: { workspaceId: string; scopeType: 'workspace' | 'channel' | 'source' | 'account'; scopeId: string; mode: string; reason: string }): Promise<void>;
+        active(workspaceId?: string): Promise<Array<{ workspaceId: string; scopeType: string; scopeId: string; channelId?: string; mode: string; reason: string; until?: Date; createdAt: Date }>>;
+      }
       interface RoomRead {
         phase: 'seed' | 'spark' | 'grow' | 'mature';        // community lifecycle
         temperature: 'silent' | 'calm' | 'lively' | 'heated' | 'argument';
@@ -608,7 +705,9 @@ interfaces:
       // LLMGateway, SocialContext (also the channel_state writer), ConversationContext,
       // KnowledgeService (RAG), StyleService (STYLE-arm assignment), MediaService (media-byte
       // fetch for moderation, delegates to the inbound adapter), SuppressionService (member_suppression
-      // accessor + complaint-signal recorder, a whitelisted bus consumer), Scheduler, the engine
+      // accessor + complaint-signal recorder, a whitelisted bus consumer), RuntimeStateService
+      // (workspace_runtime_state accessor + the single out-of-band runtime owner-alert emitter, a
+      // whitelisted outbound.requested producer), Scheduler, the engine
       // pipeline bridge (forwards an unregistered optional stage's event — see events.yaml
       // reply_pipeline.absent_stage_bridge), and each PlatformAdapter. They are exposed via
       // ModuleContext (or are pure engine wiring) and may touch a whitelisted set of events

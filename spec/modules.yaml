@@ -38,10 +38,12 @@ modules:
       owner_notice: >-
         The FIRST time the userbot is added to / sees an unknown channel it notifies the
         owner once ("added to <chat>; not configured — ignoring") via
-        outbound.requested(kind:'notice', via:'control', workspaceId:'__system__', deduped
-        per channel) — i.e. through the CONTROL BOT (owner-facing), so the owner can
-        configure or remove it. `__system__` is a reserved non-workspace scope and cannot
-        retrieve content, spend LLM budget, or receive member data.
+        outbound.requested(kind:'notice', via:'control', workspaceId:'__system__',
+        dedupeKey:`system_notice:unbound_channel:<platform>:<channel>`) — i.e. through
+        the CONTROL BOT (owner-facing), so the owner can configure or remove it.
+        `__system__` is a reserved non-workspace scope and cannot retrieve content,
+        spend LLM budget, or receive member data. System notice outbox rows prune normally;
+        only `member_notice:*` disclosure rows are permanent.
       no_auto_leave: >-
         The bot does NOT auto-leave (it may be mid-onboarding before its workspace
         row is written); it simply stays inert until configured. To remove it the
@@ -52,7 +54,9 @@ modules:
     subscribes: [message.routed]
     publishes: [moderation.violation, moderation.escalated, message.clean]
     note: >-
-      All admin actions are SILENT. Unsupported platform capabilities auto-degrade.
+      All admin actions are SILENT. Unsupported optional rich capabilities auto-degrade
+      only where overview.yaml marks them optional; required delete/restrict/admin rights
+      fail closed and never degrade.
       Moderation is SAFETY infrastructure: it runs even when the cost circuit breaker
       has tripped the workspace to read-only (the breaker bounds GENERATIVE output,
       never moderation — see overview operations).
@@ -88,8 +92,8 @@ modules:
       collapse: "dedupe by workspace + user/message bucket + reason_code so outages become one digest/status incident"
       defaults:
         text_classifier_error: "expire_drop — do not reply/process as clean; leave public text alone unless a deterministic non-LLM rule already requires delete"
-        media_scan_cap_or_vision_down: "silent_delete_unscanned when platform delete right exists; otherwise workspace_runtime_state.mode=media_hold and owner alert"
-        missing_control_bot_rights: "workspace safety_hold/read_only; no clean emission that depends on unavailable moderation execution"
+        media_scan_cap_or_vision_down: "silent_delete_unscanned when platform delete right exists; otherwise ctx.runtime.enter(mode=media_hold, reason=media_cap|provider_outage) (the RuntimeStateService accessor + single owner-alert path — never a direct workspace_runtime_state write)"
+        missing_control_bot_rights: "ctx.runtime.enter(mode=safety_hold/read_only, reason=missing_rights); no clean emission that depends on unavailable moderation execution"
       owner_surface: >-
         /status and digest show counts by reason, oldest hold age, TTL, and whether media
         is being silently deleted due to config.media_hold_mode under runtime mode media_hold. They never include raw flagged
@@ -164,7 +168,7 @@ modules:
       new_user_media_delay: "untrusted/new users cannot post media for the first N minutes (config moderation.new_user_media_delay_minutes), mirroring new_user_link_delay — most drive-by image abuse comes from fresh accounts."
       new_user_clock: "Both new_user_*_delay rules read presence from ctx.social.memberPresence(channelId, userId) (backed by the channel_members table, written by the SocialContext updater on member.joined/left + first message.clean — see contracts SocialContext + data-model channel_members). A user is 'new' when there is NO row yet (this very message is the first observation) OR now - first_seen_at < the configured delay. Using first_seen_at (earliest of join or first message) keeps the fail-safe correct even when the bot joined AFTER the user (joined_at unknown). This is the persisted clock that makes the delay enforceable rather than guesswork."
       never_store_flagged_media: "media that trips the black-tier vision classifier is deleted and its bytes are NEVER written to disk/db; only a tier+reason audit row is kept (no media payload)."
-      media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision with scope_type='workspace' + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, workspace enters runtime mode media_hold: ALL further unscanned media (new AND established users) is held/blocked/silent-deleted according to config.media_hold_mode rather than scanned — safety never silently degrades to allow. Owner sees 'media safety scanning unavailable; media temporarily held' rather than a generic budget error."
+      media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision with scope_type='workspace' + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, the workspace enters runtime mode media_hold via ctx.runtime.enter(mode=media_hold) — Moderation NEVER writes workspace_runtime_state directly (RuntimeStateService is its sole accessor + owner-alert path; the budget-side exhaustion is set by the LLMGateway through the same service, the vision-OUTAGE side by Moderation). In media_hold ALL further unscanned media (new AND established users) is held/blocked/silent-deleted according to config.media_hold_mode rather than scanned — safety never silently degrades to allow. The RuntimeStateService owner alert says 'media safety scanning unavailable; media temporarily held' rather than a generic budget error; Moderation calls ctx.runtime.resolve when scanning is restored."
     rules:
       - { feature: anti_spam,            behavior: "ad links / repeated messages / bulk joins -> silent delete NOW (auto); mute proposed to owner (L1)" }
       - { feature: hard_block,           behavior: "black-tier hit (text OR media) -> silent delete NOW (auto) + DM owner (moderation.escalated) proposing the ban (L1). Detection+delete NOT tunable; ban awaits owner ✅." }
@@ -191,18 +195,28 @@ modules:
         short, pinned disclosure — that an assistant operates here, that messages may be
         retained up to message_retention_days, and how to opt out of relationship memory (the
         opt_out_keyword) — emitted as outbound.requested(kind:'notice', via:'userbot',
-        dedupeKey:`notice:<channel>`). This gives message-retention a lawful, transparent
-        basis. The notice text lives in assets/ (content), not code.
+        dedupeKey:`member_notice:<channel>`, postSend:{pin:true}). This gives message-retention a
+        lawful, transparent basis. The notice text lives in assets/ (content), not code. The
+        send itself comes from the userbot for persona continuity; the pin is a post-send
+        platform action executed by the CONTROL BOT (admin) through platform_actions, never by
+        the userbot.
       once_ever: >-
-        The dedupeKey `notice:<channel>` makes it once-ever per channel: the outbox NEVER
-        prunes kind='notice' rows (overview idempotent_delivery.outbox_pruning), so a later
-        join cannot re-post it. Welcome emits it on the FIRST member.joined it sees, AND the
+        The dedupeKey `member_notice:<channel>` makes it once-ever per channel: the outbox
+        NEVER prunes `member_notice:*` rows (overview idempotent_delivery.outbox_pruning),
+        so a later join cannot re-post it. Welcome emits it on the FIRST member.joined it sees, AND the
         Onboarding Wizard emits the SAME keyed notice at go-live (see onboarding_wizard) so an
         ALREADY-POPULATED channel does not wait for the next join to be disclosed — whichever
         fires first wins and the other is a no-op outbox-dedup hit. A purely hand-edited
         workspace with no wizard go-live and no new joins posts on its next observed join
         (acceptable: retention's lawful basis is the pinned notice, which appears as soon as
         either trigger fires).
+      pin_precondition: >-
+        If privacy.member_notice.enabled is true, the control bot must have pin-message rights
+        in that channel in addition to delete+restrict. Go-live fails without it; runtime loss
+        calls ctx.runtime.enter(mode=degraded/safety_hold, reason=missing_pin_rights) (the
+        RuntimeStateService accessor + single owner-alert path — never a direct
+        workspace_runtime_state write). Pin failure is never silently ignored because the
+        disclosure basis is "posted + pinned", not merely "attempted".
     guards:
       - obeys the kill switch: a welcome is proactive, so suppressIfKillSwitch=true (suppressed at the adapter when NOT RoomRead.proactiveAllowed — /pause, /quiet, or account RETREAT).
       - seed/spark aware: still welcomes (1:1 warmth is wanted early) but counts toward consecutive_bot_messages so it cannot monologue.
@@ -725,6 +739,9 @@ modules:
         via:'control', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
         bot is never silenced by /pause or account RETREAT). Contents: messages sent, reply rate, spam blocked,
         black-tier escalations (text+media), safety/media holds by reason+TTL,
+        active runtime holds (read via ctx.runtime.active() — read_only/safety_hold/media_hold/
+        degraded/missing_rights/invalid_session/retreat, each already owner-alerted once at onset,
+        rolled up here so an ongoing degrade is re-surfaced daily),
         command_attempts, suppression changes/complaint spikes,
         repeated content gaps, pending items, evolution status, and repeated
         pipeline-stage failures (read from the pipeline_failures table — errors, timeouts,
@@ -732,8 +749,9 @@ modules:
       system_notices_section: >-
         Unbound-channel and adapter credential/access notices are NOT workspace-scoped — they
         are emitted live as their own owner DM (outbound.requested kind:'notice',
-        workspaceId='__system__') the moment they happen. The daily digest ALSO carries a
-        rolled-up "system notices since last digest" section, sourced from event_journal rows
+        workspaceId='__system__', dedupeKey prefixed `system_notice:`) the moment they happen.
+        These are operational notices and their outbox rows prune normally. The daily digest
+        ALSO carries a rolled-up "system notices since last digest" section, sourced from event_journal rows
         WHERE workspace_id='__system__' (so a missed live notice still surfaces once daily).
         Because these are cross-workspace and __system__ has no timezone/cron of its own, the
         digest emits this section ONCE per day, deterministically attached to the digest DM of
@@ -877,16 +895,20 @@ modules:
     go_live_notice: >-
       The moment a workspace is brought live through the wizard, if privacy.member_notice is
       enabled the wizard emits the member-notice disclosure once —
-      outbound.requested(kind:'notice', via:'userbot', dedupeKey:`notice:<channel>`) for each
-      bound channel — so an already-populated channel is disclosed at go-live rather than
-      waiting for the next join. It is the SAME keyed notice Welcome would post, so the outbox
-      dedup (kind='notice' is never pruned) guarantees exactly one per channel regardless of
-      which trigger fires first (see welcome_module.member_notice.once_ever).
+      outbound.requested(kind:'notice', via:'userbot', dedupeKey:`member_notice:<channel>`,
+      postSend:{pin:true}) for each bound channel — so an already-populated channel is
+      disclosed at go-live rather than waiting for the next join. It is the SAME keyed notice
+      Welcome would post, so the outbox dedup (`member_notice:*` is never pruned) guarantees
+      exactly one per channel regardless of which trigger fires first (see
+      welcome_module.member_notice.once_ever). The post-send pin is executed by the control bot
+      and tracked in platform_actions.
     preconditions_check: >-
       Before marking a workspace live, the wizard calls verifyAccess on BOTH adapters and
       refuses to finish if the USERBOT is not a member of the channel (hard stop) or the
       CONTROL BOT is not a group admin with delete+restrict rights (hard stop, reported for
-      the owner to grant; required safety/admin rights never silently degrade). It confirms
+      the owner to grant; required safety/admin rights never silently degrade). If
+      privacy.member_notice.enabled is true, it also requires the control bot's pin-message
+      right because the notice contract is posted + pinned. It confirms
       the userbot session string AND the control bot token both authenticate. There is NO
       privacy-mode check — the userbot reads everything by membership. The interview itself
       runs over the CONTROL BOT (the owner cannot DM the userbot, which is their own

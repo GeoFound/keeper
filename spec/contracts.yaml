@@ -566,10 +566,11 @@ interfaces:
       // ENFORCED ATOMICALLY at the userbot send queue's dequeue for proactive kinds (overview
       // operations.send_queue.consecutive_bot_cap_enforcement), NOT by a racy per-producer
       // pre-read; a producer's pre-check is a cheap optimization only, replies are exempt. The
-      // human-message reset here is what counts as "the room moved on". The CONTROL columns
-      // (paused_until, proactive_paused_until) are owned + written by the Approval Service
-      // (the kill switch) and only READ here when computing posture/proactiveAllowed — a
-      // one-way read-model handoff, not shared mutable state. The mapping is deliberate and
+      // human-message reset here is what counts as "the room moved on". The kill-switch levers
+      // (paused_until, proactive_paused_until) live in the Approval-owned channel_control table
+      // (NOT channel_state — they have a different writer than SocialContext, so a shared table
+      // would break the one-writer-per-table ownership gate) and are only READ here when computing
+      // posture/proactiveAllowed — a one-way read-model handoff, not shared mutable state. The mapping is deliberate and
       // NOT symmetric: paused_until (/pause) forces posture=='stay_silent' (so BOTH the
       // reactive and proactive gates close); proactive_paused_until (/quiet) leaves posture
       // alone and only sets proactiveAllowed=false (so proactive is gagged while reactive
@@ -584,7 +585,7 @@ interfaces:
       // SuppressionService maintains in the channel_negative_signals table (data-model) reaches
       // negative_feedback_quiet_threshold within negative_feedback_window_minutes. assess() READS
       // that table at decision time (it never writes it, nor member_suppression) and derives the
-      // posture, EXACTLY as it already reads the Approval-owned channel_state control columns — a
+      // posture, EXACTLY as it already reads the Approval-owned channel_control table — a
       // one-way read-model handoff. Distinct-user counting is deliberate: one member reacting
       // angrily many times is not a quorum. This is the "repeated complaints from MULTIPLE members
       // reduce frequency / set quiet posture" path of suppression_complaint_loop, independent of
@@ -609,14 +610,25 @@ interfaces:
       // envelope.rules + catalog) that subscribes message.clean + reaction.received to detect the
       // two ALWAYS-AVAILABLE signals (complaint/opt-out phrases on message.clean, and a negative
       // emoji — config negative_reaction_emojis — on a tracked bot message on reaction.received) and
-      // call recordNegativeSignal — so no feature module owns that detection. SIGNAL ROUTING is by
+      // call recordNegativeSignal — so no feature module owns that detection.
+      // BOT-MESSAGE IDENTITY: to classify whether a reaction.received targets one of the BOT's own
+      // messages (only those count as a negative-reaction signal, and channel_negative_signals
+      // .bot_message_id needs that id), SuppressionService ALSO subscribes reply.sent + outbound.sent
+      // and keeps a BOUNDED in-memory per-channel index of recent bot (channel_uid, bot_message_id,
+      // sentAt), pruned to suppression.negative_feedback_window_minutes. On reaction.received it
+      // checks that window-index — it does NOT read reply_feedback (Evolution-owned) or outbox
+      // (Delivery-owned), so there is no cross-owner read, and Evolution need not even exist yet
+      // (the complaint loop lands at build_order step 6, Evolution at step 8). A reaction to a bot
+      // message sent before a restart-within-the-window may be missed; that is acceptable for this
+      // rolling, self-healing soft signal (the window is short and the rows expire anyway).
+      // SIGNAL ROUTING is by
       // shape: the channel-level 'complaint'/'negative_reaction' signals append a row to
       // channel_negative_signals (the windowed auto-quiet tally); the per-USER intentional
       // 'owner_mute'/'no_response' signals write a member_suppression row only and never auto-quiet a
       // channel. The negative_feedback_quiet_threshold auto-quiet is NOT a write to the owner's
       // /pause//quiet columns (Approval is their sole writer); it is reflected by SocialContext
       // DERIVING a reduced-reply / observe_only posture from the DISTINCT-user count in
-      // channel_negative_signals — a one-way read-model handoff, like the channel_state control columns.
+      // channel_negative_signals — a one-way read-model handoff, like the Approval-owned channel_control table.
       // Modules READ it before replying, remembering, or proposing DMs; they do not share mutable
       // state with each other.
       // COMPLAINT DETECTION DEGRADES GRACEFULLY w.r.t. the sentiment_analysis flag (default
@@ -652,11 +664,17 @@ interfaces:
       // BEHAVIOR: enter() is an IDEMPOTENT upsert keyed by the row's UNIQUE
       // (workspace_id, scope_type, scope_id, mode, reason) — re-entering an already-active
       // condition is a no-op. On a no-active-row -> active TRANSITION (and only then), it emits
-      // EXACTLY ONE out-of-band owner alert as outbound.requested(kind:'notice', via:'control',
+      // EXACTLY ONE out-of-band owner alert as outbound.requested(kind:'notice', audience:'owner',
       // suppressIfKillSwitch=false, dedupeKey=`system_notice:runtime:<id>`) so a flapping
       // condition cannot spam the owner; the daily digest separately rolls up still-active rows
       // (Approval Service reads ctx.runtime.active()). resolve() clears the row (status='resolved')
-      // when the condition lifts and may emit a single "restored" notice. workspaceId on the alert
+      // when the condition lifts and may emit a single "restored" notice. active() returns rows
+      // with status='active' whose `until` is null or still in the future; a row whose `until` has
+      // passed is treated as AUTO-EXPIRED (lazily resolved on the next sweep/read). This is how a
+      // budget read_only / media_hold entered with until=end-of-workspace-day clears itself at day
+      // rollover with no explicit resolve, making workspace_runtime_state the SINGLE authority for
+      // operational mode (daily_budget_state holds no mode flag — data-model daily_budget_state).
+      // workspaceId on the alert
       // is the affected workspace when known (read_only/safety_hold/media_hold/degraded-channel) and
       // the reserved `__system__` scope for account/adapter-auth conditions that precede or span
       // workspace resolution (invalid_session, account retreat). EXCEPTION — a control-bot TOKEN

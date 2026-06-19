@@ -38,9 +38,9 @@ modules:
       owner_notice: >-
         The FIRST time the userbot is added to / sees an unknown channel it notifies the
         owner once ("added to <chat>; not configured — ignoring") via
-        outbound.requested(kind:'notice', via:'control', workspaceId:'__system__',
-        dedupeKey:`system_notice:unbound_channel:<platform>:<channel>`) — i.e. through
-        the CONTROL BOT (owner-facing), so the owner can configure or remove it.
+        outbound.requested(kind:'notice', audience:'owner', workspaceId:'__system__',
+        dedupeKey:`system_notice:unbound_channel:<platform>:<channel>`) — the outbound-router
+        sends an owner-audience notice via the CONTROL BOT, so the owner can configure or remove it.
         `__system__` is a reserved non-workspace scope and cannot retrieve content,
         spend LLM budget, or receive member data. System notice outbox rows prune normally;
         only `member_notice:*` disclosure rows are permanent.
@@ -187,14 +187,14 @@ modules:
       The actual consumer of member.joined (events.yaml lists "Welcome Module"; it was
       previously unwired — moderation only subscribes message.routed). On a join it
       composes a natural, persona-styled welcome and emits outbound.requested
-      (kind:'welcome', via:'userbot', notBefore = now + 1-3 min random, deduped per
-      channel+user) — the welcome comes from the persona (userbot), in-channel.
+      (kind:'welcome', audience:'community', notBefore = now + 1-3 min random, deduped per
+      channel+user) — a community-audience send the outbound-router routes to the persona (userbot), in-channel.
     member_notice:   # privacy disclosure (decided: notice + tiered delete)
       rule: >-
         When a workspace has privacy.member_notice enabled, the bot posts ONCE per channel a
         short, pinned disclosure — that an assistant operates here, that messages may be
         retained up to message_retention_days, and how to opt out of relationship memory (the
-        opt_out_keyword) — emitted as outbound.requested(kind:'notice', via:'userbot',
+        opt_out_keyword) — emitted as outbound.requested(kind:'notice', audience:'community',
         dedupeKey:`member_notice:<channel>`, postSend:{pin:true}). This gives message-retention a
         lawful, transparent basis. The notice text lives in assets/ (content), not code. The
         send itself comes from the userbot for persona continuity; the pin is a post-send
@@ -294,7 +294,7 @@ modules:
     strategies:
       # Each strategy names its concrete mechanism so none is left unwired:
       - { strategy: in_conversation_recommendation, frequency: when topic-relevant, example: "对了我之前写过一篇对比几个模型的", mechanism: "REPLY PIPELINE — set ReplyDraft.marketing on reply.needed -> reply.enriched (reactive)" }
-      - { strategy: proactive_share,                frequency: 1-2x per day,         example: "刚看到一个挺有意思的事",            mechanism: "PROACTIVE — on the marketing.share_due scheduler tick (its OWN per-workspace-tz cron, NOT content_calendar.due, which Atmosphere owns), compose a persona-styled share -> outbound.requested(kind:'proactive_post', via:'userbot', suppressIfKillSwitch=true)" }
+      - { strategy: proactive_share,                frequency: 1-2x per day,         example: "刚看到一个挺有意思的事",            mechanism: "PROACTIVE — on the marketing.share_due scheduler tick (its OWN per-workspace-tz cron, NOT content_calendar.due, which Atmosphere owns), compose a persona-styled share -> outbound.requested(kind:'proactive_post', audience:'community', suppressIfKillSwitch=true)" }
       - { strategy: post_answer_followup,           frequency: occasional,           example: "详细的我在站上写过",                   mechanism: "REPLY PIPELINE — same reply.enriched path as in_conversation_recommendation" }
       - { strategy: activity_embed,                 frequency: during activities,    example: "这次送的是我们的 XX 产品",            mechanism: "Activity content carries the marketing angle: the Activity Executor composes it inside the activity message — Marketing does NOT emit its own send for this" }
     proactive_share:
@@ -308,7 +308,7 @@ modules:
         observe_only. It
         ALSO honors marketing.limits (max_mentions_per_day, min_gap_hours — counted in
         marketing_log) and brand_safety.never_mention_in (complaint/argument/tense). Then it
-        emits outbound.requested(kind:'proactive_post', via:'userbot',
+        emits outbound.requested(kind:'proactive_post', audience:'community',
         suppressIfKillSwitch=true, dedupeKey:`marketing_share:<channel>:<workspace-local-date>`).
         suppressIfKillSwitch=true means the adapter's proactiveAllowed gate (/pause, /quiet,
         OR account RETREAT) still gags it even if it composed. It NEVER calls the adapter directly and NEVER bypasses
@@ -409,7 +409,7 @@ modules:
     sending: >-
       The Initiator composes persona-styled text (ctx.llm with the shared persona
       prompt + humanize util — the same de-AI post-processing as Persona) and emits
-      outbound.requested(kind:'proactive_post'|'activity', via:'userbot',
+      outbound.requested(kind:'proactive_post'|'activity', audience:'community',
       suppressIfKillSwitch=true). It NEVER calls the adapter directly and NEVER bypasses
       the send_queue.
     reads_room: Uses ctx.social.assess(channelId) — the SAME read-model Intent Router uses.
@@ -655,11 +655,13 @@ modules:
           (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided,
           lead.approved/rejected, or moderation.violation(approved) for an L1 mute/ban); a
           📝 amend carries amendText.
-        - command /pause|/quiet|/resume: WRITE channel_state.paused_until (/pause ->
-          posture stay_silent) / proactive_paused_until (/quiet -> proactiveAllowed=false
-          only) (the kill switch — the one control-owned write to channel_state;
-          SocialContext only READS these for posture/proactiveAllowed, see contracts).
-        - command /status|/why|/trace: compose from the event_journal (+ read-model tables) -> outbound.requested(kind:'dm', via:'control'); /trace <id> renders the full ordered correlationId story.
+        - command /pause|/quiet|/resume: WRITE channel_control.paused_until (/pause ->
+          posture stay_silent) / channel_control.proactive_paused_until (/quiet -> proactiveAllowed=false
+          only) — the kill switch lives in Approval's OWN channel_control table (NOT channel_state,
+          whose sole writer is SocialContext); SocialContext only READS it for posture/proactiveAllowed (see contracts).
+        - command /status|/why|/trace: compose from the Observability query API (event_journal-derived;
+          + read-model tables via their owning services + ctx.runtime.active()), NEVER raw cross-owner
+          event_journal SQL -> outbound.requested(kind:'dm', audience:'owner'); /trace <id> renders the full ordered correlationId story.
         - command /forget <user|me>: resolve userId + workspaceId -> emit user.forget.
         - command /setup, or owner text during an active interview, or a confirm on the
           onboarding draft: emit onboarding.input(start|answer|confirm) to the Onboarding Wizard.
@@ -688,13 +690,13 @@ modules:
       config.owner.approval_channel.user_id; any other sender (incl. a member messaging
       the control bot) is silently ignored (no authority, no error). Turns a pending
       proposal into a decision and correlates it back to the exact item. All its sends
-      use OutboundMessage.via='control'.
+      use OutboundMessage.audience='owner' (the outbound-router routes owner-audience sends to the control bot).
     inbound_owner_actions:   # all arrive as control.owner_action (see control_ingress)
       decisions: "✅ approve | ❌ reject | 📝 amend(text)"   # OwnerAction.itemRef from callback_data (inline button); typed fallback matches by reply-to, else #id token
       controls:    # the KILL SWITCH + visibility — owner-only operational commands
-        - "/pause [scope] [duration]   -> bot goes FULLY silent in scope (sets channel_state.paused_until)"
+        - "/pause [scope] [duration]   -> bot goes FULLY silent in scope (sets channel_control.paused_until)"
         - "/resume [scope]"
-        - "/quiet 2h                   -> stop PROACTIVE only (sets proactive_paused_until -> RoomRead.proactiveAllowed=false); reactive replies + moderation keep running; posture unchanged"
+        - "/quiet 2h                   -> stop PROACTIVE only (sets channel_control.proactive_paused_until -> RoomRead.proactiveAllowed=false); reactive replies + moderation keep running; posture unchanged"
         - "/status                     -> what the bot is doing + pending items + today's counts (read from the event_journal + read-model tables)"
         - "/why <messageId>            -> explain a recent action/reply from the event_journal (the full trace for that message's correlationId, rendered human-readable)"
         - "/trace <id>                 -> the complete ordered story of one correlationId (every event + decision + failure for that message), the control-bot mirror of `just trace <id>`"
@@ -703,7 +705,8 @@ modules:
         - "/unmute-bot-for-user <id>   -> ctx.suppression.clear(<id>) for that user; owner-only."
         - "/setup                      -> starts the onboarding interview (emits onboarding.input(start))"
     pause_is_authoritative: >-
-      paused_until / proactive_paused_until are folded into SocialContext, but NOT the same
+      channel_control.paused_until / proactive_paused_until (Approval's OWN table) are folded into
+      SocialContext's room-read, but NOT the same
       way: paused_until (/pause) forces RoomRead.posture == stay_silent (every reactive AND
       proactive path stops); proactive_paused_until (/quiet) sets RoomRead.proactiveAllowed
       == false WITHOUT changing posture (only proactive stops; reactive replies + moderation
@@ -736,7 +739,7 @@ modules:
       on: digest.due
       action: >-
         compose + DM the owner the daily digest via outbound.requested(kind:'digest',
-        via:'control', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
+        audience:'owner', dmUserId=owner, suppressIfKillSwitch=false — the owner's own control
         bot is never silenced by /pause or account RETREAT). Contents: messages sent, reply rate, spam blocked,
         black-tier escalations (text+media), safety/media holds by reason+TTL,
         active runtime holds (read via ctx.runtime.active() — read_only/safety_hold/media_hold/
@@ -762,8 +765,8 @@ modules:
         the deterministic-attachment rule is the current single source of truth.)
     sending: >-
       ALL owner-facing sends (proposals, escalations, digest, /status, /why replies)
-      go out via outbound.requested(kind:'dm'|'digest', via:'control', dmUserId=owner) —
-      through the CONTROL BOT. The control plane never calls the adapter directly. Owner
+      go out via outbound.requested(kind:'dm'|'digest', audience:'owner', dmUserId=owner) —
+      which the outbound-router routes to the CONTROL BOT. The control plane never calls the adapter directly. Owner
       DMs set suppressIfKillSwitch=false so neither the kill switch nor account RETREAT
       ever gags the owner's own visibility.
     note: Never executes a member request; controls accepted ONLY from the owner user_id.
@@ -825,8 +828,8 @@ modules:
       Sending a DM is a privileged action gated by autonomy.send_direct_message
       (default L1_propose -> owner approves ON THE CONTROL BOT). It is NEVER triggered by a
       member asking; only by the bot's own signal + the configured autonomy level. On
-      lead.approved the Funnel emits outbound.requested(kind:'dm', via:'userbot',
-      dmUserId=lead) — the DM to the LEAD goes through the USERBOT (the lead is talking to
+      lead.approved the Funnel emits outbound.requested(kind:'dm', audience:'lead',
+      dmUserId=lead) — a lead-audience DM the outbound-router routes through the USERBOT (the lead is talking to
       the persona, a real person, not a bot) and is additionally bounded by the
       account_survival dm_per_day cap (DMs are the highest ban risk). It never calls the
       adapter directly.
@@ -895,7 +898,7 @@ modules:
     go_live_notice: >-
       The moment a workspace is brought live through the wizard, if privacy.member_notice is
       enabled the wizard emits the member-notice disclosure once —
-      outbound.requested(kind:'notice', via:'userbot', dedupeKey:`member_notice:<channel>`,
+      outbound.requested(kind:'notice', audience:'community', dedupeKey:`member_notice:<channel>`,
       postSend:{pin:true}) for each bound channel — so an already-populated channel is
       disclosed at go-live rather than waiting for the next join. It is the SAME keyed notice
       Welcome would post, so the outbox dedup (`member_notice:*` is never pruned) guarantees

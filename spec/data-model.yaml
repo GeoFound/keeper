@@ -39,7 +39,10 @@ data_model:
         -- moderation_actions records tier+reason (and media_url above is cleared on a black-tier hit).
         is_edit BOOLEAN DEFAULT FALSE,            -- this row is an edit (re-moderated, never re-replied)
         edit_of TEXT,                             -- original platform_message_id this edit replaces
-        is_bot_reply BOOLEAN DEFAULT FALSE,
+        -- (no is_bot_reply column: bot sends NEVER enter `messages` — the userbot self-ingest
+        --  filter drops the account's own outgoing updates before message.received, so this table
+        --  is inbound-only. Bot-message accounting comes from reply.sent/outbound.sent on the send
+        --  path (+ outbox / reply_feedback), never reconstructed from inbound.)
         reply_to_id TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         edited_at DATETIME,                         -- latest platform edit timestamp/revision, if any
@@ -276,7 +279,10 @@ data_model:
     channel_state: |
       -- Read-model backing SocialContext.assess(): community phase + room temp.
       -- Refreshed on message.clean / member events; queried by Intent Router +
-      -- Atmosphere so the whole engine shares one notion of "度".
+      -- Atmosphere so the whole engine shares one notion of "度". SOLE WRITER: SocialContext.
+      -- The owner KILL-SWITCH levers are NOT here (they had a different writer — the Approval
+      -- Service — which would violate the one-writer-per-table ownership gate). They live in the
+      -- Approval-owned channel_control table; SocialContext only READS them at assess() time.
       CREATE TABLE channel_state (
         channel_id TEXT PRIMARY KEY,              -- canonical channel_uid (`<platform>:<native_channel_id>`)
         workspace_id TEXT NOT NULL,
@@ -288,8 +294,26 @@ data_model:
         last_human_message_at DATETIME,
         last_bot_message_at DATETIME,
         consecutive_bot_messages INTEGER DEFAULT 0,
-        paused_until DATETIME,                   -- kill switch: fully silent until (owner /pause)
-        proactive_paused_until DATETIME,         -- /quiet: proactive off, moderation stays
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    channel_control: |
+      -- Owner KILL-SWITCH levers, split out of channel_state so the TABLE boundary matches the
+      -- OWNERSHIP boundary (the table_ownership gate is per-table, single-writer). SOLE WRITER:
+      -- the Approval Service (the control plane) on /pause, /quiet, /resume. SocialContext is a
+      -- READ-ONLY consumer: assess() reads these at decision time to derive RoomRead.posture /
+      -- proactiveAllowed — a one-way read-model handoff, EXACTLY like SocialContext reading the
+      -- AccountSurvival-owned account_health.retreat_until and the SuppressionService-owned
+      -- channel_negative_signals. Neither writer touches the other's table.
+      -- Keyed per channel (canonical channel_uid), like channel_state; a /pause at workspace
+      -- scope sets one row per bound channel. A MISSING row = not paused/quieted (like a missing
+      -- account_health row = not in retreat). Mapping, applied in SocialContext.assess():
+      --   paused_until in the future           -> posture == stay_silent (reactive AND proactive off)
+      --   proactive_paused_until in the future -> proactiveAllowed == false only (reactive + moderation continue)
+      CREATE TABLE channel_control (
+        channel_id TEXT PRIMARY KEY,              -- canonical channel_uid (`<platform>:<native_channel_id>`)
+        workspace_id TEXT NOT NULL,
+        paused_until DATETIME,                   -- /pause: fully silent until (forces posture stay_silent)
+        proactive_paused_until DATETIME,         -- /quiet: proactive off until; reactive + moderation stay
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     channel_members: |
@@ -334,7 +358,7 @@ data_model:
       -- membership/rights/auth loss, AccountSurvival on account-wide retreat) through a direct engine
       -- reference. enter() is an IDEMPOTENT upsert on the UNIQUE key below; on a no-active-row ->
       -- active TRANSITION (only) it emits EXACTLY ONE out-of-band owner alert via
-      -- outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false,
+      -- outbound.requested(kind:'notice', audience:'owner', suppressIfKillSwitch=false,
       -- dedupeKey=`system_notice:runtime:<id>`) — the single owner-alert path the spec promises for
       -- every runtime hold, deduped so a flapping condition can't spam the owner; resolve() clears the
       -- row. EXCEPTION: a control-bot TOKEN invalidity records its row here but cannot DM via the dead
@@ -488,6 +512,13 @@ data_model:
       -- day-rollover race cannot create two rows. INGEST IS NOT HERE: ingest is source-scoped (a
       -- source serves many workspaces) and lives in ingest_budget_state — see that table and
       -- overview operations.cost_circuit_breaker.budget_lanes.
+      -- OPERATIONAL MODE IS NOT STORED HERE: read_only / safety_hold / media_hold live SOLELY in
+      -- workspace_runtime_state (RuntimeStateService is the single authority — there is no second
+      -- source of truth). On the exhaustion TRANSITION detected during reserve, the LLMGateway
+      -- calls ctx.runtime.enter(mode, until=end-of-workspace-day); the reserve FAILING is the
+      -- hot-path enforcement, ctx.runtime.active() is the read surface, and the hold auto-clears
+      -- at day rollover via the runtime row's `until` plus the fresh zeroed day row below. This
+      -- table is PURE ACCOUNTING (budgets + reserved/actual/used + day) — never a mode flag.
       CREATE TABLE daily_budget_state (
         workspace_id TEXT NOT NULL,
         day TEXT NOT NULL,                         -- YYYY-MM-DD in workspace timezone
@@ -500,8 +531,6 @@ data_model:
         safety_actual_usd REAL DEFAULT 0,
         media_scans_reserved INTEGER DEFAULT 0,
         media_scans_used INTEGER DEFAULT 0,
-        media_hold_until DATETIME,
-        read_only_until DATETIME,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (workspace_id, day)
       );
@@ -604,9 +633,9 @@ data_model:
       -- counts DISTINCT user_id within suppression.negative_feedback_window_minutes and, when that
       -- count reaches suppression.negative_feedback_quiet_threshold, DERIVES a reduced-reply /
       -- observe_only posture AT READ TIME — it never writes channel_state for this, nor this table.
-      -- That is a one-way read-model handoff, EXACTLY like the Approval Service owning
-      -- channel_state.paused_until / proactive_paused_until while SocialContext only reads them;
-      -- neither table's writer touches the other's. Counting DISTINCT users (not raw rows) is
+      -- That is a one-way read-model handoff, EXACTLY like the Approval Service owning the
+      -- channel_control table (paused_until / proactive_paused_until) while SocialContext only
+      -- reads it; neither table's writer touches the other's. Counting DISTINCT users (not raw rows) is
       -- deliberate: one member reacting angrily many times is not a quorum — "MULTIPLE members are
       -- unhappy" is what sets quiet posture (acceptance suppression_quiet / suppression_controls).
       -- SCOPE: the per-USER INTENTIONAL signals never land here — owner_mute (owner) and
@@ -682,7 +711,7 @@ data_model:
         workspace_id TEXT NOT NULL,
         correlation_id TEXT,
         platform TEXT DEFAULT 'telegram',
-        via TEXT NOT NULL,                       -- userbot|control (for Telegram); enough to pick the send queue on retry
+        via TEXT NOT NULL,                       -- RESOLVED transport identity (Telegram: userbot|control), computed by the outbound-router from OutboundMessage.audience at enqueue. This lives BELOW the platform boundary, so it is allowed to be Telegram-specific; the bus payload itself carries only platform-agnostic `audience`. Enough to pick the send queue on retry.
         channel_id TEXT,                         -- canonical channel_uid for channel sends
         dm_user_id TEXT,                         -- canonical actor_uid for DMs
         kind TEXT NOT NULL,                      -- reply|proactive_post|welcome|activity|digest|dm|notice
@@ -852,6 +881,7 @@ data_model:
     marketing_log: Marketing
     command_attempts: Intent Router
     channel_state: SocialContext
+    channel_control: Approval Service
     channel_members: SocialContext
     workspace_runtime_state: RuntimeStateService
     safety_holds: Moderation

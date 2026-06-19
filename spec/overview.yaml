@@ -154,7 +154,10 @@ operations:
     safety_exhaustion_behavior: >-
       If safety_daily_usd or media_scan_daily_cap is exhausted, the owner sees
       "media safety scanning unavailable; media temporarily held" and the workspace
-      records an active workspace_runtime_state row with mode=safety_hold or media_hold. For media this
+      records an active workspace_runtime_state row with mode=safety_hold or media_hold through the
+      RuntimeStateService (ctx.runtime — see operations.runtime_state; LLMGateway sets the
+      budget-exhaustion side, Moderation the vision-outage side, neither writing the table
+      directly), which also emits the single deduped owner alert. For media this
       means unscanned media is held or silently deleted according to config. For text, only
       the SURVIVORS that actually needed the LLM classifier (suspect/ambiguous text the rule
       pre-filter flagged — see modules.yaml moderation.classification_cost_model) are held /
@@ -170,7 +173,25 @@ operations:
     rule: >-
       Every inbound message and every send (reply OR outbound.requested) is keyed by
       correlationId / dedupeKey in an OUTBOX (data-model). A send is written to the
-      outbox as 'pending' BEFORE the platform call and marked 'sent' on confirm.
+      outbox as 'pending' BEFORE any platform call. The outbox gives the ENGINE a
+      durable exactly-once enqueue/decision ledger; it does NOT pretend Telegram offers a
+      caller-supplied remote idempotency key. Once a platform call has started, a crash before
+      the platform returns is an UNKNOWN remote outcome and is represented explicitly as
+      status='ambiguous', not papered over as "safe to retry".
+    platform_send_semantics: >-
+      Local idempotency and remote delivery are separate contracts. Locally, a dedupeKey can
+      produce at most one live outbox row and every retry/reconcile path is deterministic.
+      Remotely, Telegram MTProto/Bot API does not accept a client idempotency token for sends,
+      pins, or admin calls. Therefore a row that reached status='sending' and then lost the
+      process before confirm is AMBIGUOUS: the message may already be visible on Telegram.
+      The restart reconciler must NOT blindly send it again. For community/lead/userbot sends
+      the safe default is at-most-one-visible-send: mark ambiguous, surface it in trace/status/
+      digest, and do not auto-retry unless a platform-specific reconciliation proves no send
+      happened. Owner/control-plane sends whose duplicate is safe by itemRef/dedupeKey may use
+      an explicit ambiguity_policy='retry_safe_duplicate', but the duplicate risk is still
+      logged and the authority-bearing decision remains idempotent in approval_items. This is
+      the honest guarantee: no duplicate engine decision, no blind spam retry, and every
+      unknown remote outcome is visible to the owner.
     inbound_idempotency: >-
       correlationId is DERIVED DETERMINISTICALLY from the platform's unique message
       identity — `corr:<platform>:<channelId>:<platform_message_id>` (for an edit,
@@ -199,14 +220,15 @@ operations:
     outbox_pruning: >-
       The outbox is consulted for dedup, so it cannot be blindly truncated. A sweep
       (folded into retention.sweep_due) archives/prunes rows that are BOTH terminal
-      (sent/dropped/failed) AND older than reply.max_staleness + a safety margin — past
+      (sent/dropped/failed/ambiguous) AND older than reply.max_staleness + a safety margin — past
       that window no live trigger can reference them, so pruning preserves the idempotency
-      guarantee while bounding table growth. EXCEPTION: kind='notice' rows are NEVER pruned.
+      guarantee while bounding table growth. EXCEPTION: only member-notice rows
+      (`kind='notice'` AND `dedupe_key` prefixed `member_notice:`) are NEVER pruned.
       The member-notice disclosure is a ONCE-EVER, pinned per-channel obligation, and a
       future member.joined can still re-trigger it — so its outbox row is the durable
       "already disclosed" guard (one tiny row per channel) and pruning it would let the
-      one-time notice re-post. Every other kind (reply/welcome/proactive_post/activity/
-      digest/dm) is per-trigger and prunes normally.
+      one-time notice re-post. Other notices, including `__system__` owner notices with
+      `system_notice:*` dedupe keys, are operational messages and prune normally.
     inbound_crash_recovery: >-
       The outbox only protects sends that already reached 'pending'. The window BEFORE that —
       ingest -> moderation -> intent -> pipeline, before any outbox row exists — is covered by
@@ -230,13 +252,15 @@ operations:
       blanket-stop guard + the messages-row PK blocked any reprocessing of a message whose journey
       crashed before the outbox — with neither loss, nor double-journey, nor deadlock.
     crash_safety: >-
-      On restart the bot reconciles the outbox: a 'pending' row whose trigger is still
-      within reply.max_staleness is retried ONCE (the dedupeKey makes the retry safe —
-      no double-send); a 'pending' row past staleness is marked 'dropped' (don't answer
-      a 10-min-old line). This is strictly better than record-then-hope: it neither
-      double-sends nor silently loses a reply to a mid-flight crash. Together with
-      inbound_crash_recovery above, BOTH halves of the journey (pre-outbox inbound and the
-      send itself) survive a mid-flight crash with neither loss nor duplication.
+      On restart the bot reconciles the outbox by send phase, not by optimism. A
+      status='pending' row that has not entered the platform call may be sent if it is still
+      within reply.max_staleness; if stale it is marked dropped. A status='sending' row whose
+      lease expired means "the platform call may have happened"; on Telegram it becomes
+      status='ambiguous' unless a platform-specific reconciliation can prove the outcome. The
+      reconciler never converts an unknown remote outcome into a blind retry. Together with
+      inbound_crash_recovery above, BOTH halves of the journey are durable and explainable:
+      pre-outbox inbound work is re-driven exactly once by downstream guards, and post-outbox
+      sends either confirm, drop before the call, or become owner-visible ambiguous rows.
     stale_drop: a reply whose trigger is older than reply.max_staleness is dropped at any stage (the staleness guard is pipeline-wide, see events failure_policy).
   send_queue:
     rule: >-
@@ -266,7 +290,7 @@ operations:
       answers a human turn that just reset the counter, so it never monologues. This makes the
       cold_start_no_cringe invariant a hard guarantee rather than a racy best-effort.
   retention:
-    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT kind='notice', the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning); owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
+    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT member-notice rows, `kind='notice'` + `dedupe_key` prefixed `member_notice:`, the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning); owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
     data_layers: >-
       Privacy and traceability are separated into three layers:
         - audit skeleton: event name, time, workspaceId, correlationId, causationId,
@@ -301,15 +325,19 @@ operations:
     redaction: >-
       Observability MUST NOT become a leak. The session string, bot token, API keys, and
       flagged-media BYTES NEVER enter the journal or logs (gate: journal_no_secrets); long
-      text is truncated. Message text MAY appear (it aids tracing) but every journal row that
-      contains user-scoped text carries subject_user_id/channel/message metadata so /forget can
-      redact its payload_digest while preserving the trace skeleton. This metadata is NOT
-      guessed by the middleware: any workspace-scoped event whose payload concerns a specific
-      member MUST set envelope.subjectUserId (events.yaml envelope.rules), and the middleware
-      copies it onto the row (synthetic trace rows pass it via ctx.logger.trace). A row with no
-      subjectUserId is, by contract, not about one subject — so the /forget subject sweep is
-      COMPLETE, not best-effort, and cannot miss a user-text row that merely forgot to stamp the
-      subject. The journal is also pruned by retention.sweep_due past
+      text is truncated. Raw pre-routing events (message.received, inbound.member_*, inbound.
+      reaction, control.owner_action) are journaled as SKELETON ONLY while workspaceId is empty:
+      event/correlation/causation/platform/channel/update identity/subjectUserId if known, but
+      NO message text, display name, quoted text, owner free-text, media URL, or raw payload.
+      Once the Workspace Router or Approval Service resolves scope, downstream events may include
+      a redacted payload digest. Every event or trace row that contains user-scoped text or
+      user-specific state carries subject_user_id/channel/message metadata so /forget can redact
+      its payload_digest while preserving the trace skeleton. This metadata is NOT guessed by
+      the middleware: any event whose payload concerns a specific member/actor, INCLUDING raw
+      scope-deferred events when the sender is known, MUST set envelope.subjectUserId (events.yaml
+      envelope.rules), and the middleware copies it onto the row (synthetic trace rows pass it
+      via ctx.logger.trace). A row with no subjectUserId is, by contract, not about one subject
+      and contains no user-scoped text. The journal is also pruned by retention.sweep_due past
       observability.journal_retention_days.
     no_hot_loop_stall: >-
       Journaling is on the path of EVERY event, so it must never stall the connection: rows
@@ -331,6 +359,40 @@ operations:
       also close the reactive gate (see contracts RoomRead). The kill switch cannot be
       bypassed by any module. Owner-directed DMs (digest, proposals, /status) set
       suppressIfKillSwitch=false so neither lever ever blinds the owner.
+  runtime_state:
+    rule: >-
+      Durable, non-/pause operational holds (cost read_only, missing required rights, adapter
+      auth/access loss, per-channel userbot membership loss, safety/media holds, and account-wide
+      retreat) have ONE owner: the RuntimeStateService (ctx.runtime — contracts.yaml), the SOLE
+      accessor of the workspace_runtime_state table. This closes two gaps that previously had no
+      named owner: (a) WHO writes a hold row, and (b) WHO emits the "out-of-band owner alert via
+      the control bot" the spec promises for each hold. Before this, a module (Moderation) and the
+      adapters were implicitly asked to write a table they do not own and to emit an owner alert no
+      producer was declared for.
+    writers: >-
+      No module or adapter writes workspace_runtime_state directly (table_ownership gate). Module
+      callers go through ctx.runtime; infra callers hold a direct engine reference to the same
+      service: LLMGateway (read_only on generative-budget exhaustion; safety_hold/media_hold on
+      safety-lane exhaustion), Moderation (safety_hold/media_hold on classifier/vision/fetch OUTAGE
+      that is not budget; missing_rights), the userbot/control adapters (degraded/userbot_not_member,
+      invalid_session, runtime admin-right loss), Welcome/Onboarding (missing_pin_rights), and
+      AccountSurvival (account-wide retreat: account_health owns retreat_until + posture, while a
+      scope_type='account', mode='retreat' workspace_runtime_state row is the owner-visible incident +
+      its single alert).
+    alerting: >-
+      enter() is idempotent on the row's UNIQUE (workspace_id, scope_type, scope_id, mode, reason);
+      ONLY a no-active-row -> active transition emits EXACTLY ONE owner alert via
+      outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false,
+      dedupeKey=`system_notice:runtime:<id>`) — so a flapping condition cannot spam the owner, and
+      the daily digest separately rolls up still-active rows (ctx.runtime.active()). The alert's
+      workspaceId is the affected workspace when known, else the reserved `__system__` scope for
+      account/adapter-auth conditions. EXCEPTION: a control-bot TOKEN invalidity records its row but
+      cannot DM via the dead control bot, so that one reason surfaces through process health /
+      stderr / CLI (platform_prerequisites.session_validity), never a control-bot notice.
+    why: >-
+      A hold that no one can write, or an owner alert that no producer emits, is a silent failure —
+      exactly what the observability floor forbids. One service makes the operational-state surface
+      durable, deduped, and traceable.
   dual_identity:
     rule: >-
       Telegram is operated by TWO cooperating adapters, deliberately split along the
@@ -375,13 +437,17 @@ operations:
         - control bot: must be a group ADMIN holding delete + restrict (ban/mute) rights,
           since it is the moderation executor. Missing either right is a GO-LIVE HARD
           STOP for that channel: the black-tier delete floor and L1 mute/ban approvals
-          cannot honestly be claimed without it. If a required right is lost after
+          cannot honestly be claimed without it. If privacy.member_notice.enabled is true,
+          it must ALSO hold pin-message rights for that channel because the disclosure
+          contract is posted + pinned; missing pin rights are a go-live hard stop for that
+          workspace/channel, not an optional rich-feature degrade. If a required right is lost after
           launch, the affected workspace enters safety_hold/read-only, no message is
           emitted as clean merely because execution is unavailable, and the owner is
           alerted until the right is restored. Optional rich capabilities still
           auto-degrade; required safety/admin rights do not.
       verifyAccess() reports, per adapter, { isMember, isAdmin, missingRights[] } (no
-      canReadAll/privacy-mode field).
+      canReadAll/privacy-mode field). `missingRights[]` includes pin when the workspace's
+      member notice is enabled.
     runtime_membership_loss: >-
       Preconditions are also a RUNTIME concern, not only a go-live check. If the USERBOT is
       kicked/banned from a single channel after launch (it stops receiving that channel's
@@ -392,7 +458,9 @@ operations:
       an account-wide ban (account_survival RETREAT): a single-channel kick degrades only that
       channel, the rest of the account keeps operating. Symmetric coverage: control-bot rights
       loss -> safety_hold/read-only; userbot membership loss -> per-channel degrade + owner
-      alert; neither is ever a quiet stop.
+      alert; neither is ever a quiet stop. Both the degrade ROW and its owner alert go through the
+      RuntimeStateService (ctx.runtime — see operations.runtime_state), never a direct
+      workspace_runtime_state write or an ad-hoc send.
     session_validity: >-
       The userbot's hard stop is AUTH: an invalid/expired/revoked SESSION STRING means the
       owner's account cannot connect at all. The control bot's hard stop is an invalid bot
@@ -400,7 +468,10 @@ operations:
       than crash-looping: userbot auth failure alerts the owner via the control bot; control
       bot token failure cannot use the control bot, so it is surfaced through the process
       health/readiness failure, stderr/newline-JSON log, and `just status`/CLI health output
-      until an external notifier is configured in the production track. See
+      until an external notifier is configured in the production track. Both failures are
+      recorded as RuntimeStateService holds (reason=invalid_session); the userbot one alerts via
+      the control bot, the control-bot-token one is the single reason that does NOT DM (the bot is
+      down) and rides the health path instead (see operations.runtime_state). See
       account_survival.
     why: the real failure modes are a dead userbot session, a missing control-bot admin right, and an account ban — all covered here + account_survival.
 
@@ -418,7 +489,7 @@ operations:
       - global_account_ceiling: a per-account daily + per-minute send ceiling across ALL channels and DMs (the send_queue's second ceiling), well under Telegram's observed account flood thresholds.
       - flood_wait_obedience: every MTProto FLOOD_WAIT is honored in full; repeated FLOOD_WAITs within a window trip RETREAT.
       - human_pacing: jittered delays + typing simulation + no consecutive bursts; the same humanize pacing the persona wants doubles as anti-detection.
-      - retreat_on_risk: on FLOOD_WAIT recurrence, a peer-flood/spam warning, or an auth/anomaly signal, the account enters RETREAT — ALL output stops (proactive AND reactive). Retreat folds into RoomRead.posture==stay_silent (and therefore proactiveAllowed=false), so every module obeys it through the one gate exactly like /pause — the most-conservative anti-ban stance, not a partial throttle. The owner is notified out-of-band via the control bot.
+      - retreat_on_risk: on FLOOD_WAIT recurrence, a peer-flood/spam warning, or an auth/anomaly signal, the account enters RETREAT — ALL output stops (proactive AND reactive). Retreat folds into RoomRead.posture==stay_silent (and therefore proactiveAllowed=false) via account_health.retreat_until, so every module obeys it through the one gate exactly like /pause — the most-conservative anti-ban stance, not a partial throttle. The owner is notified out-of-band via the control bot through the single RuntimeStateService alert path (a scope_type='account', mode='retreat' row — see operations.runtime_state), not an ad-hoc send.
       - no_mass_dm: DMs (funnel) are the single highest ban risk on a user account; they stay governance-gated (L1) AND additionally bounded by a low per-day account DM cap, never bulk.
     why: a banned owner account is the one unrecoverable failure; no feature is worth it.
 
@@ -438,7 +509,7 @@ operations:
 # Build order. Implement strictly top-to-bottom; each step independently verifiable.
 # Cross-cutting infra (operations above) is folded into the steps that first need it.
 build_order:
-  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox + inbound_updates pending->committed lifecycle with restart re-drive) + cost_circuit_breaker generative-only (LLMGateway, reserve+release-on-failure; per-source ingest lane) + send_queue (unified outbound; atomic consecutive-bot cap at dequeue) + observability (journaling bus middleware -> event_journal with causationId + subjectUserId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
+  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox + inbound_updates pending->committed lifecycle with restart re-drive) + cost_circuit_breaker generative-only (LLMGateway, reserve+release-on-failure; per-source ingest lane) + send_queue (unified outbound; atomic consecutive-bot cap at dequeue) + RuntimeStateService (workspace_runtime_state accessor + the single deduped out-of-band owner-alert path for runtime holds) + observability (journaling bus middleware -> event_journal with causationId + subjectUserId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
   - { step: 2, name: Telegram Dual Adapter,        deliverable: "TWO adapters: telegram-userbot (MTProto/GramJS on the owner's account, session-string auth — the SOLE inbound source; community sends + lead DMs; account_survival floor: per-account ceiling + FLOOD_WAIT obedience + warm-up + retreat) and telegram-control (Bot API/grammY, group admin — executes moderation.violation; owner DMs with inline ✅/❌/📝 buttons + /command + callback handling). Deterministic correlationId from platform message id; edits as isEdit; fetchMedia; verifyAccess per adapter (isMember/isAdmin/missingRights — NO privacy mode); outbound routed by audience (community/lead → userbot, owner → control)" }
   - { step: 3, name: Workspace Router + Knowledge RAG, deliverable: "content-isolated retrieval (ctx.knowledge) + retrieval_safety/untrusted_input + content_gap.detected; unbound-channel drop (no spend)" }
   - { step: 4, name: Persona Engine + Context Manager, deliverable: "humanized, context-coherent replies; pipeline failure_policy (abort, never half-send)" }
@@ -462,6 +533,7 @@ invariants:
   - New capability = new file + one registration line; existing modules' behavior untouched.
   - Cross-promotion is gated (flag + approval + tone + rate limit).
   - Each module consumes only its declared events and emits only its declared events.
+  - Runtime identity is platform-scoped. Native platform ids are accepted only at adapter/config edges; core storage, read-models, and suppression/memory keys use canonical `channel_uid=<platform>:<nativeChannelId>` and `actor_uid=<platform>:<nativeUserId>` (or explicit `(platform, native_id)` columns). A bare Telegram chat/user id must never be used as a cross-platform key.
   - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except (a) the resolved-later RAW adapter signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction, and control.owner_action — all resolved by the Workspace Router (member/reaction/message) or the Approval Service (owner action), so their workspace-stamped re-emissions (message.routed, member.joined, member.left, reaction.received) DO carry a non-empty workspaceId; and (b) the source-scoped content-sync events knowledge.sync_due and knowledge.updated, which operate on a content SOURCE that may fan out to many workspaces and instead carry a non-empty payload sourceId — isolation for these is enforced downstream by the RAG source_id filter, never by the envelope) and a payload that validates against its declared schema.
   - Every reply-pipeline stage passes through (emits its output event) when disabled; the chain never breaks.
   - Persona immutable boundaries are hard-coded; evolution may tune only the STYLE section, and only via a gated, reversible experiment.
@@ -476,24 +548,25 @@ invariants:
   - Telegram adapter evidence is layered; local contract simulator covers every update/callback/edit/access edge, a small secret-gated live smoke runs before Step 2 is claimed, and exhaustive live E2E lives only in nightly/production readiness.
   - LLM spend is hard-bounded per workspace/day; over budget trips to read-only, never unbounded. The breaker bounds GENERATIVE output only — moderation/safety (incl. media vision) and receive never stop, so budget pressure can never loosen the black floor.
   - Budget lanes are explicit; generative can be read-only, ingest can pause, safety/media has its own cap and enters runtime safety_hold/media_hold on exhaustion; no lane silently borrows from another or silently opens the black floor.
-  - The bot never re-replies to an already-handled message across crashes (idempotent by correlationId/dedupeKey via the outbox); stale triggers are dropped; a mid-flight crash neither double-sends nor silently loses a send.
+  - The bot never re-decides an already-handled message across crashes (idempotent by correlationId/dedupeKey via the outbox); stale triggers are dropped; a mid-flight crash never creates a second engine send decision. Because Telegram lacks remote send idempotency, a crash after a platform call starts but before confirm becomes an explicit owner-visible ambiguous outbox row, never a blind retry disguised as exactly-once delivery.
   - A mid-flight crash never silently LOSES an inbound message either: inbound_updates tracks a pending->committed lifecycle, replay conflict is decided by status (committed=stop, pending=restart re-drive), and on restart every uncommitted-but-in-window inbound is re-driven from its persisted messages row — so the pre-outbox half of the journey is as crash-safe as the send half (no loss, no double-journey).
   - The userbot never ingests its own account's traffic: any inbound update whose sender is the userbot's own account (the bot's automated sends OR the owner's manual messages) is discarded before message.received — no self-moderation, no reply-to-self, no miscounted room state; bot-message accounting comes only from the send path (reply.sent/outbound.sent).
   - A message from a channel bound to NO workspace is dropped at the router: no moderation, no LLM call, no workspace/domain DB write, zero spend. The pre-routing inbound_updates claim is allowed because it is idempotency infrastructure; beyond that and the deduped `__system__` owner notice, the bot operates only in configured channels.
-  - Config identity is unambiguous at load/reload: workspace ids, source ids, owner control sender, and (platform, channel_id) bindings are unique; content source references must resolve; reserved `__system__` cannot be configured as a workspace.
+  - Config identity is unambiguous at load/reload: workspace ids, source ids, owner control sender, native (platform, channel_id) bindings, and derived channel_uid values are unique; content source references must resolve; reserved `__system__` cannot be configured as a workspace.
   - The black-tier floor applies to MEDIA, not just text: a best-effort vision classifier removes+bans on detectable black-tier images/video; flagged media bytes are never persisted. (CSAM is escalated to the owner for platform report, not claimed as auto-detected.)
   - An edited message is re-moderated (an edit into black/spam is caught) and never triggers a reply.
   - Every send — reactive reply or proactive/DM/notice — goes through the one send_queue + idempotent outbox; no module calls the platform adapter directly.
+  - Modules may not mutate arbitrary tables through raw SQL. Every table has an owner in spec/data-model.yaml; modules write only their owned tables, and shared state is accessed through declared services/repositories (SuppressionService, SocialContext, KnowledgeService, ApprovalService, Outbox/Delivery, Observability).
   - A reply-pipeline stage that errors or times out aborts that reply cleanly; it never emits a half-built, un-enriched, or un-humanized draft.
   - Scheduled owner-facing jobs (digest/reflection/retention) fire in each workspace's own timezone, not server-local time.
   - The system is fully observable, not a black box: every bus emission is journaled (envelope incl. causationId + redacted payload) to the append-only event_journal, and non-emitting decisions/lifecycle moments are traced too, so the complete ordered story of any correlationId — including why something deliberately did NOT happen — is reconstructable by a human via trace/tail/inspect and /trace, /why, /status. No session string / token / key / flagged-media bytes ever enter the journal or logs.
-  - Observability and erasure use three data layers; audit skeleton is retained for traceability, user payload digest is retention-/forget-redactable, raw messages have the shortest retention and are purged by /forget.
+  - Observability and erasure use three data layers; audit skeleton is retained for traceability, user payload digest is retention-/forget-redactable, raw messages have the shortest retention and are purged by /forget. Raw scope-deferred events with empty workspaceId are skeleton-only until routing/approval resolves scope, so an unbound channel or owner free-text cannot leak into the journal before policy can apply.
   - Persona brand safety protects the owner; high-risk topics deflect lightly, heated/argument posture observes by default, marketing is suppressed during complaints/support contexts, and /why explains any risky reply that was allowed.
   - Member suppression is first-class; do-not-reply, do-not-DM, and do-not-remember requests, owner mute-for-user, complaints, negative reactions, and no-response signals suppress future replies/DMs/memory and can auto-quiet the workspace.
   - Member message retention is disclosed (member notice); owner /forget purges a user's raw messages, while the opt-out keyword stops relationship memory.
   - User data is retention-bounded and erasable on demand (owner /forget, user opt-out); relationship memory is opt-in and never recalls an opted-out user.
   - Owner /pause overrides every proactive AND reactive path (posture==stay_silent); /quiet suppresses ONLY proactive (RoomRead.proactiveAllowed=false) while reactive replies and moderation continue; the kill switch cannot be bypassed.
-  - Platform-unsupported OPTIONAL rich capabilities (poll/pin/reaction visibility) auto-degrade silently. Required safety/admin capabilities (control-bot delete + restrict, userbot membership/auth) are hard preconditions or fail-closed runtime holds; they never silently degrade. A runtime LOSS of either (control-bot rights revoked, or the userbot kicked from a channel) marks the affected workspace/channel degraded in workspace_runtime_state and alerts the owner via the control bot until restored — never a silent stop; a single-channel userbot kick degrades only that channel, distinct from an account-wide RETREAT.
+  - Platform-unsupported OPTIONAL rich capabilities (poll/reaction visibility, and pin only when privacy.member_notice is disabled) auto-degrade silently. Required safety/admin capabilities (control-bot delete + restrict, userbot membership/auth, plus control-bot pin rights when member_notice is enabled) are hard preconditions or fail-closed runtime holds; they never silently degrade. A runtime LOSS of either (control-bot rights revoked, or the userbot kicked from a channel) marks the affected workspace/channel degraded in workspace_runtime_state and alerts the owner via the control bot until restored — both the row and the alert go through the one RuntimeStateService (ctx.runtime; the SOLE writer + single deduped owner-alert path — operations.runtime_state), never a direct table write or ad-hoc send; never a silent stop; a single-channel userbot kick degrades only that channel, distinct from an account-wide RETREAT.
   - Telegram runs as TWO identities: a USERBOT (owner's user account, MTProto) is the community face + chat plane (plain member, reads by membership, chats as the owner, NO admin actions, sole inbound source of message.received); a CONTROL BOT (Bot API) is the group-admin moderation EXECUTOR + the owner's control plane (inline-button approvals, /commands, digest) and never chats to members.
   - Every privileged admin action (delete/mute/ban) is executed by the CONTROL BOT, never by the userbot; the owner's personal account performs no admin action. The control bot accepts control input ONLY from the owner user_id; members can never command it. All owner input enters through the ONE authenticated event control.owner_action (emitted by the control bot only for the owner, consumed only by the Approval Service); no adapter calls a module directly and no other event carries owner commands.
   - Account survival outranks throughput and applies to the USERBOT account: the per-account global send ceiling, FLOOD_WAIT obedience, cold-start warm-up, and retreat-on-risk are non-optional; a recurring flood signal forces RETREAT (posture==stay_silent) and notifies the owner out-of-band via the control bot.
@@ -519,6 +592,15 @@ quality_gates:
         Static import-boundary lint (e.g. eslint-plugin-boundaries / dependency-cruiser).
         Files under src/modules/<A>/** may not import from src/modules/<B>/**. Only
         src/engine, src/services, src/knowledge, and platform/shared TYPES are importable.
+    - id: table_ownership
+      enforces: zero_coupling
+      check: >-
+        Static SQL/repository ownership gate. Every table in spec/data-model.yaml declares one
+        owner service/module. A module may write only its owned tables; reads/writes to shared
+        cross-cutting state must go through the declared service/repository (e.g. ctx.suppression
+        for member_suppression, ctx.social for channel_state/channel_members, Delivery/Outbox for
+        outbox, Approval Service for approval_items). Test fixtures scan SQL strings/repository
+        calls and fail on direct cross-owner mutation.
     - id: declared_events_only
       enforces: declared-events-contract
       check: >-
@@ -552,13 +634,16 @@ quality_gates:
         instead (see events.yaml envelope.rules). Test feeds malformed payloads and asserts
         rejection, asserts a non-exception workspace-scoped event with empty workspaceId is
         rejected (including a member.joined/member.left/reaction.received emitted with empty
-        workspaceId), and asserts a source-scoped event with empty sourceId is rejected.
+        workspaceId), and asserts a source-scoped event with empty sourceId is rejected. Raw
+        user-concerning events must carry subjectUserId when the sender/actor is known, and their
+        journal digest must be skeleton-only while workspaceId is empty.
     - id: config_uniqueness
       enforces: config-identity
       check: >-
         Config loader fixtures with duplicate workspace.id, duplicate source.id,
-        duplicate (platform, channel_id), missing content_sources references, bad id
-        charset, missing owner user_id, or configured `__system__` workspace all fail
+        duplicate native (platform, channel_id), duplicate derived channel_uid, missing
+        content_sources references, bad id charset, missing owner user_id, missing/invalid
+        embedding dimension, or configured `__system__` workspace all fail
         fast on startup and fail reload while preserving the prior good config.
     - id: content_isolation
       enforces: content_isolation
@@ -640,15 +725,17 @@ quality_gates:
         per-SOURCE ingest lane (ingest_budget_state) independently. Generative trips read_only
         only for output; ingest exhaustion pauses ONLY that source's sync (no workspace chat
         impact, and a source shared by many workspaces pauses once, not per-workspace);
-        safety/media exhaustion creates active workspace_runtime_state safety_hold/media_hold rows, writes
-        safety_holds, blocks/silent-deletes unscanned media per config, and owner status names
-        media safety unavailability. Assert a reservation released on a failed call in EACH lane.
+        safety/media exhaustion creates active workspace_runtime_state safety_hold/media_hold rows
+        THROUGH the RuntimeStateService (ctx.runtime — never a direct write) with its single deduped
+        owner alert, writes safety_holds, blocks/silent-deletes unscanned media per config, and owner
+        status names media safety unavailability. Assert a reservation released on a failed call in EACH lane.
     - id: idempotent_delivery
       enforces: idempotency
       check: >-
         Replay the same inbound PLATFORM UPDATE (same platform_message_id) after a simulated
-        crash/reconnect -> correlationId derives identically -> exactly one reply (outbox dedup
-        hits). Assert correlationId is NOT a fresh uuid per receive. A trigger older than
+        crash/reconnect -> correlationId derives identically -> one local reply outbox decision
+        (outbox dedup hits; remote mid-flight ambiguity is covered by outbox_crash_safety).
+        Assert correlationId is NOT a fresh uuid per receive. A trigger older than
         reply.max_staleness produces no reply. Assert the status-based delivery rule: a COMMITTED
         conflict stops; a PENDING conflict in the same process's in-flight set is dropped (no
         concurrent double-journey); a PENDING conflict from a prior (crashed) process re-journeys.
@@ -656,7 +743,7 @@ quality_gates:
         outbox row exists; on restart the pending inbound is re-driven from its messages row ->
         processed EXACTLY ONCE. CRASH-BEFORE-ROUTING: kill before the messages row is written,
         then deliver the platform replay; it re-journeys via the not-in-flight rule and is
-        processed EXACTLY ONCE. Neither path loses the message nor double-replies — the gap the
+        processed EXACTLY ONCE. Neither path loses the message nor creates a second engine send decision — the gap the
         old blanket-stop guard left open, closed without deadlock.
     - id: cost_breaker_reserve
       enforces: cost-bound
@@ -694,7 +781,8 @@ quality_gates:
       check: >-
         verifyAccess returns { isMember, isAdmin, missingRights } per adapter, NO privacy-mode
         field. Onboarding refuses to go live when the USERBOT is not a member, or when the
-        CONTROL BOT is not an admin with delete+restrict rights. Missing required rights are
+        CONTROL BOT is not an admin with delete+restrict rights, or when member_notice is enabled
+        and the CONTROL BOT lacks pin rights. Missing required rights are
         reported for the owner to grant and are NOT silently downgraded. An invalid userbot
         session surfaces an out-of-band owner alert VIA THE CONTROL BOT (the account is
         down); an invalid control-bot token surfaces as an unhealthy process + redacted
@@ -825,7 +913,7 @@ quality_gates:
       check: >-
         Static check: no module under src/modules/** references a PlatformAdapter send method; every
         non-reply send is an outbound.requested emission. Runtime: an outbound.requested with a dedupeKey
-        already in the outbox is dropped (no double-send); a proactive send with suppressIfKillSwitch is
+        already in the outbox is dropped (no second engine send decision); a proactive send with suppressIfKillSwitch is
         suppressed whenever NOT RoomRead.proactiveAllowed (/pause, /quiet, or account RETREAT) while an
         owner DM (suppressIfKillSwitch=false) still goes.
     - id: pipeline_failure_abort
@@ -838,9 +926,12 @@ quality_gates:
     - id: outbox_crash_safety
       enforces: idempotency
       check: >-
-        A send written 'pending' then a simulated crash before confirm -> on restart, retried exactly once
-        if within max_staleness (dedupeKey prevents a duplicate), marked 'dropped' if past staleness. Never
-        two sends, never zero for an in-window reply.
+        A send written 'pending' and crashed BEFORE the platform call starts -> on restart, sent once if
+        within max_staleness, marked dropped if stale. A send whose status reached 'sending' and then
+        crashed BEFORE confirm -> on Telegram, marked ambiguous (or reconciled only if a platform-specific
+        proof exists), owner-visible in trace/status/digest, and NOT blindly retried. Assert the engine
+        never creates two outbox send decisions for one dedupeKey and never hides an unknown remote outcome
+        as success.
     - id: scheduler_timezone
       enforces: tz-correctness
       check: >-
@@ -857,16 +948,17 @@ quality_gates:
     - id: journal_no_secrets
       enforces: observability
       check: >-
-        Seed a payload/log call containing the session string, a bot token, an API key, and flagged-media
-        bytes; assert NONE appears in event_journal or the log file (redaction holds), while correlationId/
-        causationId/event name DO. Assert the journal is pruned by the retention sweep past
+        Seed a payload/log call containing synthetic canary values shaped like a session string,
+        a bot token, an API key, and flagged-media bytes; assert NONE appears in event_journal
+        or the log file (redaction holds), while correlationId/causationId/event name DO.
+        Real secrets are never read for this test. Assert the journal is pruned by the retention sweep past
         journal_retention_days, and that journaling uses the batched off-critical-path writer (a stalled
         journal write never blocks the send/receive path).
   # NOTE: each per_step gate below is the SUMMARY; spec/acceptance.yaml expands it into
   # the authoritative capability checklist + evidence that `just verify-step N` enforces.
   # If the two ever diverge, acceptance.yaml wins and this summary must be updated.
   per_step:   # the gate that proves each build_order step is independently done
-    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + config_uniqueness + minimum_launch_profile + hot-reload swaps a workspace; lifecycle callable; declared_events_only + llm_output_isolation + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + safety_budget_media_hold + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_privacy_layers + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
+    - { step: 1, gate: "Bus delivers a published event to a registered module (+ non-module producer whitelist honored); config loads + Zod-validates + config_uniqueness + minimum_launch_profile + hot-reload swaps a workspace; lifecycle callable; declared_events_only + no_cross_module_imports + table_ownership + llm_output_isolation + idempotent_delivery (deterministic correlationId + namespaced outbox keys) + outbox_crash_safety + unified_outbound + cost_circuit_breaker + safety_budget_media_hold + cost_breaker_reserve green; Scheduler fires a per-workspace-tz tick (scheduler_timezone green); observability_trace + journal_privacy_layers + journal_no_secrets green (every emission journaled with causationId, redaction holds, trace/tail/inspect work)." }
     - { step: 2, gate: "Telegram adapter evidence ladder green: local contract simulator covers userbot/control message/callback/edit/access/media/FLOOD_WAIT edges; a secret-gated live smoke proves login, send/receive, callback, edit, and verifyAccess; message.received single-source + audience routing + userbot_access + account_survival green." }
     - { step: 3, gate: "content_isolation + indirect_injection + untrusted_input + knowledge_freshness_trust green; ctx.knowledge is the only retrieval path; unbound-source query returns zero rows; unbound_channel_drop green; incremental sync dedups by content_hash; a low-score/stale-only query emits content_gap.detected." }
     - { step: 4, gate: "reply.ready -> reply.generated: no markdown / no enumerations / persona_transparency_boundary + persona_brand_safety green; coherent with the Context Manager window; pipeline_failure_abort green (a seeded Persona error aborts, never half-sends); pipeline_watchdog green (a seeded hang is force-aborted, not lost)." }
@@ -877,6 +969,6 @@ quality_gates:
     - { step: 9, gate: "With CrossPromotion unregistered, reply.enriched passes through to reply.ready unchanged (pipeline_passthrough)." }
     - { step: 10, gate: "relationship memory: recall weaves a prior topic naturally; retention_and_erasure green (opt-out + /forget erase; opted-out recall returns null)." }
     - { step: 11, gate: "repeated unanswered question increments content_gaps.asked_count and surfaces in the digest; stored question carries no asker identity." }
-    - { step: 12, gate: "dm_funnel_safety green: explicit interest only, high-engagement digest-only, owner evidence preview, one-shot approval, lead.approved sends exactly one DM, lead.rejected creates long-lived rejected_dm suppression, no-response/complaint/opt-out also suppress; no DM without approval." }
+    - { step: 12, gate: "dm_funnel_safety green: explicit interest only, high-engagement digest-only, owner evidence preview, one-shot approval, lead.approved creates one local DM outbox decision, lead.rejected creates long-lived rejected_dm suppression, no-response/complaint/opt-out also suppress; no DM without approval." }
     - { step: 13, gate: "an experiment on dimension != style (timing/activity/marketing_angle) runs through the SAME champion/challenger gate + rollback." }
     - { step: 14, gate: "onboarding wizard interviews the owner via DM, emits a valid persona + sources config that passes the Zod schema, shows a diff, and writes atomically only after owner confirm." }

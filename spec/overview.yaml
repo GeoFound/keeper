@@ -235,8 +235,8 @@ operations:
       the inbound_updates LIFECYCLE (data-model inbound_updates). The adapter CLAIMS the row as
       status='pending' before emitting message.received; the engine flips it to 'committed' only
       at the terminal idempotently-guarded outcome (a reply outbox row written, OR Intent Router
-      journaled decision.no_reply, OR Moderation claimed a moderation_actions key / reached
-      message.clean with no reactive send). DELIVERY is decided by status + the process in-flight
+      journaled decision.no_reply, OR Moderation claimed a moderation_actions key, OR the reply
+      pipeline deliberately aborted and wrote pipeline_failures). DELIVERY is decided by status + the process in-flight
       set, not a blanket stop: (1) committed -> STOP (true replay); (2) pending AND in THIS
       process's in-flight set -> STOP (concurrent duplicate); (3) otherwise — no row, or a
       pending row claimed by a prior since-crashed process -> JOURNEY. Rule 3 is what lets a
@@ -282,15 +282,21 @@ operations:
       the ONE send chokepoint, not by each producer. Multiple proactive producers (Atmosphere,
       Marketing share, Activity, Welcome) can each read consecutive_bot_messages=under-cap
       concurrently and would all fire — so the producer-side check is a cheap pre-gate only.
-      The AUTHORITATIVE check happens at dequeue in the userbot send queue (already serialized
-      for the per-account ceiling): for a PROACTIVE/non-reply kind (suppressIfKillSwitch=true),
-      it re-reads the live consecutive_bot_messages under that serialization and DROPS the send
-      (marks the outbox row 'dropped', reason=consecutive_cap) if sending it would exceed
-      max_consecutive_bot_messages without an intervening human message. A REPLY is exempt: it
-      answers a human turn that just reset the counter, so it never monologues. This makes the
-      cold_start_no_cringe invariant a hard guarantee rather than a racy best-effort.
+      The AUTHORITATIVE check happens inside the Delivery-owned dequeue transaction in the
+      userbot send queue (already serialized for the per-account ceiling). For a PROACTIVE/
+      non-reply kind (suppressIfKillSwitch=true), Delivery does NOT trust the async
+      SocialContext counter alone. It computes/reserves bot-turn capacity from durable state:
+      the channel's last_human_message_at plus outbox rows after that point whose
+      bot_turn_reserved=1 and status is pending|sending|sent|ambiguous. If sending would
+      exceed max_consecutive_bot_messages, it marks the row dropped (reason=consecutive_cap)
+      before any platform call. Otherwise it sets bot_turn_reserved=1 in the same transaction
+      that moves pending -> sending. A REPLY is exempt: it answers a human turn that just reset
+      the counter, so it never monologues. SocialContext still updates
+      channel_state.consecutive_bot_messages on reply.sent/outbound.sent as a read model for
+      /status and producer pre-gates, but the hard guarantee lives in Delivery's reservation.
+      This makes cold_start_no_cringe structural, not timing-dependent.
   retention:
-    rule: A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT member-notice rows, `kind='notice'` + `dedupe_key` prefixed `member_notice:`, the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning); owner /forget purges or anonymizes every user-scoped raw record the system owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests for that subject) plus the user's memory note, while a user's opt-out keyword stops relationship memory only (right-to-delete, tiered — see modules user_memory.privacy).
+    rule: DataLifecycleService is the sole lifecycle-delete/redaction plane. A scheduled sweep (retention.sweep_due) deletes messages older than message_retention_days, expires user_memory past its retention, prunes terminal outbox rows older than delivery.outbox_prune_after_days (idempotent_delivery.outbox_pruning — EXCEPT member-notice rows, `kind='notice'` + `dedupe_key` prefixed `member_notice:`, the durable once-ever disclosure guard, which is never pruned), prunes event_journal rows older than observability.journal_retention_days, AND prunes channel_negative_signals rows older than suppression.negative_feedback_window_minutes (the auto-quiet tally is a short rolling window — rows past it carry no live meaning). Owner /forget emits user.forget; User Memory erases its relationship-memory note/opt-out state through its own endpoint, while DataLifecycleService purges or anonymizes user-scoped raw records it is explicitly allowed to lifecycle-mutate (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject). These lifecycle deletes/redactions are the table_ownership exception; DataLifecycleService cannot perform normal business writes.
     data_layers: >-
       Privacy and traceability are separated into three layers:
         - audit skeleton: event name, time, workspaceId, correlationId, causationId,
@@ -418,9 +424,10 @@ operations:
       otherwise cause reply-to-self loops, self-moderation, and miscounted room state.
       reply.sent / outbound.sent are emitted from the SEND path (the outbox confirm), NEVER
       reconstructed from inbound, so dropping all self-account inbound loses no bot-message
-      accounting. consecutive_bot_messages is therefore driven only by real sends and reset
-      only by a non-self human message. (The control bot already emits no message.received;
-      this rule is the userbot's symmetric self-exclusion.)
+      accounting. consecutive_bot_messages is therefore a read model driven only by real sends
+      and reset only by a non-self human message; the hard proactive cap reserves bot turns
+      earlier in outbox.bot_turn_reserved so it does not wait for outbound.sent. (The control
+      bot already emits no message.received; this rule is the userbot's symmetric self-exclusion.)
     why: >-
       A userbot cannot be the control plane (you cannot DM your own account; user
       accounts have no inline buttons). Putting all admin actions on the bot keeps the
@@ -509,7 +516,7 @@ operations:
 # Build order. Implement strictly top-to-bottom; each step independently verifiable.
 # Cross-cutting infra (operations above) is folded into the steps that first need it.
 build_order:
-  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox + inbound_updates pending->committed lifecycle with restart re-drive) + cost_circuit_breaker generative-only (LLMGateway, reserve+release-on-failure; per-source ingest lane) + send_queue (unified outbound; atomic consecutive-bot cap at dequeue) + RuntimeStateService (workspace_runtime_state accessor + the single deduped out-of-band owner-alert path for runtime holds) + observability (journaling bus middleware -> event_journal with causationId + subjectUserId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
+  - { step: 1, name: Engine core,                  deliverable: "Event Bus (+ non-module producer whitelist) + Module system + config loading (+ hot-reload) + Scheduler (per-workspace tz) + idempotent_delivery (outbox + inbound_updates pending->committed lifecycle with restart re-drive, including pipeline-abort terminal commits) + cost_circuit_breaker generative-only (LLMGateway, reserve+release-on-failure; per-source ingest lane) + send_queue (unified outbound; atomic consecutive-bot cap at dequeue via outbox bot-turn reservation) + RuntimeStateService (workspace_runtime_state accessor + the single deduped out-of-band owner-alert path for runtime holds) + DataLifecycleService (retention/forget delete+redaction plane) + observability (journaling bus middleware -> event_journal with causationId + subjectUserId, structured redacted logging, and the trace/tail/inspect read interface) from day one" }
   - { step: 2, name: Telegram Dual Adapter,        deliverable: "TWO adapters: telegram-userbot (MTProto/GramJS on the owner's account, session-string auth — the SOLE inbound source; community sends + lead DMs; account_survival floor: per-account ceiling + FLOOD_WAIT obedience + warm-up + retreat) and telegram-control (Bot API/grammY, group admin — executes moderation.violation; owner DMs with inline ✅/❌/📝 buttons + /command + callback handling). Deterministic correlationId from platform message id; edits as isEdit; fetchMedia; verifyAccess per adapter (isMember/isAdmin/missingRights — NO privacy mode); outbound routed by audience (community/lead → userbot, owner → control)" }
   - { step: 3, name: Workspace Router + Knowledge RAG, deliverable: "content-isolated retrieval (ctx.knowledge) + retrieval_safety/untrusted_input + content_gap.detected; unbound-channel drop (no spend)" }
   - { step: 4, name: Persona Engine + Context Manager, deliverable: "humanized, context-coherent replies; pipeline failure_policy (abort, never half-send)" }
@@ -532,10 +539,11 @@ build_order:
 infra_service_introduction:
   - { service: EventBus + Module system + Scheduler + config loader, step: 1, note: "engine core" }
   - { service: Database + Outbox/Delivery + inbound_updates, step: 1, note: "send_queue + outbox + crash-recovery; platform SEND lands at step 2 but the outbox write path is step 1" }
+  - { service: DataLifecycleService, step: 1, note: "sole lifecycle-delete/redaction plane for retention.sweep_due and user.forget across owned tables; owners keep normal writes, lifecycle purge/redact is the only cross-owner mutation exception" }
   - { service: LLMGateway, step: 1, note: "budget reserve/release + the daily/ingest budget lanes; owns daily_budget_state/ingest_budget_state/llm_usage" }
   - { service: RuntimeStateService (ctx.runtime), step: 1, note: "sole accessor of workspace_runtime_state + the single deduped owner-alert path; the SINGLE authority for read_only/safety_hold/media_hold/degraded mode" }
   - { service: Observability (journal middleware + redaction + structured logger + trace/tail/inspect query API), step: 1, note: "owns event_journal; its query API is the only read path for /status,/why,/trace,digest" }
-  - { service: SocialContext (ctx.social), step: 1, note: "MINIMAL at step 1: maintains channel_state.consecutive_bot_messages + last_*_at from reply.sent/outbound.sent and READS channel_control — exactly what the step-1 send_queue atomic consecutive-bot cap + proactiveAllowed suppression need. EXTENDED: channel_members presence (step 5, new-user delays), full RoomRead phase/temperature/posture (step 6 Intent), proactive room-read (step 8 Atmosphere)." }
+  - { service: SocialContext (ctx.social), step: 1, note: "MINIMAL at step 1: maintains channel_state.last_*_at/consecutive_bot_messages as a read model from message.clean/reply.sent/outbound.sent and READS channel_control/account_health for RoomRead. The race-free consecutive-bot cap itself is enforced by Delivery's outbox/send_queue reservation, not by this async read model. EXTENDED: channel_members presence (step 5, new-user delays), full RoomRead phase/temperature/posture (step 6 Intent), proactive room-read (step 8 Atmosphere)." }
   - { service: MediaService (ctx.media), step: 2, note: "delegates to the userbot adapter fetchMedia; needs the adapter, so step 2" }
   - { service: KnowledgeService (ctx.knowledge), step: 3, note: "isolation-filtered RAG retrieval; owns knowledge_* tables" }
   - { service: ConversationContext (ctx.conversation) + Context Manager updater, step: 4, note: "rolling per-channel window for Persona coherence; real updates begin once message.clean flows at step 5 (step-4 tests feed the window via fixtures)" }
@@ -616,13 +624,17 @@ quality_gates:
       enforces: zero_coupling
       check: >-
         Static SQL/repository ownership gate. Every table in spec/data-model.yaml declares one
-        owner service/module. A module may write only its owned tables; reads/writes to shared
-        cross-cutting state must go through the declared service/repository (e.g. ctx.suppression
-        for member_suppression, ctx.social for channel_state/channel_members, Delivery/Outbox for
-        outbox, Approval Service for approval_items + channel_control (the owner kill-switch levers,
-        which SocialContext only READS), and the Observability query API for event_journal-derived
-        reads — /status,/why,/trace,digest compose from it, never raw event_journal SQL). Test
-        fixtures scan SQL strings/repository calls and fail on direct cross-owner mutation.
+        NORMAL writer owner service/module. A module may write only its owned tables; reads/writes
+        to shared cross-cutting state must go through the declared service/repository (e.g.
+        ctx.suppression for member_suppression, ctx.social for channel_state/channel_members,
+        Delivery/Outbox for outbox, Approval Service for approval_items + channel_control,
+        and the Observability query API for event_journal-derived reads — /status,/why,/trace/
+        digest compose from it, never raw event_journal SQL). The ONLY cross-owner write
+        exception is DataLifecycleService, whose allowed mutations are lifecycle deletes,
+        anonymization, and redaction for retention.sweep_due and user.forget, listed in
+        spec/data-model.yaml lifecycle_policies. It cannot perform normal business updates.
+        Test fixtures scan SQL strings/repository calls and fail on direct cross-owner mutation
+        outside owner repositories or those lifecycle policies.
     - id: declared_events_only
       enforces: declared-events-contract
       check: >-
@@ -694,7 +706,10 @@ quality_gates:
       check: >-
         In seed phase the bot only broadcasts (no reactive chat, no polls); a poll below
         min_participants_for_poll is refused; consecutive bot messages never exceed
-        max_consecutive_bot_messages without an intervening human message.
+        max_consecutive_bot_messages without an intervening human message. The cap test
+        fires N concurrent proactive outbox rows and asserts Delivery's dequeue transaction
+        reserves bot-turn capacity with outbox.bot_turn_reserved before platform send, so
+        async outbound.sent/SocialContext lag cannot overshoot the cap.
     - id: persona_transparency_boundary
       enforces: persona-boundary
       check: >-
@@ -769,8 +784,11 @@ quality_gates:
         outbox row exists; on restart the pending inbound is re-driven from its messages row ->
         processed EXACTLY ONCE. CRASH-BEFORE-ROUTING: kill before the messages row is written,
         then deliver the platform replay; it re-journeys via the not-in-flight rule and is
-        processed EXACTLY ONCE. Neither path loses the message nor creates a second engine send decision — the gap the
-        old blanket-stop guard left open, closed without deadlock.
+        processed EXACTLY ONCE. PIPELINE-ABORT: after reply.needed but before any outbox row,
+        inject a Persona error/timeout/hang; assert pipeline_failures is written and the inbound
+        row is committed so restart does not later send a stale reply. Neither path loses the
+        message nor creates a second engine send decision — the gap the old blanket-stop guard
+        left open, closed without deadlock.
     - id: cost_breaker_reserve
       enforces: cost-bound
       check: >-
@@ -838,11 +856,13 @@ quality_gates:
     - id: retention_and_erasure
       enforces: privacy
       check: >-
-        Retention sweep deletes messages past message_retention_days and expires user_memory;
-        the opt-out keyword erases a user's note + stops collection (raw messages still age out);
-        owner /forget ALSO purges/anonymizes that user's rows from messages, command_attempts,
-        leads, moderation target ids where legally safe, and event_journal payload digests (full
-        erasure without destroying the audit skeleton); recall on an opted-out user returns null.
+        DataLifecycleService runs retention.sweep_due and user.forget lifecycle policies: retention
+        deletes/prunes only the rows declared in data-model.lifecycle_policies, while normal table
+        owners keep normal writes. The opt-out keyword erases a user's note + stops collection
+        (raw messages still age out); owner /forget ALSO purges/anonymizes/redacts that user's rows
+        from messages, command_attempts, leads, moderation target ids where legally safe, and
+        event_journal payload digests/reasons (full erasure without destroying the audit skeleton);
+        recall on an opted-out user returns null.
         With privacy.member_notice on, a one-time + pinned notice is posted.
     - id: journal_privacy_layers
       enforces: privacy-observability-split
@@ -946,9 +966,10 @@ quality_gates:
       enforces: pipeline-failure
       check: >-
         Inject a throw / timeout in a non-head stage (e.g. Persona): assert the chain aborts for that
-        correlationId — no out-event, no half-built draft delivered — and the failure is logged; assert it
-        is NOT silently forwarded as passthrough. (A stage that HANGS without throwing is covered by the
-        pipeline_watchdog gate.)
+        correlationId — no out-event, no half-built draft delivered — and the failure is logged in
+        pipeline_failures; assert it is NOT silently forwarded as passthrough. The originating
+        inbound_updates row is committed on that failure terminal so a restart does not re-drive a
+        stale reply. (A stage that HANGS without throwing is covered by the pipeline_watchdog gate.)
     - id: outbox_crash_safety
       enforces: idempotency
       check: >-

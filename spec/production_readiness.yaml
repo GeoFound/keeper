@@ -13,10 +13,14 @@ meta:
     A "production launch" claim is valid only when every gate below is green with
     evidence. Until then the honest status is "functional MVP", stated as such.
   scaling_note: >-
-    The $5 single-node SQLite default is the DEV/SMALL floor, not the ceiling. The
-    tech_stack `alt:` entries (Postgres, Chroma/Qdrant, BullMQ) are the documented
-    scale-out path; these gates assume the system may be moved off single-node, and
-    the core modules must not assume otherwise.
+    The current functional architecture is explicitly single-node SQLite-first. That is the
+    DEV/SMALL production floor, not a bug. The tech_stack `alt:` entries (Postgres,
+    Chroma/Qdrant, BullMQ) are the documented scale-out path, but scale-out is a separate
+    migration: process-local coordination points such as the reply in-flight supervisor,
+    send-queue serialization, account ceilings, and any in-memory recent-message indexes must
+    be replaced by durable/shared coordinators before running multiple workers. Core domain
+    modules should avoid unnecessary host-local assumptions, but production_readiness does not
+    claim multi-node safety until that migration is explicitly completed.
 
 gates:
   - id: observability

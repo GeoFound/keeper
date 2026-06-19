@@ -82,7 +82,8 @@ data_model:
       -- reaches its terminal, idempotently-guarded outcome — i.e. once EVERY non-idempotent side
       -- effect is either done-and-guarded or decided-not-to-happen: a reply outbox row was written
       -- (reply:<correlationId>), OR Intent Router journaled decision.no_reply, OR Moderation
-      -- claimed a moderation_actions.action_key / reached message.clean with no reactive send.
+      -- claimed a moderation_actions.action_key, OR the reply pipeline wrote a pipeline_failures
+      -- row (error/timeout/hang_aborted) and intentionally abandoned the reply.
       -- RESTART RE-DRIVE (covers a crash where the platform does NOT redeliver): on startup the
       -- engine scans inbound_updates WHERE status='pending' AND received_at within
       -- reply.max_staleness + margin, and for those that HAVE a persisted `messages` row RE-DRIVES
@@ -234,7 +235,7 @@ data_model:
       CREATE TABLE approval_items (
         item_ref TEXT PRIMARY KEY,                  -- callback_data / #id token
         workspace_id TEXT NOT NULL,
-        type TEXT NOT NULL,                        -- moderation|activity|lead|evolution|onboarding|cross_promo
+        type TEXT NOT NULL,                        -- coarse queue bucket: moderation|activity|lead|evolution|onboarding|cross_promo. Fine-grained kind lives in payload_json and ApprovalDecision.type (e.g. moderation_mute/moderation_ban -> moderation); item_ref joins them.
         source_event_id TEXT,
         source_correlation_id TEXT,
         status TEXT DEFAULT 'pending',             -- pending|approved|rejected|amended|expired|cancelled
@@ -700,8 +701,8 @@ data_model:
       -- remote outcomes and become 'ambiguous' on Telegram unless platform-specific
       -- reconciliation proves otherwise. The engine never blindly retries an unknown remote
       -- send; ambiguity is surfaced to owner trace/status/digest.
-      -- PRUNING: terminal rows older than delivery.outbox_prune_after_days are swept
-      -- (idempotent_delivery.outbox_pruning), EXCEPT member-notice rows
+      -- PRUNING/DELETION: terminal rows older than delivery.outbox_prune_after_days are swept
+      -- by DataLifecycleService under lifecycle_policies below, EXCEPT member-notice rows
       -- (kind='notice' AND dedupe_key prefixed `member_notice:`) — the once-ever pinned
       -- disclosure, whose row is the durable per-channel "already disclosed" guard a future
       -- member.joined can still reference, so it is NEVER pruned. System notices use
@@ -717,6 +718,8 @@ data_model:
         kind TEXT NOT NULL,                      -- reply|proactive_post|welcome|activity|digest|dm|notice
         payload_json TEXT NOT NULL,              -- serialized OutgoingMessage; no secrets or media bytes; pruned with terminal rows
         suppress_if_kill_switch BOOLEAN DEFAULT TRUE,
+        bot_turn_reserved BOOLEAN DEFAULT FALSE,  -- set by Delivery in the dequeue txn for proactive/non-reply userbot sends that count toward max_consecutive_bot_messages; this, not the async SocialContext counter, is the hard cap ledger
+        bot_turn_reserved_at DATETIME,            -- compared with channel_state.last_human_message_at when counting reserved bot turns
         ambiguity_policy TEXT DEFAULT 'at_most_once', -- at_most_once|retry_safe_duplicate
         post_send_actions_json TEXT,             -- e.g. {"pin":true} for member notice; executed after sent
         post_send_status_json TEXT,              -- per-action status/error, redacted
@@ -731,6 +734,8 @@ data_model:
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         sent_at DATETIME
       );
+      CREATE INDEX ix_outbox_bot_turns
+        ON outbox (channel_id, bot_turn_reserved, bot_turn_reserved_at, status);
     platform_actions: |
       -- Execute-once ledger for non-send platform actions owned by Delivery/Platform infra,
       -- currently the member-notice post-send pin. It is deliberately separate from
@@ -866,6 +871,23 @@ data_model:
         reason TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE UNIQUE INDEX ux_pipeline_failures_once
+        ON pipeline_failures (correlation_id, stage, kind);
+  lifecycle_policies:
+    # DataLifecycleService is the ONLY cross-owner lifecycle mutation plane. It may perform
+    # only these deletes/anonymizations/redactions; normal inserts/updates remain with the table owner.
+    retention_sweep:
+      messages: "delete rows older than workspaces.privacy.message_retention_days"
+      user_memory: "expire notes older than user_memory.retention_days"
+      outbox: "prune terminal sent/dropped/failed/ambiguous rows older than delivery.outbox_prune_after_days, excluding member_notice:*"
+      event_journal: "prune rows older than observability.journal_retention_days"
+      channel_negative_signals: "prune rows older than suppression.negative_feedback_window_minutes"
+    user_forget:
+      messages: "delete rows for subject actor_uid"
+      command_attempts: "delete/anonymize rows for subject actor_uid"
+      leads: "delete/anonymize rows for subject actor_uid"
+      moderation_actions: "redact target_user_id where legally safe; retain audit skeleton for owner-visible enforcement history"
+      event_journal: "redact payload_digest/reason for subject_user_id and set redacted_at; retain audit skeleton"
   ownership:
     # Enforced by overview.yaml quality_gates.architecture.table_ownership.
     # "owner" is the only writer. Other modules read through owner-provided services/repos.

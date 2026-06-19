@@ -33,7 +33,7 @@ events:
       - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY inbound journey — it is the SOLE resolver of channelId -> workspace for EVERY raw adapter channel signal: it copies the resolved workspaceId onto message.routed (from message.received) AND onto member.joined / member.left / reaction.received (from the raw inbound.member_joined / inbound.member_left / inbound.reaction), then every downstream stage propagates it unchanged. The adapter stays workspace-unaware; an unbound channel is dropped at the router for member/reaction signals exactly as for messages (no member.*/reaction.received re-emit, no channel_members write). Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved/*.rejected, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
       - A FIXED set of RAW adapter events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: the userbot's pre-routing channel signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction (workspace not yet routed — the Workspace Router resolves them) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). These events still MUST carry subjectUserId when the sender/actor is known (message sender, joined/left user, reacting user, owner actor), and the journal middleware records only a skeleton digest while workspaceId is empty. EVERY other workspace-scoped event — INCLUDING the resolved member.joined / member.left / reaction.received — MUST carry a non-empty workspaceId.
       - A SMALL fixed set of SOURCE-SCOPED infra events is NOT workspace-scoped at all: knowledge.sync_due and knowledge.updated operate on a content SOURCE that may be bound to MANY workspaces (and a sync may belong to none yet), so a single workspaceId is meaningless for them. They carry an EMPTY workspaceId and MUST instead carry a non-empty sourceId in their payload (ScheduledTick.sourceId for knowledge.sync_due — the Scheduler fires one tick PER SOURCE on that source's own interval; KnowledgeDelta.sourceId for knowledge.updated). Isolation for these is enforced downstream at RAG QUERY time by the source_id filter (see knowledge.yaml content_isolation), never by the envelope. This is the ONLY non-workspace, non-`__system__` scope class; every other event still requires a non-empty workspaceId. (The envelope_conformance gate asserts a source-scoped event with empty sourceId is rejected.)
-      - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved OR that span all workspaces (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures, and the account-wide RuntimeStateService alerts whose scope is the account, not one workspace — invalid_session, account retreat). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emissions are outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false) with a `system_notice:*` dedupeKey (this includes RuntimeStateService account/adapter-auth alerts keyed `system_notice:runtime:*`); unlike member_notice rows, these prune normally. A RuntimeStateService alert for a KNOWN workspace (read_only/safety_hold/media_hold/degraded-channel) instead carries that non-empty workspaceId, not `__system__`.
+      - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved OR that span all workspaces (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures, and the account-wide RuntimeStateService alerts whose scope is the account, not one workspace — invalid_session, account retreat). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emissions are outbound.requested(kind:'notice', audience:'owner', suppressIfKillSwitch=false) with a `system_notice:*` dedupeKey (this includes RuntimeStateService account/adapter-auth alerts keyed `system_notice:runtime:*`); unlike member_notice rows, these prune normally. A RuntimeStateService alert for a KNOWN workspace (read_only/safety_hold/media_hold/degraded-channel) instead carries that non-empty workspaceId, not `__system__`.
       - A consumer MUST ignore an event whose version it does not understand (forward-compatible).
       - |
         Most producers are registered Modules whose subscribesTo/publishes are asserted by
@@ -62,7 +62,7 @@ events:
               in-event to its out-event unchanged (see reply_pipeline.absent_stage_bridge).
               This is how reply.ready is emitted when Cross-Promotion is absent — NOT by Marketing.
           (e) RuntimeStateService (workspace_runtime_state accessor) — emits outbound.requested
-              (kind:'notice', via:'control', suppressIfKillSwitch=false) ONCE per durable runtime
+              (kind:'notice', audience:'owner', suppressIfKillSwitch=false) ONCE per durable runtime
               hold on its no-row -> active transition (the single out-of-band owner-alert path for
               read_only / safety_hold / media_hold / degraded / missing_rights / invalid_session /
               account retreat; deduped by the hold's UNIQUE key so a flapping condition can't spam
@@ -84,10 +84,19 @@ events:
               reaction.received to detect the two always-available complaint signals (complaint/
               opt-out phrases on message.clean, and a negative emoji — config
               negative_reaction_emojis — on a tracked bot message on reaction.received) and call
-              recordNegativeSignal. It only writes member_suppression (per-user opt-outs) and
-              channel_negative_signals (the per-(workspace,channel) windowed tally SocialContext
-              reads for auto-quiet posture); it never re-emits a bus event. See contracts
-              SuppressionService.
+              recordNegativeSignal. It ALSO consumes reply.sent + outbound.sent to maintain a
+              BOUNDED in-memory recent-bot-message index (window = negative_feedback_window_minutes)
+              so it can tell whether a reaction.received targets one of the bot's own messages —
+              without reading the Evolution-owned reply_feedback or the Delivery-owned outbox
+              (no cross-owner read; see contracts SuppressionService BOT-MESSAGE IDENTITY). It only
+              writes member_suppression (per-user opt-outs) and channel_negative_signals (the
+              per-(workspace,channel) windowed tally SocialContext reads for auto-quiet posture); it
+              never re-emits a bus event. See contracts SuppressionService.
+          (j) Platform Adapter / Delivery — the CONSUMER side of the adapter (it is also a PRODUCER
+              in (a)): consumes reply.generated and outbound.requested (enqueues to the outbox +
+              send_queue, routes by audience) and the control-bot adapter consumes
+              moderation.violation (the group-admin executor). Enumerated here so declared_events_only
+              covers the adapter's consumed events too, not just its produced ones.
         These are infra, not peer modules; no module imports them.
       - An EDITED inbound message is NOT a new event name: the Platform Adapter re-emits message.received with UnifiedMessage.isEdit=true (and editOf set), so an edit flows the SAME route (Workspace Router -> Moderation) and is RE-MODERATED. Downstream reactive stages MUST NOT treat an edit as a fresh trigger (Intent Router never replies to an edit); the Context Manager updates the edited turn in place.
       - SELF-INGEST EXCLUSION: the USERBOT adapter never emits message.received / inbound.member_* / inbound.reaction for an update whose sender is its OWN account (the bot's automated sends OR the owner's manual messages on that same account). It drops them before emit (overview operations.dual_identity.self_ingest_filter). bot-message accounting comes only from reply.sent/outbound.sent on the send path, never reconstructed from inbound — so the drop loses nothing.
@@ -124,10 +133,10 @@ events:
     - { event: reply.enriched,               version: 1, publisher: Marketing Engine,                consumers: [Cross-Promotion],                                                   payload: ReplyDraft }
     - { event: reply.ready,                  version: 1, publisher: "Cross-Promotion (or the ENGINE PIPELINE BRIDGE when Cross-Promotion is unregistered — see reply_pipeline.absent_stage_bridge; never the Marketing module)", consumers: [Persona Engine], payload: ReplyDraft }
     - { event: reply.generated,              version: 1, publisher: Persona Engine,                  consumers: [Platform Adapter],                                                  payload: ReplyDraft }
-    - { event: reply.sent,                   version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Funnel, SocialContext (channel_state updater)],   payload: ReplySent }
+    - { event: reply.sent,                   version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Funnel, SocialContext (channel_state updater), SuppressionService (member_suppression accessor)],   payload: ReplySent }   # SuppressionService records the bot (channel,bot_message_id) into its bounded recent-bot-message index so a later reaction.received can be classified as targeting a bot message
     # --- unified outbound (ALL non-reply sends go through here -> send_queue + outbox; see overview operations) ---
     - { event: outbound.requested,           version: 1, publisher: "Workspace Router (system notices) / Welcome / Atmosphere Initiator / Activity Executor / Marketing (proactive_share) / Approval Service (digest+DM) / Funnel / Onboarding / RuntimeStateService (runtime-hold + account-retreat owner alerts)", consumers: ["Platform Adapter (ROUTED by audience: owner→control bot, community+lead→userbot)"], payload: OutboundMessage }   # proactive/broadcast/DM/notice; routed adapter de-dups via outbox + obeys kill switch
-    - { event: outbound.sent,                version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Activity Planner, Funnel, SocialContext (channel_state updater)],           payload: OutboundSent }     # proactive sends feed timing/activity evolution + consecutive-bot-message guard; Activity Planner stamps activities.executed_at (kind:'activity'); Funnel stamps leads.dm_sent_at (kind:'dm' to the lead) — each filters to its OWN dedupeKeys/kinds
+    - { event: outbound.sent,                version: 1, publisher: Platform Adapter,                consumers: [Evolution Tracker, Activity Planner, Funnel, SocialContext (channel_state updater), SuppressionService (member_suppression accessor)],           payload: OutboundSent }     # proactive sends feed timing/activity evolution + consecutive-bot-message guard; Activity Planner stamps activities.executed_at (kind:'activity'); Funnel stamps leads.dm_sent_at (kind:'dm' to the lead) — each filters to its OWN dedupeKeys/kinds; SuppressionService records the bot message id into its recent-bot-message index (same as reply.sent)
     # --- proactive / operations ---
     - { event: atmosphere.cold,              version: 1, publisher: Atmosphere Monitor,              consumers: [Initiator],                                                         payload: AtmosphereState }
     - { event: activity.proposed,            version: 1, publisher: Activity Planner,                consumers: [Approval Service],                                                  payload: ActivityProposal }
@@ -199,12 +208,16 @@ events:
       // kill switch + lifecycle gates before sending.
       interface OutboundMessage {
         kind: 'proactive_post' | 'welcome' | 'activity' | 'digest' | 'dm' | 'notice';
-        via: 'userbot' | 'control';    // ROUTING: which Telegram identity sends this.
-                                        //   owner-facing (digest, approval items, /status, /why, owner DM) -> 'control'
-                                        //   community + lead-facing (proactive_post, welcome, activity, notice,
-                                        //   funnel DM to a LEAD) -> 'userbot' (the persona). Set by the producer;
-                                        //   the engine asserts owner-recipient kinds are never 'userbot'. System
-                                        //   notices (workspaceId='__system__') are always owner-facing via 'control'.
+        audience: 'community' | 'lead' | 'owner';  // PLATFORM-AGNOSTIC routing intent (the bus
+                                        //   contract stays platform-unaware — no Telegram identity leaks here).
+                                        //   owner  (digest, approval items, /status, /why, owner DM, system notices) — set by the producer.
+                                        //   community (proactive_post, welcome, activity, member notice) — the persona, in-channel.
+                                        //   lead   (funnel DM to a LEAD) — the persona, 1:1.
+                                        //   The platforms/outbound-router maps audience -> the platform's send IDENTITY and
+                                        //   stores the RESOLVED transport on outbox.via: on Telegram owner->control bot,
+                                        //   community/lead->userbot; a single-identity platform (e.g. Discord) maps all to its one sender.
+                                        //   The engine asserts an owner-recipient kind (digest/owner DM/approval) carries audience:'owner';
+                                        //   System notices (workspaceId='__system__') are always audience:'owner'.
         channelId?: string;            // target channel (omit for a DM)
         dmUserId?: string;             // set for kind:'dm'/'digest' to the owner (via control) or a lead (via userbot)
         content: OutgoingMessage;      // text (+ optional poll/media/buttons), already humanized by the producer
@@ -408,11 +421,13 @@ reply_pipeline:
                                                // when no STYLE experiment is running (treated as 'champion').
       text?: string;                           // final reply text, set by Persona only
     }
-  stages:   # fixed order; each consumes the previous event, emits the next
-    - { order: 1, module: Intent Router,   in: message.clean,  out: reply.needed,    owns: "intent + reply decision (chain head; may decline)" }
-    - { order: 2, module: Marketing,       in: reply.needed,   out: reply.enriched,  owns: "marketing field (passthrough when off/irrelevant/rate-limited)" }
-    - { order: 3, module: Cross-Promotion, in: reply.enriched, out: reply.ready,     owns: "crossPromo field (passthrough when module absent — default)" }
-    - { order: 4, module: Persona,         in: reply.ready,    out: reply.generated, owns: "text (assemble prompt, call LLM, humanize)" }
+  stages:   # fixed order; each consumes the previous event, emits the next.
+            # optional=false: a missing module is a production startup error (never bridged).
+            # optional=true:  a missing module is bridged by the engine (forward in->out unchanged).
+    - { order: 1, module: Intent Router,   optional: false, in: message.clean,  out: reply.needed,    owns: "intent + reply decision (chain head; may decline)" }
+    - { order: 2, module: Marketing,       optional: false, in: reply.needed,   out: reply.enriched,  owns: "marketing field (passthrough when off/irrelevant/rate-limited)" }
+    - { order: 3, module: Cross-Promotion, optional: true,  in: reply.enriched, out: reply.ready,     owns: "crossPromo field (passthrough when flag off; engine-bridged when module unregistered — default)" }
+    - { order: 4, module: Persona,         optional: false, in: reply.ready,    out: reply.generated, owns: "text (assemble prompt, call LLM, humanize)" }
   passthrough_rule: >-
     Every stage except the head MUST emit its out-event even when it has nothing
     to add: it forwards the same ReplyDraft (its owned field left null/false).
@@ -430,16 +445,29 @@ reply_pipeline:
     passthrough_rule covers a REGISTERED stage whose feature flag is OFF (it emits its
     own out-event). A stage whose MODULE IS NOT REGISTERED AT ALL (an optional/`future`
     stage — Cross-Promotion is the only current case) has no module to emit anything. The
-    ENGINE handles this from the stages table: at startup, for any stage whose module is
-    absent, it installs a built-in BRIDGE that subscribes the stage's in-event and re-emits
-    the unchanged envelope as the stage's out-event (its owned field left null). This is
+    ENGINE handles this from the stages table, BUT ONLY for stages marked optional:true: at
+    startup, for any OPTIONAL stage whose module is absent, it installs a built-in BRIDGE that
+    subscribes the stage's in-event and re-emits the unchanged envelope as the stage's out-event
+    (its owned field left null). An absent MANDATORY stage (optional:false — Intent Router,
+    Marketing, Persona) is NOT bridged: it is a PRODUCTION STARTUP ERROR, so a misconfigured
+    deploy can never silently drop intent/enrichment/humanization. This is
     engine infrastructure (whitelisted producer — see envelope.rules), NOT a module, so no
     module ever emits an event outside its declared set. This is precisely how reply.ready
     is produced when Cross-Promotion is unregistered; the Marketing module's PIPELINE output
     stays reply.enriched only — it NEVER emits reply.ready (its publishes are [reply.enriched,
     outbound.requested]; outbound.requested is its separate proactive_share path, never the
     pipeline out-event). Gate: pipeline_passthrough (which now asserts BOTH the flag-off
-    passthrough AND the unregistered-stage bridge).
+    passthrough AND the unregistered-OPTIONAL-stage bridge).
+  incremental_build_note: >-
+    During the build_order, the MANDATORY pipeline stages arrive across steps — Persona (step 4),
+    Intent Router (step 6), Marketing (step 8) — so the chain is not wired end-to-end until step 8
+    (Marketing is the last mandatory stage to register). This is intentional, not a gap: each step
+    verifies its stage in isolation by feeding the stage's in-event (step 4 feeds reply.ready, step 6
+    asserts reply.needed emission, etc.), and the walking skeleton's reactive reply uses a hardcoded
+    Echo responder, NOT the real pipeline (see acceptance.yaml step 1 walking_skeleton). The
+    "missing mandatory stage = startup error" assertion above is therefore RELAXED in dev/test
+    partial builds and enforced only at a production start. End-to-end reactive reply is a step-8
+    milestone.
   failure_policy: >-
     passthrough covers a DISABLED stage; this covers a stage that THROWS or TIMES
     OUT (e.g. Persona's LLM call fails). A stage MUST wrap its work: on error or on
@@ -515,7 +543,7 @@ flows:
       can never bypass them. No module owns a send path.
     steps:
       - "Producer (Welcome / Atmosphere Initiator / Activity Executor / Marketing proactive_share / Approval Service / Funnel / Onboarding): compose + humanize text -> emit outbound.requested (with dedupeKey, notBefore, suppressIfKillSwitch, ambiguityPolicy, and optional postSend.pin for the member notice)"
-      - "Delivery/Platform Adapter (selected by OutboundMessage.via — userbot for community/lead, control bot for owner): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, ambiguityPolicy, postSend actions, and correlationId (when a send has no inbound cause, a synthetic `corr:<kind>:<dedupeKey>` is used so the proactive send is still traceable via `just trace`). If dedupeKey already exists, drop (no second engine decision). If suppressIfKillSwitch and NOT RoomRead.proactiveAllowed (so /pause + account RETREAT via posture==stay_silent, OR /quiet via proactive_paused_until — see contracts RoomRead), mark dropped BEFORE any platform call. For a PROACTIVE/non-reply kind, the dequeue ALSO re-reads the live consecutive_bot_messages under the send queue's serialization and marks the row dropped (reason=consecutive_cap) if sending would exceed max_consecutive_bot_messages without an intervening human message — the ATOMIC enforcement of the 'never talk to itself' cap (overview send_queue.consecutive_bot_cap_enforcement); a reply is exempt. Honor notBefore; when the platform call is about to start, move pending -> sending with a lease. On confirm, mark sent with platform_message_id and emit outbound.sent. On restart, pending rows may send; expired sending rows become ambiguous on Telegram unless reconciled — no blind retry. If postSend.pin is set, the delivery service claims platform_actions(action_key=`plat:<dedupeKey>:pin`) and asks the CONTROL BOT to pin the sent message, then records post-send status; missing pin rights are a go-live/runtime hold, not a silent degrade."
+      - "Delivery/Platform Adapter (the outbound-router maps OutboundMessage.audience -> identity — community/lead→userbot, owner→control bot — and stores the resolved transport on outbox.via): atomically INSERT the kind-namespaced outbox row as pending BEFORE any platform call, including the resolved via/platform, serialized OutgoingMessage payload, notBefore, suppressIfKillSwitch, trigger_at, ambiguityPolicy, postSend actions, and correlationId (when a send has no inbound cause, a synthetic `corr:<kind>:<dedupeKey>` is used so the proactive send is still traceable via `just trace`). If dedupeKey already exists, drop (no second engine decision). If suppressIfKillSwitch and NOT RoomRead.proactiveAllowed (so /pause + account RETREAT via posture==stay_silent, OR /quiet via proactive_paused_until — see contracts RoomRead), mark dropped BEFORE any platform call. For a PROACTIVE/non-reply kind, the dequeue ALSO re-reads the live consecutive_bot_messages under the send queue's serialization and marks the row dropped (reason=consecutive_cap) if sending would exceed max_consecutive_bot_messages without an intervening human message — the ATOMIC enforcement of the 'never talk to itself' cap (overview send_queue.consecutive_bot_cap_enforcement); a reply is exempt. Honor notBefore; when the platform call is about to start, move pending -> sending with a lease. On confirm, mark sent with platform_message_id and emit outbound.sent. On restart, pending rows may send; expired sending rows become ambiguous on Telegram unless reconciled — no blind retry. If postSend.pin is set, the delivery service claims platform_actions(action_key=`plat:<dedupeKey>:pin`) and asks the CONTROL BOT to pin the sent message, then records post-send status; missing pin rights are a go-live/runtime hold, not a silent degrade."
       - "SocialContext updater: on outbound.sent bump last_bot_message_at + consecutive_bot_messages; Evolution Tracker records proactive sends for timing/activity feedback"
   control_plane_ingress:   # how owner input reaches the bot — the single authenticated edge
     note: >-
@@ -528,8 +556,8 @@ flows:
       - "CONTROL BOT adapter: receive owner DM / inline-button callback -> verify senderId == owner user_id (else drop) -> emit control.owner_action (workspaceId may be empty; correlationId from the control message/callback id)"
       - "Approval Service: dispatch by kind —
           decision(✅/❌/📝): match itemRef to a pending item (callback_data first, else reply-to/#id), resolve its workspaceId, emit the item's decision event (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided, lead.approved/rejected, or moderation.violation(approved) for an L1 mute/ban);
-          command('/pause'|'/quiet'|'/resume'): write channel_state.paused_until / proactive_paused_until (the kill switch — the one control-owned write to channel_state, read by SocialContext for posture);
-          command('/status'|'/why'|'/trace'): compose from the event_journal (+ read-models) -> outbound.requested(kind:'dm', via:'control');
+          command('/pause'|'/quiet'|'/resume'): write channel_control.paused_until / proactive_paused_until (the kill switch — Approval's OWN channel_control table, NOT channel_state; read by SocialContext for posture);
+          command('/status'|'/why'|'/trace'): compose from the Observability query API (event_journal-derived) + read-models via their owning services -> outbound.requested(kind:'dm', audience:'owner');
           command('/forget <user|me>'): resolve userId+workspaceId -> emit user.forget;
           command('/setup') or text during an active session: emit onboarding.input(start|answer); a confirm decision on the onboarding draft -> onboarding.input(confirm)"
       - "Target consumer acts: Platform Adapter executes an approved moderation.violation; Funnel sends an approved lead DM; User Memory + Database service erase on user.forget; Onboarding Wizard advances its interview on onboarding.input"

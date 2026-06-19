@@ -98,7 +98,7 @@ tech_stack:
 # Cross-cutting operational policy. Not a feature — the floor every feature stands on.
 operations:
   cost_circuit_breaker:
-    rule: LLMGateway atomically reserves against the scoped budget state BEFORE each call (daily_budget_state for workspace lanes, ingest_budget_state for source ingest). Over budget -> trip to READ-ONLY / safety hold / source ingest pause as appropriate and notify the owner. `llm_usage` is the audit ledger, not the concurrency guard. Resets next day in the lane's day basis (workspace timezone for workspace lanes, server day for source ingest).
+    rule: LLMGateway atomically reserves against the scoped budget state BEFORE each call (daily_budget_state for workspace lanes, ingest_budget_state for source ingest). Over budget -> trip to READ-ONLY / safety hold / source ingest pause as appropriate and notify the owner. `llm_usage` is the audit ledger, not the concurrency guard. Resets next day in the lane's day basis (workspace timezone for workspace lanes, server day for source ingest). SINGLE MODE AUTHORITY — the read_only/safety_hold/media_hold MODE is recorded ONLY in workspace_runtime_state via ctx.runtime.enter(mode, until=end-of-workspace-day) on the exhaustion transition (the RuntimeStateService owns it + emits the one deduped owner alert); daily_budget_state holds pure accounting and NO mode flag, and the reserve simply failing is the hot-path enforcement. The "reset next day" is then mechanical — the runtime row auto-expires at its `until` and the fresh zeroed day row lets reserves succeed again (no second source of truth to clear).
     reserve_not_check: >-
       The check is a RESERVE, not a bare read. Concurrent generative calls each
       atomically reserve their estimated cost against the day's remaining budget in
@@ -349,9 +349,9 @@ operations:
   owner_control_supremacy:
     rule: >-
       The owner has TWO levers, deliberately distinct, both read through the single
-      room-read gate. /pause (channel_state.paused_until) forces RoomRead.posture ==
+      room-read gate. /pause (channel_control.paused_until) forces RoomRead.posture ==
       stay_silent, overriding EVERY proactive AND reactive path. /quiet
-      (channel_state.proactive_paused_until) is narrower: it sets RoomRead.proactiveAllowed
+      (channel_control.proactive_paused_until) is narrower: it sets RoomRead.proactiveAllowed
       = false WITHOUT changing posture, so it gags every PROACTIVE path while reactive
       replies and moderation keep running (proactive-only). proactiveAllowed is false
       whenever posture==stay_silent OR proactive_paused_until is in the future, so /pause,
@@ -382,7 +382,7 @@ operations:
     alerting: >-
       enter() is idempotent on the row's UNIQUE (workspace_id, scope_type, scope_id, mode, reason);
       ONLY a no-active-row -> active transition emits EXACTLY ONE owner alert via
-      outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false,
+      outbound.requested(kind:'notice', audience:'owner', suppressIfKillSwitch=false,
       dedupeKey=`system_notice:runtime:<id>`) — so a flapping condition cannot spam the owner, and
       the daily digest separately rolls up still-active rows (ctx.runtime.active()). The alert's
       workspaceId is the affected workspace when known, else the reserved `__system__` scope for
@@ -524,6 +524,25 @@ build_order:
   - { step: 13, name: Evolution multi-dimension,   deliverable: "experiments on timing / activity type / marketing angle, same gating" }
   - { step: 14, name: Owner Onboarding Wizard,     deliverable: "bot interviews owner via DM -> generates persona + sources config" }
 
+# Infra read-model / cross-cutting SERVICES are not in build_order above (that lists feature
+# MODULES). But modules depend on them, sometimes BEFORE the service's "natural" feature step, so
+# each service's EARLIEST introduction step is pinned here (introduced MINIMALLY when first needed,
+# then extended as more consumers arrive — never back-loaded). These are constructed engine wiring
+# / ctx.* services, not registered peer modules (see contracts registration_example).
+infra_service_introduction:
+  - { service: EventBus + Module system + Scheduler + config loader, step: 1, note: "engine core" }
+  - { service: Database + Outbox/Delivery + inbound_updates, step: 1, note: "send_queue + outbox + crash-recovery; platform SEND lands at step 2 but the outbox write path is step 1" }
+  - { service: LLMGateway, step: 1, note: "budget reserve/release + the daily/ingest budget lanes; owns daily_budget_state/ingest_budget_state/llm_usage" }
+  - { service: RuntimeStateService (ctx.runtime), step: 1, note: "sole accessor of workspace_runtime_state + the single deduped owner-alert path; the SINGLE authority for read_only/safety_hold/media_hold/degraded mode" }
+  - { service: Observability (journal middleware + redaction + structured logger + trace/tail/inspect query API), step: 1, note: "owns event_journal; its query API is the only read path for /status,/why,/trace,digest" }
+  - { service: SocialContext (ctx.social), step: 1, note: "MINIMAL at step 1: maintains channel_state.consecutive_bot_messages + last_*_at from reply.sent/outbound.sent and READS channel_control — exactly what the step-1 send_queue atomic consecutive-bot cap + proactiveAllowed suppression need. EXTENDED: channel_members presence (step 5, new-user delays), full RoomRead phase/temperature/posture (step 6 Intent), proactive room-read (step 8 Atmosphere)." }
+  - { service: MediaService (ctx.media), step: 2, note: "delegates to the userbot adapter fetchMedia; needs the adapter, so step 2" }
+  - { service: KnowledgeService (ctx.knowledge), step: 3, note: "isolation-filtered RAG retrieval; owns knowledge_* tables" }
+  - { service: ConversationContext (ctx.conversation) + Context Manager updater, step: 4, note: "rolling per-channel window for Persona coherence; real updates begin once message.clean flows at step 5 (step-4 tests feed the window via fixtures)" }
+  - { service: StyleService (ctx.styling), step: 4, note: "STYLE-arm assignment; returns 'champion' + live STYLE prompt until Evolution creates an experiment at step 8 (reads Evolution-owned evolution_experiments, empty until then)" }
+  - { service: SuppressionService (ctx.suppression), step: 6, note: "member_suppression + channel_negative_signals accessor + complaint-signal recorder; first needed by Intent Router opt-out phrases + the complaint loop. Consumes message.clean/reaction.received/reply.sent/outbound.sent." }
+  - { service: AccountSurvival, step: 2, note: "owns account_health (per-account ceiling/warm-up/FLOOD_WAIT/retreat) for the userbot; folds RETREAT into posture via account_health.retreat_until read by SocialContext" }
+
 # Architecture invariants (acceptance gates). A change is wrong if it violates any.
 # Each invariant maps to an automated check in `quality_gates` below — these are
 # enforced by CI, not by good intentions.
@@ -536,6 +555,7 @@ invariants:
   - Runtime identity is platform-scoped. Native platform ids are accepted only at adapter/config edges; core storage, read-models, and suppression/memory keys use canonical `channel_uid=<platform>:<nativeChannelId>` and `actor_uid=<platform>:<nativeUserId>` (or explicit `(platform, native_id)` columns). A bare Telegram chat/user id must never be used as a cross-platform key.
   - Every emitted event carries the standard envelope (non-empty correlationId, and non-empty workspaceId for every event except (a) the resolved-later RAW adapter signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction, and control.owner_action — all resolved by the Workspace Router (member/reaction/message) or the Approval Service (owner action), so their workspace-stamped re-emissions (message.routed, member.joined, member.left, reaction.received) DO carry a non-empty workspaceId; and (b) the source-scoped content-sync events knowledge.sync_due and knowledge.updated, which operate on a content SOURCE that may fan out to many workspaces and instead carry a non-empty payload sourceId — isolation for these is enforced downstream by the RAG source_id filter, never by the envelope) and a payload that validates against its declared schema.
   - Every reply-pipeline stage passes through (emits its output event) when disabled; the chain never breaks.
+  - Reply-pipeline stages are typed mandatory or optional (events.yaml reply_pipeline.stages). The engine bridges an absent OPTIONAL stage (forwards its in->out event unchanged — only Cross-Promotion today); an absent MANDATORY stage (Intent Router, Marketing, Persona) is a PRODUCTION STARTUP ERROR, never silently bridged, so a misconfigured deploy can't silently drop enrichment/humanization. During incremental build the mandatory stages arrive across steps (Persona@4, Intent@6, Marketing@8) and each is verified by feeding its in-event; end-to-end reactive reply is a step-8 milestone (Marketing is the last mandatory stage) and the startup assertion is relaxed only in dev/test partial builds.
   - Persona immutable boundaries are hard-coded; evolution may tune only the STYLE section, and only via a gated, reversible experiment.
   - The black-tier content floor (illegal/harmful) is non-tunable; neither config nor evolution can loosen it. Gray-tier (legal-but-distasteful) is tolerated by default.
   - A group member can NEVER trigger a privileged action via chat; privileged actions originate only from the owner control-plane or the bot's own configured policy (action provenance).
@@ -599,8 +619,10 @@ quality_gates:
         owner service/module. A module may write only its owned tables; reads/writes to shared
         cross-cutting state must go through the declared service/repository (e.g. ctx.suppression
         for member_suppression, ctx.social for channel_state/channel_members, Delivery/Outbox for
-        outbox, Approval Service for approval_items). Test fixtures scan SQL strings/repository
-        calls and fail on direct cross-owner mutation.
+        outbox, Approval Service for approval_items + channel_control (the owner kill-switch levers,
+        which SocialContext only READS), and the Observability query API for event_journal-derived
+        reads — /status,/why,/trace,digest compose from it, never raw event_journal SQL). Test
+        fixtures scan SQL strings/repository calls and fail on direct cross-owner mutation.
     - id: declared_events_only
       enforces: declared-events-contract
       check: >-
@@ -613,10 +635,14 @@ quality_gates:
         TWO cases. (1) DISABLED-stage: for each registered reply-pipeline stage, a test sets
         its feature flag off and asserts the stage's output event still fires with the input
         ReplyDraft intact (deep-equal except for the field that stage owns). (2) UNREGISTERED-
-        stage bridge: with Cross-Promotion NOT registered, assert the ENGINE bridge forwards
-        reply.enriched -> reply.ready unchanged (and that the Marketing module does NOT emit
-        reply.ready — it stays within its declared publishes). See events.yaml
-        reply_pipeline.absent_stage_bridge.
+        stage bridge: with Cross-Promotion (optional:true) NOT registered, assert the ENGINE bridge
+        forwards reply.enriched -> reply.ready unchanged (and that the Marketing module does NOT emit
+        reply.ready — it stays within its declared publishes). (3) MISSING-MANDATORY-stage: with a
+        stage marked optional:false (Intent Router/Marketing/Persona) absent, assert a PRODUCTION
+        start raises a startup error (NOT a silent bridge), while a dev/test partial build (the
+        incremental build_order before step 8) is allowed — so a misconfigured deploy can never
+        silently drop intent/enrichment/humanization. See events.yaml reply_pipeline.absent_stage_bridge
+        + reply_pipeline.incremental_build_note.
     - id: envelope_conformance
       enforces: envelope-contract
       check: >-
@@ -840,8 +866,8 @@ quality_gates:
     - id: owner_pause_overrides
       enforces: kill-switch
       check: >-
-        With channel_state.paused_until in the future, no proactive or reactive message is emitted
-        (RoomRead.posture == stay_silent). With channel_state.proactive_paused_until in the future
+        With channel_control.paused_until in the future, no proactive or reactive message is emitted
+        (RoomRead.posture == stay_silent). With channel_control.proactive_paused_until in the future
         (/quiet), RoomRead.proactiveAllowed == false so every proactive send is suppressed while
         reactive replies AND moderation still act and posture is unchanged. Assert the two levers are
         independent: /quiet does not silence a reactive reply, /pause silences both.

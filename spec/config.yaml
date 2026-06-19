@@ -27,7 +27,7 @@ config_files:
         ingest_daily_usd: 1.0       # PER-SOURCE/day bound for embedding/sync (ingest is SOURCE-scoped, not per-workspace — a source serves many workspaces; metered in ingest_budget_state). Over cap -> that source's sync pauses, never trips any workspace's chat.
         safety_daily_usd: 0.5       # separate safety lane (per workspace/day) for classifiers/vision; never borrowed by chat. NOTE: moderation runs a deterministic rule pre-filter FIRST (modules.yaml moderation.classification_cost_model) so only suspect/ambiguous text + media consume this lane — a busy room does not exhaust it on benign traffic.
         media_scan_daily_cap: 200   # max vision moderation calls/day/workspace; over cap -> hold ALL unscanned media (fail-safe)
-        media_hold_mode: "silent_delete_unscanned" # owner-visible status; no member-facing explanation
+        media_hold_mode: "silent_delete_unscanned" # disposition while runtime mode=media_hold; owner-visible status, no member-facing explanation
         safety_hold_ttl_hours: 24   # unresolved holds expire to safe default, never to clean
     delivery:                       # send_queue + idempotency (operations) — covers replies AND outbound.requested
       per_channel_rate_per_min: 8   # CONSERVATIVE: this is a USERBOT on a real account, not a Bot API bot

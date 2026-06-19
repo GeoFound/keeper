@@ -30,7 +30,7 @@ events:
       }
     rules:
       - correlationId is DERIVED DETERMINISTICALLY from the platform message identity by the Platform Adapter (`corr:<platform>:<channelId>:<platform_message_id>`; for an edit, still the original/editOf message id), NEVER a fresh uuid. This is what makes outbox dedup protect against redelivery — a reconnect/crash that REPLAYS an update yields the SAME correlationId, so it is idempotent end-to-end. The inbound replay guard is separate: it keys on the concrete platform update identity (original message vs each edit revision, e.g. Telegram update id / edit_date), so repeated edits are re-moderated while replaying the same edit is a no-op. (See overview operations.idempotent_delivery.inbound_idempotency.) control.owner_action is keyed the same way off the owner's control-bot message/callback id (`corr:telegram:<owner_dm>:<message_or_callback_id>`), so a redelivered owner tap is also idempotent and never double-acts.
-      - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY inbound journey — it is the SOLE resolver of channelId -> workspace for EVERY raw adapter channel signal: it copies the resolved workspaceId onto message.routed (from message.received) AND onto member.joined / member.left / reaction.received (from the raw inbound.member_joined / inbound.member_left / inbound.reaction), then every downstream stage propagates it unchanged. The adapter stays workspace-unaware; an unbound channel is dropped at the router for member/reaction signals exactly as for messages (no member.*/reaction.received re-emit, no channel_members write). Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
+      - The Workspace Router is the ONLY producer allowed to mint workspaceId for the COMMUNITY inbound journey — it is the SOLE resolver of channelId -> workspace for EVERY raw adapter channel signal: it copies the resolved workspaceId onto message.routed (from message.received) AND onto member.joined / member.left / reaction.received (from the raw inbound.member_joined / inbound.member_left / inbound.reaction), then every downstream stage propagates it unchanged. The adapter stays workspace-unaware; an unbound channel is dropped at the router for member/reaction signals exactly as for messages (no member.*/reaction.received re-emit, no channel_members write). Control-plane events are scoped by the Approval Service instead (it resolves the target workspace from the pending item / command scope and stamps every event it then emits — moderation.violation, *.approved/*.rejected, onboarding.input, user.forget, AND its own owner-facing outbound.requested for digest/status/why — with that resolved workspaceId). A command that is inherently cross-workspace (a global /status) emits ONE owner DM per workspace, each carrying that workspace's id, rather than a single workspace-less send — so the non-empty-workspaceId rule holds for every owner-facing send too.
       - A FIXED set of RAW adapter events MAY carry an empty workspaceId because their scope is not yet resolved at emit time: the userbot's pre-routing channel signals message.received, inbound.member_joined, inbound.member_left, inbound.reaction (workspace not yet routed — the Workspace Router resolves them) and control.owner_action (the control bot does not know which workspace a tap targets — the Approval Service resolves it). EVERY other workspace-scoped event — INCLUDING the resolved member.joined / member.left / reaction.received — MUST carry a non-empty workspaceId.
       - A SMALL fixed set of SOURCE-SCOPED infra events is NOT workspace-scoped at all: knowledge.sync_due and knowledge.updated operate on a content SOURCE that may be bound to MANY workspaces (and a sync may belong to none yet), so a single workspaceId is meaningless for them. They carry an EMPTY workspaceId and MUST instead carry a non-empty sourceId in their payload (ScheduledTick.sourceId for knowledge.sync_due — the Scheduler fires one tick PER SOURCE on that source's own interval; KnowledgeDelta.sourceId for knowledge.updated). Isolation for these is enforced downstream at RAG QUERY time by the source_id filter (see knowledge.yaml content_isolation), never by the envelope. This is the ONLY non-workspace, non-`__system__` scope class; every other event still requires a non-empty workspaceId. (The envelope_conformance gate asserts a source-scoped event with empty sourceId is rejected.)
       - A RESERVED non-workspace scope `__system__` is allowed only for owner-facing operational notices that occur before a real workspace can be resolved (e.g. unknown/unbound channel seen by the userbot, adapter credential/access failures). It is NOT a content workspace: no RAG, no LLM budget, no moderation, no member data, no channel routing, and no module may treat it as a workspace returned by config. The only currently allowed system-scoped bus emission is outbound.requested(kind:'notice', via:'control', suppressIfKillSwitch=false) with a kind-namespaced dedupeKey.
@@ -141,6 +141,7 @@ events:
     - { event: content_gap.detected,         version: 1, publisher: RAG Engine,                      consumers: [Content Gap],                                                       payload: ContentGap }      # KB could not answer
     - { event: lead.identified,              version: 1, publisher: Funnel,                          consumers: [Approval Service],                                                  payload: Lead }            # DM proposal -> owner (governance-gated)
     - { event: lead.approved,                version: 1, publisher: Approval Service,                consumers: [Funnel],                                                            payload: ApprovalDecision }   # owner ✅ -> Funnel sends the DM
+    - { event: lead.rejected,                version: 1, publisher: Approval Service,                consumers: [Funnel],                                                            payload: ApprovalDecision }   # owner ❌ / ttl safe-default -> Funnel records rejected_dm suppression
     - { event: lead.followup_due,            version: 1, publisher: Scheduler,                       consumers: [Funnel],                                                            payload: ScheduledTick }   # per-workspace tz tick; Funnel resolves leads whose dm_sent_at + no_response window elapsed with no reply -> mark no_response + long-lived suppression (absence-of-reply needs a timer; events alone can't observe it)
     - { event: user.forget,                  version: 1, publisher: Approval Service,                consumers: [User Memory, "Database service (user-scoped raw-record purge/redaction)"], payload: ForgetRequest }   # owner /forget — note+opt-out erased by User Memory, user-scoped raw records purged/redacted by the Database service
     - { event: onboarding.input,             version: 1, publisher: Approval Service,                consumers: [Onboarding Wizard],                                                 payload: OnboardingInput }  # Approval forwards owner control input that belongs to an active /setup session
@@ -245,8 +246,82 @@ events:
         workspaceId: string;
         channelId: string;
         userId: string;
+        leadId?: string;        // DB leads.id when already persisted; itemRef links once proposed
         signal: string;        // why flagged (repeated engagement / explicit interest)
+        evidence: string[];    // redacted evidence snippets shown to the owner
         proposedDm: string;    // draft opener for owner to approve (governance L1)
+      }
+    ActivityProposal: |
+      interface ActivityProposal {
+        proposalId: string;      // stable itemRef source for approval_items
+        workspaceId: string;
+        channelId: string;
+        type: 'ai_news_discussion' | 'poll_survey' | 'topic_day' | 'quiz' | 'giveaway' | 'cost_bearing' | string;
+        trigger: 'scheduler' | 'hot_topic' | 'owner_plan' | 'auto';
+        title?: string;
+        plan: string;            // redacted owner preview + executor plan
+        requiresApproval: boolean;
+        scheduledAt?: Date;
+        estimatedCostUsd?: number;
+        evidence?: string[];     // hot topic / calendar reason, no secrets
+        dedupeKey: string;       // activity:<workspace/channel/type/window>
+      }
+    ApprovalDecision: |
+      interface ApprovalDecision {
+        itemRef: string;          // approval_items.item_ref, from callback_data / #id
+        type: 'moderation_mute' | 'moderation_ban' | 'black_tier_notify' |
+              'giveaway' | 'cost_bearing' | 'low_risk_activity' |
+              'cross_promo' | 'lead_dm' | 'evolution_tuning' | 'onboarding_confirm';
+        decision: 'approved' | 'rejected' | 'amended' | 'expired' | 'held' | 'dropped' | 'cancelled';
+        safeDefault?: 'reject' | 'hold' | 'drop' | 'cancel' | 'no_decision';
+        workspaceId: string;
+        sourceCorrelationId?: string;
+        targetUserId?: string;    // lead/moderation target; must also be envelope.subjectUserId when user-specific
+        channelId?: string;
+        amendText?: string;
+        payloadJson?: string;     // redacted snapshot from approval_items.payload_json
+        decidedAt: Date;
+      }
+    CrossPromoProposal: |
+      interface CrossPromoProposal {
+        proposalId: string;
+        fromWorkspaceId: string;
+        toWorkspaceId: string;
+        sourceId?: string;
+        itemId?: string;
+        product: string;
+        tone: string;
+        contextSummary: string;   // redacted, no member identity
+        previewText: string;
+        maxPerWeek: number;
+        requiresApproval: true;
+      }
+    TuningProposal: |
+      interface TuningProposal {
+        proposalId: string;
+        workspaceId: string;
+        dimension: 'style' | 'timing' | 'activity_type' | 'marketing_angle';
+        champion: string;
+        challenger: string;
+        rationale: string;
+        sampleCount: number;
+        guardrailReport: Record<string, unknown>;
+        redteamPassed: boolean;
+      }
+    InsightBatch: |
+      interface InsightBatch {
+        workspaceId: string;
+        generatedAt: Date;
+        sampleCount: number;
+        insights: Array<{
+          category: 'conversation' | 'marketing' | 'activity' | 'timing' | string;
+          description: string;
+          confidence: number;
+          sampleCount: number;
+          reusable: boolean;      // methodology-only; content/user data never shared
+        }>;
+        experimentId?: number;
+        proposedTuningId?: string;
       }
     OwnerAction: |
       // The SINGLE authenticated control-plane ingress. Emitted by the CONTROL BOT
@@ -284,9 +359,9 @@ events:
         userId: string;                            // resolved target ('/forget me' resolved to the owner's id)
         scope: 'full';
       }
-    # MemberEvent / ReactionEvent / ActivityProposal / ApprovalDecision /
-    # CrossPromoProposal / TuningProposal / InsightBatch are defined inline where
-    # first owned (modules.yaml) — listed here so the catalog is complete.
+    # MemberEvent / ReactionEvent are defined in contracts.yaml. Every other catalog
+    # payload above has an explicit schema here so envelope_conformance can generate
+    # Zod validators without implementation-time invention.
 
 # -----------------------------------------------------------------------------
 # THE ORDERED REPLY PIPELINE
@@ -434,7 +509,7 @@ flows:
     steps:
       - "CONTROL BOT adapter: receive owner DM / inline-button callback -> verify senderId == owner user_id (else drop) -> emit control.owner_action (workspaceId may be empty; correlationId from the control message/callback id)"
       - "Approval Service: dispatch by kind —
-          decision(✅/❌/📝): match itemRef to a pending item (callback_data first, else reply-to/#id), resolve its workspaceId, emit the item's decision event (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided, lead.approved, or moderation.violation(approved) for an L1 mute/ban);
+          decision(✅/❌/📝): match itemRef to a pending item (callback_data first, else reply-to/#id), resolve its workspaceId, emit the item's decision event (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided, lead.approved/rejected, or moderation.violation(approved) for an L1 mute/ban);
           command('/pause'|'/quiet'|'/resume'): write channel_state.paused_until / proactive_paused_until (the kill switch — the one control-owned write to channel_state, read by SocialContext for posture);
           command('/status'|'/why'|'/trace'): compose from the event_journal (+ read-models) -> outbound.requested(kind:'dm', via:'control');
           command('/forget <user|me>'): resolve userId+workspaceId -> emit user.forget;

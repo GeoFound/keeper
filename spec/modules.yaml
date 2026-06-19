@@ -27,8 +27,10 @@ modules:
     unbound_channel:   # anyone can add a Telegram bot to an arbitrary group — guard the front door
       rule: >-
         If channelId resolves to NO configured workspace, the inbound signal is DROPPED at
-        the router: a message gets no message.routed, no moderation, no LLM call, no DB write,
-        ZERO spend; a raw member/reaction signal (inbound.member_joined/left/reaction) gets no
+        the router: a message gets no message.routed, no moderation, no LLM call, no workspace/
+        domain DB write, ZERO spend; the pre-routing inbound_updates claim remains allowed
+        because it is idempotency infrastructure. A raw member/reaction signal
+        (inbound.member_joined/left/reaction) gets no
         member.*/reaction.received re-emit and no channel_members write. An unbound channel can
         never consume budget, retrieve content, update a read-model, or trigger any action. The
         bot only ever operates in explicitly configured channels (action provenance starts at
@@ -86,11 +88,11 @@ modules:
       collapse: "dedupe by workspace + user/message bucket + reason_code so outages become one digest/status incident"
       defaults:
         text_classifier_error: "expire_drop — do not reply/process as clean; leave public text alone unless a deterministic non-LLM rule already requires delete"
-        media_scan_cap_or_vision_down: "silent_delete_unscanned when platform delete right exists; otherwise workspace_runtime_state.mode=safety_hold and owner alert"
+        media_scan_cap_or_vision_down: "silent_delete_unscanned when platform delete right exists; otherwise workspace_runtime_state.mode=media_hold and owner alert"
         missing_control_bot_rights: "workspace safety_hold/read_only; no clean emission that depends on unavailable moderation execution"
       owner_surface: >-
         /status and digest show counts by reason, oldest hold age, TTL, and whether media
-        is being silently deleted due to media_hold_mode. They never include raw flagged
+        is being silently deleted due to config.media_hold_mode under runtime mode media_hold. They never include raw flagged
         media bytes or member-visible explanations.
     action_provenance_and_autonomy: >-
       ALL moderation actions are EXECUTED BY THE CONTROL BOT (the group-admin identity),
@@ -162,7 +164,7 @@ modules:
       new_user_media_delay: "untrusted/new users cannot post media for the first N minutes (config moderation.new_user_media_delay_minutes), mirroring new_user_link_delay — most drive-by image abuse comes from fresh accounts."
       new_user_clock: "Both new_user_*_delay rules read presence from ctx.social.memberPresence(channelId, userId) (backed by the channel_members table, written by the SocialContext updater on member.joined/left + first message.clean — see contracts SocialContext + data-model channel_members). A user is 'new' when there is NO row yet (this very message is the first observation) OR now - first_seen_at < the configured delay. Using first_seen_at (earliest of join or first message) keeps the fail-safe correct even when the bot joined AFTER the user (joined_at unknown). This is the persisted clock that makes the delay enforceable rather than guesswork."
       never_store_flagged_media: "media that trips the black-tier vision classifier is deleted and its bytes are NEVER written to disk/db; only a tier+reason audit row is kept (no media payload)."
-      media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, workspace enters media_hold_mode: ALL further unscanned media (new AND established users) is held/blocked/silent-deleted per config rather than scanned — safety never silently degrades to allow. Owner sees 'media safety scanning unavailable; media temporarily held' rather than a generic budget error."
+      media_budget: "vision calls are counted in the SAFETY budget lane (llm_usage purpose=moderation_vision with scope_type='workspace' + daily_budget_state safety/media counters). If media_scan cap or safety_daily_usd is hit, workspace enters runtime mode media_hold: ALL further unscanned media (new AND established users) is held/blocked/silent-deleted according to config.media_hold_mode rather than scanned — safety never silently degrades to allow. Owner sees 'media safety scanning unavailable; media temporarily held' rather than a generic budget error."
     rules:
       - { feature: anti_spam,            behavior: "ad links / repeated messages / bulk joins -> silent delete NOW (auto); mute proposed to owner (L1)" }
       - { feature: hard_block,           behavior: "black-tier hit (text OR media) -> silent delete NOW (auto) + DM owner (moderation.escalated) proposing the ban (L1). Detection+delete NOT tunable; ban awaits owner ✅." }
@@ -618,7 +620,16 @@ modules:
 
   approval_service:
     subscribes: [control.owner_action, activity.proposed, cross_promo.proposed, moderation.escalated, evolution.tuning_proposed, lead.identified, digest.due]
-    publishes: [activity.approved, activity.rejected, cross_promo.approved, evolution.tuning_decided, lead.approved, moderation.violation, user.forget, onboarding.input, outbound.requested]
+    publishes: [activity.approved, activity.rejected, cross_promo.approved, evolution.tuning_decided, lead.approved, lead.rejected, moderation.violation, user.forget, onboarding.input, outbound.requested]
+    implementation_phasing: >-
+      The module exists from build_order step 5 as a MINIMAL moderation-approval kernel,
+      because Moderation first needs owner-confirmed mute/ban there. Step 5 scope is narrow but
+      complete for that capability: persist approval_items before the owner DM, match owner
+      ✅/❌/ttl for moderation_mute/moderation_ban, emit moderation.violation(approved) only on
+      ✅, and reject safely otherwise. Build_order step 7 expands the SAME module to the full
+      owner control plane (/pause, /quiet, /status, /why, digest, /forget, generic approval
+      item types). This is staged implementation, not a deferred dependency: every capability is
+      complete at the step that first needs it.
     control_ingress: >-
       EVERY owner input enters through control.owner_action — the ONE authenticated edge,
       emitted by the CONTROL BOT adapter only for the owner user_id (a member DMing the
@@ -628,8 +639,8 @@ modules:
       or the command scope and stamping it on whatever event it emits next:
         - decision (✅/❌/📝): match itemRef -> emit that item's decision event
           (activity.approved/rejected, cross_promo.approved, evolution.tuning_decided,
-          lead.approved, or moderation.violation(approved) for an L1 mute/ban); a 📝 amend
-          carries amendText.
+          lead.approved/rejected, or moderation.violation(approved) for an L1 mute/ban); a
+          📝 amend carries amendText.
         - command /pause|/quiet|/resume: WRITE channel_state.paused_until (/pause ->
           posture stay_silent) / proactive_paused_until (/quiet -> proactiveAllowed=false
           only) (the kill switch — the one control-owned write to channel_state;
@@ -753,6 +764,12 @@ modules:
     subscribes: [message.clean, member.left, user.forget]
     publishes: []
     feature_flag: user_memory   # default OFF — privacy-sensitive, opt-in per workspace
+    implementation_phasing: >-
+      The privacy endpoint for user.forget lands with build_order step 7 because /forget must
+      erase any existing note/opt-out state as soon as owner controls exist. The feature's
+      collection + recall behavior remains build_order step 10 and stays behind feature_flag
+      user_memory. This keeps erasure complete before memory is useful, without turning on
+      relationship memory early.
     role: >-
       Per-user RELATIONSHIP memory — the lever that turns "a bot" into "a real
       regular" ("你上周不是问过 X 嘛"). Distills a short SUMMARY per user (topics,
@@ -779,7 +796,7 @@ modules:
       only "write a new article".
 
   funnel:
-    subscribes: [message.clean, reply.sent, reaction.received, lead.approved, outbound.sent, lead.followup_due]
+    subscribes: [message.clean, reply.sent, reaction.received, lead.approved, lead.rejected, outbound.sent, lead.followup_due]
     publishes: [lead.identified, outbound.requested]
     feature_flag: funnel        # default OFF
     role: >-
@@ -814,6 +831,14 @@ modules:
       leads.dm_sent_at + stage='dm_sent'. The outbox is the authority for delivery; this is the
       funnel's domain-table mirror (so a no_response timer starts from a real send, not an
       approval). It ignores outbound.sent for the owner's digest/DM kinds and other producers.
+    rejection_tracking: >-
+      The Funnel consumes lead.rejected (owner ❌ OR proposal.ttl safe-default reject) and records
+      leads.last_owner_decision='rejected', stage='dropped', suppression_reason='rejected_dm',
+      suppression_until=now+rejection_downgrade_days, AND calls
+      ctx.suppression.suppress({scope:'dm', reason:'rejected_dm', expiresAt:suppression_until}).
+      Without this event, the approval_items row would know the owner rejected the DM but the
+      Funnel would have no bus-visible cause to create the long-lived downgrade required by
+      dm_funnel_safety.
     no_response_detection: >-
       Absence-of-reply CANNOT be observed from inbound events alone (no event fires for "the
       lead never answered"), so it needs a TIMER. The Scheduler emits a per-workspace-tz

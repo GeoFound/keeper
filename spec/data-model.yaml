@@ -13,8 +13,9 @@ data_model:
       -- (post-routing, so workspace_id is known and NOT NULL holds); a genuine edit UPDATES
       -- the existing row in place (is_edit, edit_of, edited_at). A message from a channel
       -- bound to no workspace never reaches routing, so it writes nothing here (zero spend,
-      -- zero side effects — unbound_channel_drop). Pre-routing replay dedup lives in
-      -- inbound_updates (written by the ingest adapter), not here.
+      -- no workspace/domain side effects — unbound_channel_drop). Pre-routing replay dedup
+      -- still lives in inbound_updates (written by the ingest adapter) and is explicitly
+      -- allowed as idempotency infrastructure, not workspace operation.
       CREATE TABLE messages (
         id TEXT PRIMARY KEY,                      -- PLATFORM-QUALIFIED identity `<platform>:<channel_id>:<platform_message_id>` (globally unique). NOT the bare platform_message_id: Telegram message ids are per-CHAT and collide across channels. (Same components as correlationId minus the `corr:` prefix.)
         workspace_id TEXT NOT NULL,
@@ -316,16 +317,30 @@ data_model:
         ON channel_members (workspace_id, channel_id, first_seen_at);
     workspace_runtime_state: |
       -- Durable operational state for holds that are not human /pause: cost read-only,
-      -- missing required platform rights, adapter auth/access failures, and safety holds.
-      -- /status and the owner digest read this so a restart does not hide a degraded state.
+      -- missing required platform rights, adapter auth/access failures, per-channel userbot
+      -- membership loss, and safety/media holds. This is MULTI-ROW by design: a workspace can
+      -- be read_only for budget while one channel is degraded because the userbot was kicked.
+      -- /status and the owner digest read active rows so a restart does not hide a degraded state.
       CREATE TABLE workspace_runtime_state (
-        workspace_id TEXT PRIMARY KEY,
-        mode TEXT DEFAULT 'normal',              -- normal|read_only|safety_hold|disabled
-        reason TEXT,
-        details_json TEXT,                       -- redacted, no secrets/media bytes
+        id TEXT PRIMARY KEY,                       -- runtime:<workspace>:<scope_type>:<scope_id>:<mode>:<reason>
+        workspace_id TEXT NOT NULL,
+        scope_type TEXT NOT NULL,                  -- workspace|channel|source|account
+        scope_id TEXT NOT NULL,                    -- workspace_id, channel_id, source_id, or account_id
+        channel_id TEXT,                           -- set when scope_type='channel'
+        mode TEXT NOT NULL,                        -- read_only|safety_hold|media_hold|degraded|disabled|retreat
+        reason TEXT NOT NULL,                      -- budget_exhausted|media_cap|missing_rights|userbot_not_member|invalid_session|...
+        status TEXT DEFAULT 'active',              -- active|resolved
+        details_json TEXT,                         -- redacted, no secrets/media bytes
         until DATETIME,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        resolved_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(workspace_id, scope_type, scope_id, mode, reason)
       );
+      CREATE INDEX ix_workspace_runtime_active
+        ON workspace_runtime_state (workspace_id, status, mode, until);
+      CREATE INDEX ix_workspace_runtime_channel
+        ON workspace_runtime_state (workspace_id, channel_id, status);
     safety_holds: |
       -- Bounded fail-closed queue for classifier outages, media scan cap exhaustion,
       -- missing required safety rights, and other conditions where passing as clean would
@@ -492,21 +507,38 @@ data_model:
         PRIMARY KEY (source_id, day)
       );
     llm_usage: |
-      -- Cost circuit breaker backing. Per workspace per day; LLMGateway checks the
-      -- daily_budget_state reservation row BEFORE each call and appends actual usage here
-      -- after completion for audit/model/purpose breakdowns.
+      -- Cost/audit ledger for ALL LLM lanes. Workspace-scoped generative/safety calls append
+      -- scope_type='workspace' rows keyed by workspace_id/day (workspace timezone) and are
+      -- bounded by daily_budget_state. Source-scoped ingest/embedding calls append
+      -- scope_type='source' rows keyed by source_id/day (server timezone) and are bounded by
+      -- ingest_budget_state. This avoids forcing a shared source's re-embed into an arbitrary
+      -- workspace while preserving one audit surface for model/purpose breakdowns.
       CREATE TABLE llm_usage (
         id INTEGER PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        day TEXT NOT NULL,                       -- YYYY-MM-DD (workspace timezone)
-        model TEXT,
-        purpose TEXT,                            -- chat|classifier|embedding|reflection|moderation_vision
+        scope_type TEXT NOT NULL,                  -- workspace|source
+        scope_id TEXT NOT NULL,                    -- workspace_id when workspace-scoped; source_id when source-scoped
+        workspace_id TEXT,                         -- set iff scope_type='workspace'
+        source_id TEXT,                            -- set iff scope_type='source'
+        day TEXT NOT NULL,                         -- YYYY-MM-DD in the scope's day basis
+        day_timezone TEXT NOT NULL,                -- workspace timezone OR "server"
+        model TEXT NOT NULL,
+        purpose TEXT NOT NULL,                     -- chat|classifier|reflection|moderation_vision|embedding|ingest
         tokens_in INTEGER DEFAULT 0,
         tokens_out INTEGER DEFAULT 0,
         cost_usd REAL DEFAULT 0,
         calls INTEGER DEFAULT 0,
-        UNIQUE(workspace_id, day, model, purpose)
+        CHECK (
+          (scope_type = 'workspace' AND workspace_id = scope_id AND source_id IS NULL) OR
+          (scope_type = 'source' AND source_id = scope_id AND workspace_id IS NULL)
+        ),
+        UNIQUE(scope_type, scope_id, day, model, purpose)
       );
+      CREATE INDEX ix_llm_usage_workspace
+        ON llm_usage (workspace_id, day, purpose)
+        WHERE scope_type = 'workspace';
+      CREATE INDEX ix_llm_usage_source
+        ON llm_usage (source_id, day, purpose)
+        WHERE scope_type = 'source';
     user_memory: |
       -- Per-user relationship memory (feature_flag user_memory, default OFF).
       -- Stores a DISTILLED summary, never raw logs. Privacy-bounded + opt-out.

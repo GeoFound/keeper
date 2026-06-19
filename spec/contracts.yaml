@@ -32,6 +32,149 @@ domain_model:
         capabilities: string[];            // ["delete","ban","poll","reaction"]
       }
 
+# Shared type definitions referenced by the authoritative interfaces below.
+# These are intentionally broad enough for step-by-step implementation, but concrete
+# enough that src/** can generate Zod schemas without inventing missing shapes.
+supporting_types:
+  ConfigTypes:
+    signature: |
+      interface PersonaConfig {
+        name: string;
+        identity: 'owner' | string;
+        activeHours: string;                // normalized from config persona.active_hours
+        timezone: string;                   // IANA TZ
+        replyProbability: number;
+        minDelaySeconds: number;
+        maxDelaySeconds: number;
+        replyRate: { perUserMax: number; windowMinutes: number };
+        brandSafety: {
+          highRiskTopics: string[];
+          highRiskResponse: 'light_deflect' | 'silent';
+          strongOpinionDenylist: string[];
+        };
+      }
+      interface MarketingConfig {
+        maxMentionsPerDay: number;
+        minGapHours: number;
+        style: 'recommendation' | string;
+      }
+      interface ActivityConfig {
+        autoTopics: boolean;
+        autoPolls: boolean;
+        requireApproval: string[];
+      }
+      interface AtmosphereConfig {
+        coldThresholdHours: number;
+        maxProactivePerDay: number;
+        quietHours: string;
+        lifecycle: {
+          seedMaxMembers: number;
+          sparkMinActive24h: number;
+          growMinActive24h: number;
+          minParticipantsForPoll: number;
+          maxConsecutiveBotMessages: number;
+        };
+      }
+      interface ModerationConfig {
+        antiSpam: boolean;
+        welcomeNewMembers: boolean;
+        newUserLinkDelayMinutes: number;
+        newUserMediaDelayMinutes: number;
+        floodLimit: number;
+        spamKeywords: string[];
+        grayZoneTolerance: 'permissive' | 'moderate' | 'strict';
+        hardBlock: { enabled: true; onHit: 'delete_now+escalate_ban+notify_owner' };
+        media: { visionClassifier: 'best_effort' };
+      }
+      interface EvolutionConfig {
+        reflectionIntervalHours: number;
+        contributeToShared: boolean;
+        useSharedInsights: boolean;
+        autoTune: boolean;
+        challengerRatioFloor: number;
+        challengerRatioCap: number;
+        minExposure: number;
+        promoteProb: number;
+        attributionWindowMinutes: number;
+        guardrailTolerance: number;
+        rollbackWatchHours: number;
+        sharedMinConfidence: number;
+        sharedMinSamples: number;
+      }
+      interface ModuleConfig {
+        getWorkspace(workspaceId: string): Workspace;
+        listWorkspaces(): Workspace[];
+        getOwner(): { platform: 'telegram'; userId: string; via: 'control_bot' };
+        getFeature(workspaceId: string, flag: string): boolean;
+      }
+  EngineTypes:
+    signature: |
+      interface EventBus {
+        emit<T>(name: string, envelope: EventEnvelope<T>): Promise<void>;
+        on<T>(name: string, handler: (envelope: EventEnvelope<T>) => Promise<void> | void): void;
+      }
+      interface Database {
+        transaction<T>(fn: () => T): T;
+        prepare(sql: string): unknown;       // concrete type comes from better-sqlite3
+      }
+      interface Logger {
+        info(message: string, fields?: Record<string, unknown>): void;
+        warn(message: string, fields?: Record<string, unknown>): void;
+        error(message: string, fields?: Record<string, unknown>): void;
+        trace(name: string, fields: {
+          correlationId: string;
+          workspaceId: string;
+          causationId?: string;
+          subjectUserId?: string;
+          reason?: string;
+          level?: 'info' | 'warn' | 'error';
+          payloadDigest?: Record<string, unknown>;
+        }): Promise<void>;
+      }
+      interface LLMGateway {
+        complete<T>(input: {
+          workspaceId: string;
+          purpose: 'chat' | 'classifier' | 'reflection';
+          model?: string;
+          schema: unknown;
+          messages: unknown[];
+          estimatedCostUsd: number;
+        }): Promise<T>;
+        classifyMedia<T>(input: {
+          workspaceId: string;
+          bytes: Uint8Array;
+          mime: string;
+          schema: unknown;
+          estimatedCostUsd: number;
+        }): Promise<T>;
+        embed(input: {
+          sourceId: string;
+          texts: string[];
+          estimatedCostUsd: number;
+        }): Promise<{ vectors: number[][]; model: string; dimension: number }>;
+      }
+      interface ModuleHealth {
+        status: 'healthy' | 'degraded' | 'unhealthy';
+        reason?: string;
+        details?: Record<string, unknown>;
+      }
+      interface PollData {
+        question: string;
+        options: string[];
+        anonymous?: boolean;
+        multipleChoice?: boolean;
+        closesAt?: Date;
+      }
+      interface PlatformCapabilities {
+        canSendMessage: boolean;
+        canSendDirectMessage: boolean;
+        canSendPoll: boolean;
+        canPinMessage: boolean;
+        canDelete: boolean;
+        canRestrict: boolean;
+        canReadReactions: boolean;
+      }
+
 # Governance — the CONTROL PLANE. Separates "chat" from "commands".
 # IRON RULE: a group member can NEVER make the bot take a privileged action by
 # talking to it. Member messages are conversation DATA, never control input.

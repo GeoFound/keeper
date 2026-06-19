@@ -437,7 +437,7 @@ modules:
           do:   [everything + evolution self-tuning]
       anti_cringe_rules:   # hard guards, enforced regardless of phase
         - never run a poll/quiz below min_participants_for_poll
-        - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself). This producer-side check is a cheap PRE-GATE; the AUTHORITATIVE, race-free enforcement is at the userbot send-queue dequeue (overview send_queue.consecutive_bot_cap_enforcement), so concurrent proactive producers cannot collectively overshoot the cap.
+        - never emit more than max_consecutive_bot_messages without a human message in between (no talking to itself). This producer-side check is a cheap PRE-GATE; the AUTHORITATIVE, race-free enforcement is Delivery's outbox.bot_turn_reserved reservation at the userbot send-queue dequeue (overview send_queue.consecutive_bot_cap_enforcement), so concurrent proactive producers cannot collectively overshoot the cap even if SocialContext's async counter has not caught up.
         - in seed phase, only broadcast value — never simulate dialogue
         - if NOT RoomRead.proactiveAllowed (/pause, /quiet, or account RETREAT) or posture == stay_silent, do nothing
 
@@ -700,7 +700,7 @@ modules:
         - "/status                     -> what the bot is doing + pending items + today's counts (read from the event_journal + read-model tables)"
         - "/why <messageId>            -> explain a recent action/reply from the event_journal (the full trace for that message's correlationId, rendered human-readable)"
         - "/trace <id>                 -> the complete ordered story of one correlationId (every event + decision + failure for that message), the control-bot mirror of `just trace <id>`"
-        - "/forget <user|me>           -> emits user.forget(scope:full): User Memory deletes the relationship-memory note + sets opted_out (stops collection); the Database service purges/anonymizes its user-scoped raw records (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject). Distinct from the opt_out_keyword, which stops relationship memory only (raw messages still age out per message_retention_days). See privacy decision."
+        - "/forget <user|me>           -> emits user.forget(scope:full): User Memory deletes the relationship-memory note + sets opted_out (stops collection); DataLifecycleService purges/anonymizes/redacts user-scoped raw records under data-model.lifecycle_policies (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject). Distinct from the opt_out_keyword, which stops relationship memory only (raw messages still age out per message_retention_days). See privacy decision."
         - "/mute-bot-for-user <id>     -> ctx.suppression.suppress({scope:reply|dm|all, reason:'owner_mute'}) for that user (the SuppressionService accessor, not a direct table write); owner-only, no in-channel notice."
         - "/unmute-bot-for-user <id>   -> ctx.suppression.clear(<id>) for that user; owner-only."
         - "/setup                      -> starts the onboarding interview (emits onboarding.input(start))"
@@ -799,7 +799,7 @@ modules:
     privacy:
       - memory suppression: ctx.suppression.isSuppressed(scope:memory) (backed by member_suppression scope=memory|all, via the SuppressionService accessor — never a direct table read) prevents collection and recall even if feature_flag user_memory is on.
       - opt-out (keyword): a user sending the configured opt_out_keyword erases their note, sets opted_out=true, and stops relationship-memory collection. It does NOT purge their raw messages — those still age out per message_retention_days. (Tiered-delete decision.)
-      - forget (owner /forget -> user.forget event): FULL erase. This module erases the note + sets opted_out on user.forget; the Database service purges/anonymizes the user-scoped raw records it owns (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject) on the same event. The stronger, complete right-to-erasure path. (Each endpoint erases only the data it owns — no cross-module table write.)
+      - forget (owner /forget -> user.forget event): FULL erase. This module erases the note + sets opted_out on user.forget; DataLifecycleService purges/anonymizes/redacts user-scoped raw records under data-model.lifecycle_policies (messages, command_attempts, leads, moderation target ids where legally safe, and event_journal payload digests/reasons for that subject) on the same event. The stronger, complete right-to-erasure path. Normal writes remain per-owner; lifecycle deletes/redactions are the declared DataLifecycleService exception, not arbitrary cross-module table writes.
       - retention: notes expire after user_memory.retention_days; raw messages trimmed by message_retention_days (retention.sweep_due).
       - never returns memory for an opted-out user; never exposes another user's memory.
 

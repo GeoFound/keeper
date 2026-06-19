@@ -481,6 +481,9 @@ interfaces:
                                       // missing_rights/invalid_session/retreat) + the single out-of-band owner
                                       // alert path (infra, not a peer module); the SOLE accessor of
                                       // workspace_runtime_state — modules never touch that table directly
+        lifecycle: DataLifecycleService; // retention/forget lifecycle delete+redaction plane.
+                                      // Normal business writes still belong to each table owner;
+                                      // this service may only execute data-model.lifecycle_policies.
       }
       // MediaService is the SANCTIONED read path for media bytes. Media moderation
       // needs the raw bytes to run the vision classifier, but a module may NOT call a
@@ -562,11 +565,14 @@ interfaces:
       // outbound.sent to keep them current. Critically it increments
       // consecutive_bot_messages + last_bot_message_at on every bot send (reply.sent OR
       // outbound.sent) and RESETS consecutive_bot_messages on the next human message — this
-      // MAINTAINS the counter the cap reads. The cap itself (max_consecutive_bot_messages) is
-      // ENFORCED ATOMICALLY at the userbot send queue's dequeue for proactive kinds (overview
-      // operations.send_queue.consecutive_bot_cap_enforcement), NOT by a racy per-producer
-      // pre-read; a producer's pre-check is a cheap optimization only, replies are exempt. The
-      // human-message reset here is what counts as "the room moved on". The kill-switch levers
+      // MAINTAINS the counter the UI/status/pre-gates read. The hard cap itself
+      // (max_consecutive_bot_messages) is ENFORCED ATOMICALLY by Delivery at the userbot
+      // send queue's dequeue for proactive kinds, using outbox.bot_turn_reserved in the same
+      // transaction that moves pending -> sending (overview
+      // operations.send_queue.consecutive_bot_cap_enforcement), NOT by this async read model
+      // and NOT by a racy per-producer pre-read; a producer's pre-check is a cheap
+      // optimization only, replies are exempt. The human-message reset here is what counts as
+      // "the room moved on". The kill-switch levers
       // (paused_until, proactive_paused_until) live in the Approval-owned channel_control table
       // (NOT channel_state — they have a different writer than SocialContext, so a shared table
       // would break the one-writer-per-table ownership gate) and are only READ here when computing
@@ -697,6 +703,14 @@ interfaces:
         resolve(input: { workspaceId: string; scopeType: 'workspace' | 'channel' | 'source' | 'account'; scopeId: string; mode: string; reason: string }): Promise<void>;
         active(workspaceId?: string): Promise<Array<{ workspaceId: string; scopeType: string; scopeId: string; channelId?: string; mode: string; reason: string; until?: Date; createdAt: Date }>>;
       }
+      // DataLifecycleService is a lifecycle plane, not a module-owned repository. It is the
+      // only sanctioned cross-owner writer, and only for retention/erasure operations declared
+      // in spec/data-model.yaml lifecycle_policies. It cannot insert or update business state,
+      // cannot emit domain events, and is the consumer of retention.sweep_due + user.forget.
+      interface DataLifecycleService {
+        sweep(now: Date): Promise<{ deleted: number; redacted: number }>;
+        forget(input: { workspaceId: string; userId: string; correlationId: string }): Promise<{ deleted: number; redacted: number }>;
+      }
       interface RoomRead {
         phase: 'seed' | 'spark' | 'grow' | 'mature';        // community lifecycle
         temperature: 'silent' | 'calm' | 'lively' | 'heated' | 'argument';
@@ -725,7 +739,8 @@ interfaces:
       // fetch for moderation, delegates to the inbound adapter), SuppressionService (member_suppression
       // accessor + complaint-signal recorder, a whitelisted bus consumer), RuntimeStateService
       // (workspace_runtime_state accessor + the single out-of-band runtime owner-alert emitter, a
-      // whitelisted outbound.requested producer), Scheduler, the engine
+      // whitelisted outbound.requested producer), DataLifecycleService (retention/user.forget
+      // lifecycle delete+redaction plane), Scheduler, the engine
       // pipeline bridge (forwards an unregistered optional stage's event — see events.yaml
       // reply_pipeline.absent_stage_bridge), and each PlatformAdapter. They are exposed via
       // ModuleContext (or are pure engine wiring) and may touch a whitelisted set of events

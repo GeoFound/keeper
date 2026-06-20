@@ -1,0 +1,63 @@
+owner:
+  approval_channel: { platform: "telegram", via: "control_bot", user_id: 1000 }
+llm:
+  providers:
+    default: { base_url: "https://openrouter.ai/api/v1", api_key_env: "LLM_API_KEY" }
+  models:
+    chat: "google/gemini-2.5-flash"
+    classifier: "google/gemini-2.0-flash-lite"
+    embedding: "openai/text-embedding-3-small"
+    embedding_dimension: 1536
+    reflection: "google/gemini-2.5-flash"
+    moderation_vision: "google/gemini-2.5-flash"
+  budget:
+    daily_usd_per_workspace: 3
+    safety_daily_usd: 0.5
+    ingest_daily_usd: 1
+    media_scan_daily_cap: 200
+    on_exceed: "read_only"
+    media_hold_mode: "silent_delete_unscanned"
+    safety_hold_ttl_hours: 24
+delivery:
+  per_channel_rate_per_min: 8
+  backoff: "exponential"
+  reply_max_staleness_seconds: 600
+  pipeline_stage_timeout_seconds: 30
+  pipeline_inflight_deadline_seconds: 150
+  outbox_prune_after_days: 3
+approvals: { proposal_ttl_hours: 24 }
+account_survival:
+  account_global_per_min: 12
+  account_global_per_day: 800
+  dm_per_day: 15
+  warmup_days: 7
+  warmup_start_fraction: 0.2
+  flood_wait_retreat_threshold: 3
+  flood_wait_window_minutes: 30
+  retreat_cooldown_minutes: 120
+  session_string_env: "TELEGRAM_SESSION_STRING"
+scheduler:
+  reflection_cron: "0 4 * * *"
+  sync_cron: "*/30 * * * *"
+  digest_cron: "0 9 * * *"
+  retention_sweep_cron: "0 3 * * *"
+  activity_cron: "0 12 * * *"
+  marketing_share_cron: "0 13 * * *"
+  lead_followup_cron: "0 * * * *"
+platforms:
+  telegram:
+    userbot:
+      api_id_env: "TELEGRAM_API_ID"
+      api_hash_env: "TELEGRAM_API_HASH"
+      session_string_env: "TELEGRAM_SESSION_STRING"
+    control_bot: { token_env: "TELEGRAM_CONTROL_BOT_TOKEN" }
+observability:
+  journal_enabled: true
+  journal_retention_days: 14
+  journal_sampling: {}
+  log_dir: "./data/logs"
+  log_level: "info"
+  redact: true
+  payload_digest_max_chars: 2000
+database: { path: "./data/bot.db" }
+vector_store: { provider: "sqlite-vec", path: "./data/bot.db" }

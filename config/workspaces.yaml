@@ -1,0 +1,125 @@
+# Sanitized example workspace (see spec/config.yaml). channel_id is a placeholder.
+# launch_profile: minimum is the conservative first launch — evolution/funnel/cross_promotion/
+# user_memory MUST stay false here (the loader rejects a minimum launch with them on).
+workspaces:
+  - id: "ws-ai-community"
+    name: "AI 交流社区"
+    launch_profile: "minimum"
+    channels:
+      - { platform: "telegram", channel_id: "-1001234567890", role: "owner" }
+    content_sources: ["ai-site-main", "local-docs"]
+    features:
+      moderation: true
+      persona: true
+      marketing: true
+      activities: true
+      atmosphere: true
+      evolution: false                     # default OFF for launch; owner-ramp later
+      cross_promotion: false
+      user_memory: false
+      funnel: false
+      content_gap: true
+      digest: true
+      sentiment_analysis: false
+      analytics: false                     # RESERVED — no consuming module yet
+      auto_faq: false                      # RESERVED — no consuming module yet
+    persona:
+      name: "展展"
+      identity: "owner"
+      active_hours: "09:00-01:00"
+      timezone: "Asia/Tokyo"               # also the timezone all scheduled jobs fire in for this workspace
+      reply_probability: 0.7
+      min_delay_seconds: 30
+      max_delay_seconds: 300
+      reply_rate:
+        per_user_max: 5
+        window_minutes: 10
+      brand_safety:
+        high_risk_topics: ["法律", "医疗", "金融", "投资", "政治", "宗教", "战争", "退款", "支付"]
+        high_risk_response: "light_deflect"
+        strong_opinion_denylist: ["政策站队", "医疗建议", "投资建议", "法律结论"]
+    marketing:
+      max_mentions_per_day: 1
+      min_gap_hours: 6
+      style: "recommendation"
+    activities:
+      auto_topics: true
+      auto_polls: false
+      require_approval: ["giveaway", "contest", "any_with_cost"]
+    atmosphere:
+      cold_threshold_hours: 8
+      max_proactive_per_day: 1
+      quiet_hours: "01:00-09:00"
+      lifecycle:
+        seed_max_members: 10
+        spark_min_active_24h: 1
+        grow_min_active_24h: 5
+        min_participants_for_poll: 8
+        max_consecutive_bot_messages: 2
+    evolution:
+      reflection_interval_hours: 72
+      contribute_to_shared: true
+      use_shared_insights: true
+      auto_tune: false
+      challenger_ratio_floor: 0.05
+      challenger_ratio_cap: 0.5
+      min_exposure: 30
+      promote_prob: 0.95
+      attribution_window_minutes: 30
+      guardrail_tolerance: 0.02
+      rollback_watch_hours: 72
+      shared_min_confidence: 0.8
+      shared_min_samples: 50
+    moderation:
+      anti_spam: true
+      welcome_new_members: true
+      new_user_link_delay_minutes: 10
+      new_user_media_delay_minutes: 10
+      flood_limit: 5
+      spam_keywords: ["代购", "刷单"]
+      gray_zone_tolerance: "permissive"   # permissive(default) | moderate | strict — taste, NOT the floor
+      hard_block:
+        enabled: true                     # MUST stay true; loader rejects false
+        on_hit: "delete_now+escalate_ban+notify_owner"
+      media:
+        vision_classifier: "best_effort"  # best_effort only; schema rejects off
+    governance:
+      on_command_attempt: "silent"
+      on_out_of_scope: "deflect"
+      delegated_principals: []
+      autonomy:
+        delete_message:      "L2_policy_auto"
+        mute_user:           "L1_propose"
+        ban_user:            "L1_propose"
+        post_link:           "L2_policy_auto"
+        run_activity:        "L2_policy_auto"
+        send_direct_message: "L1_propose"
+        generate_media:      "L0_forbidden"
+        refund_or_payment:   "L0_forbidden"
+      suppression:
+        reply_opt_out_phrases: ["别回复我", "不要回我", "别cue我"]
+        dm_opt_out_phrases: ["别私信我", "不要私信我", "别给我发私信"]
+        memory_opt_out_phrase: "不要记住我"
+        owner_mute_command: "/mute-bot-for-user"
+        negative_feedback_quiet_threshold: 3
+        negative_feedback_window_minutes: 60
+        negative_reaction_emojis: ["👎", "💩", "🤮", "🖕", "😡", "🤬"]
+    privacy:
+      message_retention_days: 90
+      member_notice:
+        enabled: true
+      forget_purges_raw: true
+      user_memory:
+        retention_days: 180
+        opt_out_keyword: "不要记住我"
+    funnel:
+      require_explicit_interest: true
+      per_user_cooldown_days: 30
+      max_pending_per_workspace: 5
+      high_engagement_to_digest_only: true
+      no_response_downgrade_days: 3650
+      rejection_downgrade_days: 3650
+    content_gap:
+      min_score: 0.55
+    digest: {}
+    ignore_topics: ["退款", "refund", "付款问题"]

@@ -1,0 +1,10 @@
+sources:
+  - id: "src-docs"
+    name: "Docs"
+    adapter: "file"
+    path: "data/knowledge/ws-main"
+    trust: "owned"
+    freshness_max_days: 180
+    workspace_priority: 0.8
+    content_type: "docs"
+    sync: { interval_minutes: 5 }

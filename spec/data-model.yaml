@@ -94,6 +94,10 @@ data_model:
       -- A 'pending' row older than the window is marked 'committed' WITHOUT re-drive (stale
       -- trigger — mirrors the outbox stale-drop). This guard is pre-routing, so it carries NO
       -- workspace_id (the canonical messages row, written later by the Workspace Router, does).
+      -- PRUNING: COMMITTED rows older than delivery.reply_max_staleness + a safety margin are
+      -- swept by DataLifecycleService (lifecycle_policies.retention_sweep) — past the staleness
+      -- window no platform replay can re-journey them, so the idempotency guard no longer needs
+      -- them and per-message row growth stays bounded. PENDING rows are NEVER pruned (live state).
       CREATE TABLE inbound_updates (
         id TEXT PRIMARY KEY,                         -- upd:<platform>:<channel>:<message>:<kind>:<identity>
         platform TEXT NOT NULL,
@@ -882,6 +886,7 @@ data_model:
       outbox: "prune terminal sent/dropped/failed/ambiguous rows older than delivery.outbox_prune_after_days, excluding member_notice:*"
       event_journal: "prune rows older than observability.journal_retention_days"
       channel_negative_signals: "prune rows older than suppression.negative_feedback_window_minutes"
+      inbound_updates: "prune COMMITTED rows older than delivery.reply_max_staleness + a safety margin — past the staleness window no platform replay can re-journey them (a replay past staleness commits without re-drive), so the idempotency guard no longer needs them and the per-message row count stays bounded. Pending rows are NEVER pruned (they are still live crash-recovery state)."
     user_forget:
       messages: "delete rows for subject actor_uid"
       command_attempts: "delete/anonymize rows for subject actor_uid"

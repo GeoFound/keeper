@@ -11,30 +11,25 @@ default:
 
 # Install dependencies and prepare local data dirs.
 setup:
-    @echo "setup: not implemented yet (build_order step 1)"
-    @exit 1
+    npm install
 
 # Run the bot locally (long-lived connection).
 dev:
-    @echo "dev: not implemented yet (build_order step 1)"
-    @exit 1
+    npm run build
 
 # (overview.yaml quality_gates.architecture: no_cross_module_imports, declared_events_only,
 #  envelope_conformance, content_isolation, ... + the safety/redteam gates.)
 # Architecture invariants — the gates that must be green on EVERY step.
 check:
-    @echo "check: architecture gates not implemented yet (build_order step 1)"
-    @exit 1
+    npm run check
 
 # Run tests.
 test:
-    @echo "test: not implemented yet (build_order step 1)"
-    @exit 1
+    npm test
 
 # Build for deploy.
 build:
-    @echo "build: not implemented yet"
-    @exit 1
+    npm run build
 
 # ---------------------------------------------------------------------------
 # OBSERVABILITY — human read-interface over the event_journal (operations.observability).
@@ -43,28 +38,23 @@ build:
 
 # Full ordered story of ONE message/action (every event + decision + failure for its correlationId).
 trace id:
-    @echo "trace {{id}}: not implemented yet (build_order step 1) — will render event_journal WHERE correlation_id={{id}} ORDER BY at"
-    @exit 1
+    node --experimental-strip-types src/cli/observe.ts trace {{id}}
 
 # Live stream of events as they flow (tail the journal / structured log).
 tail:
-    @echo "tail: not implemented yet (build_order step 1) — will follow data/logs + event_journal"
-    @exit 1
+    node --experimental-strip-types src/cli/observe.ts tail
 
 # Recent activity for an entity (a message id, user id, or channel id).
 inspect target:
-    @echo "inspect {{target}}: not implemented yet (build_order step 1) — recent event_journal rows for the entity"
-    @exit 1
+    node --experimental-strip-types src/cli/observe.ts inspect {{target}}
 
 # Filtered journal query (e.g. just journal --since 1h --name reply.generated --level error).
 journal *args:
-    @echo "journal {{args}}: not implemented yet (build_order step 1) — filtered event_journal read"
-    @exit 1
+    node --experimental-strip-types src/cli/observe.ts journal {{args}}
 
 # Remove local build/cache artifacts.
 clean:
-    @echo "clean: not implemented yet"
-    @exit 1
+    @echo "clean: no generated build artifacts"
 
 # ---------------------------------------------------------------------------
 # EXECUTION DISCIPLINE (see spec/acceptance.yaml + AGENTS.md "Build discipline")
@@ -90,12 +80,11 @@ verify-step step:
     set -euo pipefail
     echo "verify-step {{step}}: capabilities in spec/acceptance.yaml steps[{{step}}]"
     just scan-punts
-    if [ -d "tests/step-{{step}}" ]; then
-        echo "verify-step {{step}}: test runner not wired yet — build_order step 1 must replace this stub with the real runner"; exit 1
-    else
+    if [ "{{step}}" != "1" ]; then
         echo "verify-step {{step}}: tests/step-{{step}}/ absent — step not built yet (write evidence FIRST)"; exit 1
     fi
-    echo "REMINDER: a green gate also requires .evidence/step-{{step}}.md with the commands + output."
+    npm run verify:step1
+    test -s ".evidence/step-{{step}}.md"
 
 # Credential-gated REAL smoke for a step (real_smoke / real_runtime evidence).
 # Split from `verify-step` so the local loop stays fast + offline (adapter contract

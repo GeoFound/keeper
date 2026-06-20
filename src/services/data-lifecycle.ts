@@ -49,6 +49,9 @@ export class DataLifecycleService {
         WHERE status = 'committed' AND datetime(COALESCE(committed_at, received_at)) < datetime(@cutoff)
       `).run({ cutoff }).changes;
       deleted += this.store.prepare(`
+        DELETE FROM scheduler_ticks WHERE datetime(fired_at) < datetime(@cutoff)
+      `).run({ cutoff }).changes;
+      deleted += this.store.prepare(`
         DELETE FROM outbox
         WHERE status IN ('sent', 'dropped', 'failed', 'ambiguous')
           AND dedupe_key NOT LIKE 'member_notice:%'

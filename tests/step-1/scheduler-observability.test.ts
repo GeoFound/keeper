@@ -9,7 +9,8 @@ import { SchedulerService } from '../../src/services/scheduler.ts';
 import { StructuredLogger } from '../../src/services/structured-logger.ts';
 
 test('scheduler fires workspace-local ticks and catches up once', () => {
-  const scheduler = new SchedulerService();
+  const store = createTestStore('scheduler');
+  const scheduler = new SchedulerService(store);
   const ticks = scheduler.dueDailyTicks(
     [
       { workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00' },
@@ -20,7 +21,7 @@ test('scheduler fires workspace-local ticks and catches up once', () => {
   assert.equal(ticks.some((tick) => tick.workspaceId === 'tokyo'), true);
   assert.equal(ticks.some((tick) => tick.workspaceId === 'utc'), false);
 
-  const restarted = new SchedulerService();
+  const restarted = new SchedulerService(store);
   assert.equal(
     restarted.dueDailyTicks(
       [{ workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00', jobId: 'digest' }],
@@ -34,12 +35,13 @@ test('scheduler fires workspace-local ticks and catches up once', () => {
   );
   assert.equal(caughtUp.length, 1);
   assert.equal(
-    restarted.dueDailyTicks(
+    new SchedulerService(store).dueDailyTicks(
       [{ workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00', jobId: 'digest' }],
       new Date('2026-06-19T00:06:00.000Z'),
     ).length,
     0,
   );
+  assert.equal(store.prepare('SELECT COUNT(*) AS count FROM scheduler_ticks').get().count, 2);
 });
 
 test('trace, tail, inspect, structured logs, and secret redaction work', async () => {
@@ -89,8 +91,10 @@ test('event journal writes are buffered off the hot path and flushed explicitly'
     {
       eventId: 'evt:test',
       name: 'outbound.requested',
+      version: 1,
       workspaceId: 'ws-main',
       correlationId: 'corr:buffer',
+      timestamp: new Date('2026-06-19T00:00:00.000Z').toISOString(),
       at: new Date('2026-06-19T00:00:00.000Z').toISOString(),
     },
     {

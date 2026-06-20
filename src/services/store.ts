@@ -5,6 +5,7 @@ import YAML from 'yaml';
 import { load as loadSqliteVec } from 'sqlite-vec';
 
 export type StatementParams = Record<string, unknown> | unknown[];
+const SCHEMA_VERSION = 2;
 
 export class SQLiteStore {
   readonly filePath: string;
@@ -46,14 +47,29 @@ export class FileStore extends SQLiteStore {}
 
 function applySchema(db: Database.Database, input: { schemaPath: string; embeddingDimension: number }): void {
   const version = db.pragma('user_version', { simple: true }) as number;
-  if (version >= 1) return;
   const parsed = YAML.parse(readFileSync(input.schemaPath, 'utf8'));
   const tables = parsed.data_model.tables as Record<string, string>;
+  if (version >= SCHEMA_VERSION) return;
+
   db.transaction(() => {
-    for (const [name, ddl] of Object.entries(tables)) {
-      const sql = ddl.replaceAll('${embedding_dim}', String(input.embeddingDimension));
-      db.exec(sql);
+    if (version < 1) {
+      for (const ddl of Object.values(tables)) {
+        db.exec(renderSchemaSql(ddl, input.embeddingDimension));
+      }
+    } else if (version < 2) {
+      db.exec(renderAdditiveSchemaSql(tables.scheduler_ticks, input.embeddingDimension));
     }
-    db.pragma('user_version = 1');
+    db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
+}
+
+function renderSchemaSql(ddl: string, embeddingDimension: number): string {
+  return ddl.replaceAll('${embedding_dim}', String(embeddingDimension));
+}
+
+function renderAdditiveSchemaSql(ddl: string, embeddingDimension: number): string {
+  return renderSchemaSql(ddl, embeddingDimension)
+    .replace(/\bCREATE TABLE\b/g, 'CREATE TABLE IF NOT EXISTS')
+    .replace(/\bCREATE INDEX\b/g, 'CREATE INDEX IF NOT EXISTS')
+    .replace(/\bCREATE UNIQUE INDEX\b/g, 'CREATE UNIQUE INDEX IF NOT EXISTS');
 }

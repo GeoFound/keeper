@@ -22,6 +22,16 @@ type ReservationInput = {
   mediaHoldMode?: string;
 };
 
+type UsageRecord = {
+  costUsd: number;
+  tokensIn?: number;
+  tokensOut?: number;
+};
+
+type ReservationContext = {
+  recordUsage(usage: UsageRecord): void;
+};
+
 export class LLMGateway {
   private readonly store: SQLiteStore;
   private readonly runtime: RuntimeStateService;
@@ -64,7 +74,7 @@ export class LLMGateway {
     `).run(values);
   }
 
-  async withReservation<T>(input: ReservationInput, call: () => Promise<T>): Promise<T> {
+  async withReservation<T>(input: ReservationInput, call: (ctx: ReservationContext) => Promise<T>): Promise<T> {
     const reserved = this.reserve(input);
     if (!reserved.ok) {
       if (input.scopeType === 'workspace' && input.lane === 'generative') {
@@ -107,9 +117,15 @@ export class LLMGateway {
       throw new Error(`budget exhausted for ${input.scopeType}:${input.scopeId}:${input.lane}`);
     }
 
+    let usage: UsageRecord | undefined;
     try {
-      const result = await call();
-      this.reconcileSuccess(input);
+      const result = await call({
+        recordUsage(record) {
+          if (!Number.isFinite(record.costUsd) || record.costUsd < 0) throw new Error('actual LLM cost must be a non-negative finite number');
+          usage = record;
+        },
+      });
+      this.reconcileSuccess(input, usage ?? { costUsd: input.estimateUsd });
       return result;
     } catch (error) {
       this.release(input);
@@ -120,12 +136,14 @@ export class LLMGateway {
   private reserve(input: ReservationInput): { ok: boolean } {
     return this.store.transaction(() => {
       if (input.scopeType === 'source') {
-        const row = this.store.prepare(`
+        const row = this.ensureSourceBudgetRow(input);
+        if (!row) return { ok: false };
+        const current = this.store.prepare(`
           SELECT ingest_budget_usd, ingest_reserved_usd, ingest_actual_usd
           FROM ingest_budget_state
           WHERE source_id = ? AND day = ?
         `).get(input.scopeId, input.day) as any;
-        if (!row || row.ingest_actual_usd + row.ingest_reserved_usd + input.estimateUsd > row.ingest_budget_usd) return { ok: false };
+        if (!current || current.ingest_actual_usd + current.ingest_reserved_usd + input.estimateUsd > current.ingest_budget_usd) return { ok: false };
         this.store.prepare(`
           UPDATE ingest_budget_state
           SET ingest_reserved_usd = ingest_reserved_usd + @estimate, updated_at = CURRENT_TIMESTAMP
@@ -134,6 +152,8 @@ export class LLMGateway {
         return { ok: true };
       }
 
+      const ensured = this.ensureWorkspaceBudgetRow(input);
+      if (!ensured) return { ok: false };
       const lane = input.lane === 'generative' ? 'generative' : 'safety';
       const row = this.store.prepare(`
         SELECT generative_budget_usd, safety_budget_usd,
@@ -157,16 +177,73 @@ export class LLMGateway {
     });
   }
 
-  private reconcileSuccess(input: ReservationInput): void {
+  private ensureWorkspaceBudgetRow(input: ReservationInput): boolean {
+    const existing = this.store.prepare(`
+      SELECT 1 FROM daily_budget_state WHERE workspace_id = ? AND day = ?
+    `).get(input.scopeId, input.day);
+    if (existing) return true;
+
+    const prior = this.store.prepare(`
+      SELECT generative_budget_usd, safety_budget_usd, media_scan_cap
+      FROM daily_budget_state
+      WHERE workspace_id = ? AND day < ?
+      ORDER BY day DESC
+      LIMIT 1
+    `).get(input.scopeId, input.day) as any;
+    if (!prior) return false;
+
+    this.store.prepare(`
+      INSERT OR IGNORE INTO daily_budget_state (
+        workspace_id, day, generative_budget_usd, safety_budget_usd, media_scan_cap
+      ) VALUES (
+        @workspace_id, @day, @generative_budget_usd, @safety_budget_usd, @media_scan_cap
+      )
+    `).run({
+      workspace_id: input.scopeId,
+      day: input.day,
+      generative_budget_usd: prior.generative_budget_usd,
+      safety_budget_usd: prior.safety_budget_usd,
+      media_scan_cap: prior.media_scan_cap,
+    });
+    return true;
+  }
+
+  private ensureSourceBudgetRow(input: ReservationInput): boolean {
+    const existing = this.store.prepare(`
+      SELECT 1 FROM ingest_budget_state WHERE source_id = ? AND day = ?
+    `).get(input.scopeId, input.day);
+    if (existing) return true;
+
+    const prior = this.store.prepare(`
+      SELECT ingest_budget_usd
+      FROM ingest_budget_state
+      WHERE source_id = ? AND day < ?
+      ORDER BY day DESC
+      LIMIT 1
+    `).get(input.scopeId, input.day) as any;
+    if (!prior) return false;
+
+    this.store.prepare(`
+      INSERT OR IGNORE INTO ingest_budget_state (source_id, day, ingest_budget_usd)
+      VALUES (@source_id, @day, @ingest_budget_usd)
+    `).run({
+      source_id: input.scopeId,
+      day: input.day,
+      ingest_budget_usd: prior.ingest_budget_usd,
+    });
+    return true;
+  }
+
+  private reconcileSuccess(input: ReservationInput, usage: UsageRecord): void {
     this.store.transaction(() => {
       if (input.scopeType === 'source') {
         this.store.prepare(`
           UPDATE ingest_budget_state
           SET ingest_reserved_usd = MAX(0, ingest_reserved_usd - @estimate),
-              ingest_actual_usd = ingest_actual_usd + @estimate,
+              ingest_actual_usd = ingest_actual_usd + @actual,
               updated_at = CURRENT_TIMESTAMP
           WHERE source_id = @scope_id AND day = @day
-        `).run({ estimate: input.estimateUsd, scope_id: input.scopeId, day: input.day });
+        `).run({ estimate: input.estimateUsd, actual: usage.costUsd, scope_id: input.scopeId, day: input.day });
       } else {
         const lane = input.lane === 'generative' ? 'generative' : 'safety';
         const reservedColumn = lane === 'generative' ? 'generative_reserved_usd' : 'safety_reserved_usd';
@@ -174,12 +251,12 @@ export class LLMGateway {
         this.store.prepare(`
           UPDATE daily_budget_state
           SET ${reservedColumn} = MAX(0, ${reservedColumn} - @estimate),
-              ${actualColumn} = ${actualColumn} + @estimate,
+              ${actualColumn} = ${actualColumn} + @actual,
               updated_at = CURRENT_TIMESTAMP
           WHERE workspace_id = @scope_id AND day = @day
-        `).run({ estimate: input.estimateUsd, scope_id: input.scopeId, day: input.day });
+        `).run({ estimate: input.estimateUsd, actual: usage.costUsd, scope_id: input.scopeId, day: input.day });
       }
-      this.upsertUsage(input);
+      this.upsertUsage(input, usage);
     });
   }
 
@@ -200,19 +277,21 @@ export class LLMGateway {
     `).run({ estimate: input.estimateUsd, scope_id: input.scopeId, day: input.day });
   }
 
-  private upsertUsage(input: ReservationInput): void {
+  private upsertUsage(input: ReservationInput, usage: UsageRecord): void {
     const scopeColumns = input.scopeType === 'workspace'
       ? { workspace_id: input.scopeId, source_id: null }
       : { workspace_id: null, source_id: input.scopeId };
     this.store.prepare(`
       INSERT INTO llm_usage (
         scope_type, scope_id, workspace_id, source_id, day, day_timezone,
-        model, purpose, cost_usd, calls
+        model, purpose, tokens_in, tokens_out, cost_usd, calls
       ) VALUES (
         @scope_type, @scope_id, @workspace_id, @source_id, @day, @day_timezone,
-        @model, @purpose, @cost, 1
+        @model, @purpose, @tokens_in, @tokens_out, @cost, 1
       )
       ON CONFLICT(scope_type, scope_id, day, model, purpose) DO UPDATE SET
+        tokens_in = tokens_in + excluded.tokens_in,
+        tokens_out = tokens_out + excluded.tokens_out,
         cost_usd = cost_usd + excluded.cost_usd,
         calls = calls + 1
     `).run({
@@ -224,7 +303,9 @@ export class LLMGateway {
       day_timezone: input.scopeType === 'workspace' ? 'workspace' : 'server',
       model: input.model ?? 'test-model',
       purpose: input.purpose ?? input.lane,
-      cost: input.estimateUsd,
+      tokens_in: usage.tokensIn ?? 0,
+      tokens_out: usage.tokensOut ?? 0,
+      cost: usage.costUsd,
     });
   }
 }

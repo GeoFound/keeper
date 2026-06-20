@@ -4,10 +4,12 @@ import { newId, isoNow } from '../services/ids.ts';
 export type EventEnvelope = {
   eventId: string;
   name: string;
+  version: number;
   workspaceId: string;
   correlationId: string;
   causationId?: string;
   subjectUserId?: string;
+  timestamp: string;
   at: string;
 };
 
@@ -200,6 +202,10 @@ export const EVENT_SCHEMAS = {
   'onboarding.input': z.object({ phase: z.enum(['start', 'answer', 'confirm', 'cancel']) }).passthrough(),
 } satisfies Record<string, z.ZodTypeAny>;
 
+export const EVENT_VERSIONS = Object.fromEntries(
+  Object.keys(EVENT_SCHEMAS).map((name) => [name, 1]),
+) as Record<keyof typeof EVENT_SCHEMAS, number>;
+
 const RAW_SCOPE_DEFERRED_EVENTS = new Set([
   'message.received',
   'inbound.member_joined',
@@ -225,19 +231,24 @@ export function isSourceScopedEvent(name: string): boolean {
 
 export function createEnvelope(input: {
   name: string;
+  version?: number;
   workspaceId: string;
   correlationId: string;
   causationId?: string;
   subjectUserId?: string;
+  timestamp?: string;
 }): EventEnvelope {
+  const timestamp = input.timestamp ?? isoNow();
   return {
     eventId: newId('evt'),
     name: input.name,
+    version: input.version ?? 1,
     workspaceId: input.workspaceId,
     correlationId: input.correlationId,
     causationId: input.causationId,
     subjectUserId: input.subjectUserId,
-    at: isoNow(),
+    timestamp,
+    at: timestamp,
   };
 }
 
@@ -262,6 +273,8 @@ function knownSubjects(payload: any): string[] {
 function validateEnvelope(name: string, envelope: EventEnvelope, payload: unknown): void {
   if (!EVENT_SCHEMAS[name as keyof typeof EVENT_SCHEMAS]) throw new Error(`undeclared event ${name}`);
   if (envelope.name !== name) throw new Error(`envelope name ${envelope.name} does not match ${name}`);
+  if (!Number.isInteger(envelope.version) || envelope.version < 1) throw new Error('event version is required');
+  if (!envelope.timestamp) throw new Error('event timestamp is required');
   if (!envelope.correlationId) throw new Error('correlationId is required');
 
   const hasWorkspace = envelope.workspaceId.length > 0;
@@ -317,6 +330,11 @@ export class EventBus {
     const schema = EVENT_SCHEMAS[name as keyof typeof EVENT_SCHEMAS];
     if (!schema) throw new Error(`event ${name} is not declared`);
     validateEnvelope(name, envelope, payload);
+    const understoodVersion = EVENT_VERSIONS[name as keyof typeof EVENT_SCHEMAS];
+    if (envelope.version !== understoodVersion) {
+      this.observability.recordEvent(name, envelope, { ignoredVersion: envelope.version, expectedVersion: understoodVersion }, producer);
+      return;
+    }
     schema.parse(payload);
 
     this.observability.recordEvent(name, envelope, payload, producer);

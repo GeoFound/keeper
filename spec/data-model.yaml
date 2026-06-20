@@ -448,6 +448,25 @@ data_model:
         full_reembed_required BOOLEAN DEFAULT FALSE,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+    scheduler_ticks: |
+      -- Durable one-shot ledger for scheduler catch-up. A missed per-workspace local-day tick
+      -- may be claimed once after the configured local time passes, and that claim must survive
+      -- process restarts so "catch up once" does not become "catch up once per process".
+      -- SOLE WRITER: SchedulerService. Keyed by (workspace_id, job_id, local_date), where
+      -- local_date is computed in the workspace's persona.timezone.
+      CREATE TABLE scheduler_ticks (
+        id TEXT PRIMARY KEY,                       -- sched:<workspace_id>:<job_id>:<local_date>
+        workspace_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        local_date TEXT NOT NULL,                  -- YYYY-MM-DD in the workspace timezone
+        timezone TEXT NOT NULL,
+        local_time TEXT NOT NULL,                  -- HH:MM configured target time
+        fired_at DATETIME NOT NULL,                -- actual UTC instant this process claimed it
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(workspace_id, job_id, local_date)
+      );
+      CREATE INDEX ix_scheduler_ticks_ws_date
+        ON scheduler_ticks (workspace_id, local_date, job_id);
     knowledge_chunks: |
       -- Text chunks used by RAG. source_id is the isolation key; embedding_model/dim make
       -- model changes detectable instead of silently mis-scoring vectors.
@@ -887,6 +906,7 @@ data_model:
       event_journal: "prune rows older than observability.journal_retention_days"
       channel_negative_signals: "prune rows older than suppression.negative_feedback_window_minutes"
       inbound_updates: "prune COMMITTED rows older than delivery.reply_max_staleness + a safety margin — past the staleness window no platform replay can re-journey them (a replay past staleness commits without re-drive), so the idempotency guard no longer needs them and the per-message row count stays bounded. Pending rows are NEVER pruned (they are still live crash-recovery state)."
+      scheduler_ticks: "prune rows older than the operational retention window after their local day can no longer catch up"
     user_forget:
       messages: "delete rows for subject actor_uid"
       command_attempts: "delete/anonymize rows for subject actor_uid"
@@ -914,6 +934,7 @@ data_model:
     safety_holds: Moderation
     knowledge_items: Content Sync Pipeline
     source_sync_state: Content Sync Pipeline
+    scheduler_ticks: Scheduler
     knowledge_chunks: Content Sync Pipeline
     knowledge_vectors: Content Sync Pipeline
     knowledge_vector_map: Content Sync Pipeline

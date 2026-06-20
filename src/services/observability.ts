@@ -49,7 +49,7 @@ export class ObservabilityService {
       stage: producer,
       level: 'info',
       payload_digest: skeleton ? skeletonDigest(payload) : stableDigest(payload),
-      at: envelope.at,
+      at: envelope.timestamp ?? envelope.at,
     });
   }
 

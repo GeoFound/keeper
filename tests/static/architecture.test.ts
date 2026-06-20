@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import YAML from 'yaml';
-import { createTestStore } from '../support/test-store.ts';
+import { createTestDbPath, createTestStore } from '../support/test-store.ts';
+import { SQLiteStore } from '../../src/services/store.ts';
 
 function filesUnder(dir: string): string[] {
   try {
@@ -82,6 +84,17 @@ test('SQLite schema is applied from the authoritative data model with WAL enable
   assert.match(vectorSql, /USING vec0/i);
 });
 
+test('SQLite schema migrates v1 databases with the scheduler tick ledger', () => {
+  const dbPath = createTestDbPath('schema-v1-migration');
+  const seed = new Database(dbPath);
+  seed.pragma('user_version = 1');
+  seed.close();
+
+  const store = new SQLiteStore(dbPath);
+  assert.equal(store.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduler_ticks'").get().name, 'scheduler_ticks');
+  assert.equal(store.prepare('PRAGMA user_version').get().user_version, 2);
+});
+
 test('real crash evidence uses child process kill, not in-process restart simulation only', () => {
   const crashTests = filesUnder('tests').filter((file) => file.endsWith('.ts')).map((file) => readFileSync(file, 'utf8')).join('\n');
   assert.match(crashTests, /node:child_process/);
@@ -109,6 +122,7 @@ test('every table mutation in src comes from its declared owner (table_ownership
     llm_usage: ['llm-gateway.ts'],                 // LLMGateway
     outbox: ['outbox.ts'],                         // Delivery/Outbox
     event_journal: ['observability.ts'],           // Observability
+    scheduler_ticks: ['scheduler.ts'],             // Scheduler
     inbound_updates: ['inbound-lifecycle.ts'],     // Delivery/Ingest infra
     messages: ['inbound-lifecycle.ts'],            // spec owner Workspace Router (step 3); pre-router ingest persists it now
     pipeline_failures: ['inbound-lifecycle.ts'],   // spec owner Pipeline supervisor (step 4); written at the inbound commit point now

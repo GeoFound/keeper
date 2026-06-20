@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   EventBus,
   EVENT_SCHEMAS,
+  EVENT_VERSIONS,
   createEnvelope,
   isRawScopeDeferredEvent,
   isSourceScopedEvent,
@@ -67,8 +68,13 @@ test('bus delivers only declared events and rejects undeclared module emissions'
 
 test('every catalog event has a schema and envelope scope rules are enforced', async () => {
   assert.equal(Object.keys(EVENT_SCHEMAS).length, 43);
+  assert.equal(Object.keys(EVENT_VERSIONS).length, 43);
   const store = createTestStore('envelope');
   const bus = new EventBus({ observability: new ObservabilityService(store) });
+
+  const envelope = createEnvelope({ name: 'outbound.requested', workspaceId: 'ws-main', correlationId: 'corr:versioned' });
+  assert.equal(envelope.version, 1);
+  assert.match(envelope.timestamp, /^\d{4}-\d{2}-\d{2}T/);
 
   await assert.rejects(
     () =>
@@ -145,6 +151,45 @@ test('every catalog event has a schema and envelope scope rules are enforced', a
 
   assert.equal(isRawScopeDeferredEvent('inbound.reaction'), true);
   assert.equal(isSourceScopedEvent('knowledge.updated'), true);
+});
+
+test('unsupported event envelope versions are journaled and ignored by consumers', async () => {
+  const store = createTestStore('unsupported-version');
+  const observability = new ObservabilityService(store);
+  const bus = new EventBus({ observability });
+  let delivered = false;
+
+  bus.registerModule({
+    name: 'VersionProbe',
+    subscribes: ['outbound.requested'],
+    publishes: [],
+    handle() {
+      delivered = true;
+    },
+  });
+
+  await bus.emit(
+    'outbound.requested',
+    createEnvelope({
+      name: 'outbound.requested',
+      version: 2,
+      workspaceId: 'ws-main',
+      correlationId: 'corr:future-version',
+    }),
+    {
+      kind: 'notice',
+      audience: 'owner',
+      content: { text: 'future payload' },
+      dedupeKey: 'system_notice:future',
+      suppressIfKillSwitch: false,
+    },
+    'system',
+  );
+
+  assert.equal(delivered, false);
+  const rows = observability.trace('corr:future-version');
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].payloadDigest, /ignoredVersion/);
 });
 
 test('raw empty-workspace events are journaled as skeleton-only with subject stamping', async () => {

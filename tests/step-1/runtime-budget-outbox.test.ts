@@ -77,13 +77,39 @@ test('LLMGateway reserves atomically and releases failed reservations', async ()
   gateway.seedBudget({ scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-19', limitUsd: 1 });
 
   const calls = await Promise.allSettled([
-    gateway.withReservation({ scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-19', estimateUsd: 0.7 }, async () => 1),
-    gateway.withReservation({ scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-19', estimateUsd: 0.7 }, async () => 2),
+    gateway.withReservation(
+      { scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-19', estimateUsd: 0.7 },
+      async ({ recordUsage }) => {
+        recordUsage({ costUsd: 0.4, tokensIn: 10, tokensOut: 5 });
+        return 1;
+      },
+    ),
+    gateway.withReservation(
+      { scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-19', estimateUsd: 0.7 },
+      async ({ recordUsage }) => {
+        recordUsage({ costUsd: 0.4, tokensIn: 10, tokensOut: 5 });
+        return 2;
+      },
+    ),
   ]);
 
   assert.equal(calls.filter((r) => r.status === 'fulfilled').length, 1);
   assert.equal(store.prepare('SELECT COUNT(*) AS count FROM llm_usage').get().count, 1);
   assert.equal(store.prepare('SELECT generative_reserved_usd AS reserved FROM daily_budget_state').get().reserved, 0);
+  assert.deepEqual(
+    store.prepare(`
+      SELECT generative_actual_usd AS actual FROM daily_budget_state WHERE workspace_id = 'ws-main' AND day = '2026-06-19'
+    `).get(),
+    { actual: 0.4 },
+  );
+  assert.deepEqual(
+    store.prepare(`
+      SELECT cost_usd AS cost, tokens_in AS tokensIn, tokens_out AS tokensOut
+      FROM llm_usage
+      WHERE scope_type = 'workspace' AND scope_id = 'ws-main'
+    `).get(),
+    { cost: 0.4, tokensIn: 10, tokensOut: 5 },
+  );
   const hold = store.prepare(`
     SELECT mode, until
     FROM workspace_runtime_state
@@ -93,6 +119,31 @@ test('LLMGateway reserves atomically and releases failed reservations', async ()
   assert.equal(hold.until, '2026-06-20T00:00:00.000Z');
   assert.equal(runtime.active({ workspaceId: 'ws-main', now: new Date('2026-06-19T12:00:00.000Z') }).length, 1);
   assert.equal(runtime.active({ workspaceId: 'ws-main', now: new Date('2026-06-20T00:00:01.000Z') }).length, 0);
+
+  const nextDayCalls = await Promise.all([
+    gateway.withReservation(
+      { scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-20', estimateUsd: 0.1 },
+      async ({ recordUsage }) => {
+        recordUsage({ costUsd: 0.05 });
+        return 'next-1';
+      },
+    ),
+    gateway.withReservation(
+      { scopeType: 'workspace', scopeId: 'ws-main', lane: 'generative', day: '2026-06-20', estimateUsd: 0.1 },
+      async ({ recordUsage }) => {
+        recordUsage({ costUsd: 0.06 });
+        return 'next-2';
+      },
+    ),
+  ]);
+  assert.deepEqual(nextDayCalls, ['next-1', 'next-2']);
+  const nextDayRow = store.prepare(`
+    SELECT COUNT(*) AS count, generative_actual_usd AS actual
+    FROM daily_budget_state
+    WHERE workspace_id = 'ws-main' AND day = '2026-06-20'
+  `).get() as any;
+  assert.equal(nextDayRow.count, 1);
+  assert.equal(Math.abs(nextDayRow.actual - 0.11) < 0.000001, true);
 
   await assert.rejects(
     () =>
@@ -112,9 +163,18 @@ test('LLMGateway keeps ingest source budgets and media holds separate', async ()
   const gateway = new LLMGateway(store, runtime);
 
   gateway.seedBudget({ scopeType: 'source', scopeId: 'src-docs', lane: 'ingest', day: '2026-06-19', limitUsd: 1 });
-  await gateway.withReservation({ scopeType: 'source', scopeId: 'src-docs', lane: 'ingest', day: '2026-06-19', estimateUsd: 0.2 }, async () => 'ok');
-  assert.equal(store.prepare('SELECT ingest_actual_usd AS actual FROM ingest_budget_state').get().actual, 0.2);
-  assert.equal(store.prepare('SELECT scope_type AS scopeType FROM llm_usage').get().scopeType, 'source');
+  await gateway.withReservation(
+    { scopeType: 'source', scopeId: 'src-docs', lane: 'ingest', day: '2026-06-19', estimateUsd: 0.2 },
+    async ({ recordUsage }) => {
+      recordUsage({ costUsd: 0.15, tokensIn: 3, tokensOut: 0 });
+      return 'ok';
+    },
+  );
+  assert.equal(store.prepare('SELECT ingest_actual_usd AS actual FROM ingest_budget_state').get().actual, 0.15);
+  assert.deepEqual(
+    store.prepare('SELECT scope_type AS scopeType, cost_usd AS cost, tokens_in AS tokensIn FROM llm_usage').get(),
+    { scopeType: 'source', cost: 0.15, tokensIn: 3 },
+  );
 
   gateway.seedBudget({ scopeType: 'workspace', scopeId: 'ws-main', lane: 'media_safety', day: '2026-06-19', limitUsd: 0.1 });
   await assert.rejects(

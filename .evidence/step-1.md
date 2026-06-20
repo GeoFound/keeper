@@ -714,3 +714,337 @@ Output (tail):
 ✓ scan-punts: clean
 ✓ verify-through 1: all steps 1..1 + architecture gates green
 ```
+
+## Round 4 — strict Step 1 spec-completion fixes
+
+Date: 2026-06-20
+
+Fixes: (1) `LLMGateway` now separates estimate reservation from actual usage
+reconciliation: callers can record actual cost/tokens, success releases the estimate and books
+actual cost to `daily_budget_state`/`ingest_budget_state` + `llm_usage`, failure releases with no
+actual booked; it also creates a fresh zeroed day row from the prior day budget on rollover so
+the next day can reserve successfully. (2) `SchedulerService` now claims due local-day ticks in a
+durable `scheduler_ticks` table owned by Scheduler, so a missed tick catches up once across process
+restart, not once per in-memory instance. (3) Event envelopes now carry `version` and `timestamp`;
+unsupported event versions are journaled and ignored by consumers. Spec/data-model and the static
+table ownership gate were updated with the new scheduler-owned table.
+
+Command: `ai-cap check cost.budget`
+
+Output:
+
+```text
+能力: cost.budget
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 2 个项目各自实现
+```
+
+Command: `ai-cap check scheduler.tick`
+
+Output:
+
+```text
+能力: scheduler.tick
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `ai-cap check event.bus`
+
+Output:
+
+```text
+能力: event.bus
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `npm test`
+
+Output:
+
+```text
+> keeper@0.1.0 test
+> node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts
+
+✔ tests/static/architecture.test.ts (624.821191ms)
+✔ tests/step-1/config-loader.test.ts (683.69471ms)
+✔ tests/step-1/engine-lifecycle.test.ts (581.675445ms)
+✔ tests/step-1/event-bus.test.ts (699.414522ms)
+✔ tests/step-1/inbound-crash.test.ts (437.071317ms)
+✔ tests/step-1/real-crash.test.ts (930.371403ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (730.718854ms)
+✔ tests/step-1/scheduler-observability.test.ts (572.239953ms)
+✔ tests/step-1/walking-skeleton.test.ts (601.321044ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 957.561721
+```
+
+Command: `just check`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ spec wiring remains internally consistent (221.433727ms)
+✔ static architecture gates reject direct module coupling and unsafe privileged paths (1.37627ms)
+✔ SQLite schema is applied from the authoritative data model with WAL enabled (24.467604ms)
+✔ real crash evidence uses child process kill, not in-process restart simulation only (0.937528ms)
+✔ every table mutation in src comes from its declared owner (table_ownership) (6.414255ms)
+✔ config loads, validates hard floor, uniqueness, embedding dimension, and launch profile (21.350294ms)
+✔ config rejects dangerous or ambiguous inputs and preserves prior config on bad reload (15.845809ms)
+✔ config can be loaded from YAML files (47.278772ms)
+✔ the committed sanitized config/ directory validates against the loader (21.00682ms)
+✔ config runtime watches config files, swaps a good edit live, and keeps prior config on a bad edit (85.935155ms)
+✔ engine registers modules, starts, stops, and calls module health checks (45.872751ms)
+✔ bus delivers only declared events and rejects undeclared module emissions (39.925949ms)
+✔ every catalog event has a schema and envelope scope rules are enforced (12.697892ms)
+✔ unsupported event envelope versions are journaled and ignored by consumers (12.973101ms)
+✔ raw empty-workspace events are journaled as skeleton-only with subject stamping (13.49901ms)
+✔ payload schemas reject malformed catalog payloads (11.477617ms)
+✔ inbound_updates re-drive after routing and commit after pipeline abort (38.184354ms)
+✔ pending without a persisted message waits for platform replay and stale pending commits (21.462064ms)
+✔ real process kill after outbox sending restarts as ambiguous from disk (229.705579ms)
+✔ real process kill after persisted inbound message redrives from disk (124.780365ms)
+✔ real process kill after pipeline abort stays committed after restart (120.616835ms)
+✔ RuntimeStateService is idempotent and emits one deduped owner alert (44.461892ms)
+✔ RuntimeStateService expires timed holds and reactivates through the same deduped incident row (20.791616ms)
+✔ LLMGateway reserves atomically and releases failed reservations (50.654764ms)
+✔ LLMGateway keeps ingest source budgets and media holds separate (17.868013ms)
+✔ Outbox handles dedupe, ambiguous sending rows, staleness, and bot-turn reservation (16.790557ms)
+✔ reply.generated is written to the same outbox with a reply namespaced key (20.886952ms)
+✔ DataLifecycleService is the bounded cross-owner delete/redaction plane (11.902802ms)
+✔ owner outbound notices use suppressIfKillSwitch=false and are still journaled (11.680614ms)
+✔ scheduler fires workspace-local ticks and catches up once (67.523342ms)
+✔ trace, tail, inspect, structured logs, and secret redaction work (17.809432ms)
+✔ event journal writes are buffered off the hot path and flushed explicitly (22.928954ms)
+✔ test/development Echo harness wires inbound bus to unified outbox (53.496313ms)
+✔ Echo harness is rejected in production (13.698642ms)
+✔ engine.start() runs crash recovery: reconciles the outbox and re-drives inbound (16.908896ms)
+ℹ tests 35
+ℹ suites 0
+ℹ pass 35
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 881.202437
+```
+
+Command: `just scan-punts`
+
+Output:
+
+```text
+✓ scan-punts: clean
+```
+
+Command: `just build`
+
+Output:
+
+```text
+npm run build
+
+> keeper@0.1.0 build
+> node --experimental-strip-types src/index.ts --healthcheck
+
+keeper engine core ok
+```
+
+Command: `just verify-through 1`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ tests/static/architecture.test.ts (659.025411ms)
+✔ tests/step-1/config-loader.test.ts (639.325634ms)
+✔ tests/step-1/engine-lifecycle.test.ts (454.72688ms)
+✔ tests/step-1/event-bus.test.ts (702.535174ms)
+✔ tests/step-1/inbound-crash.test.ts (500.235215ms)
+✔ tests/step-1/real-crash.test.ts (907.622065ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (669.116639ms)
+✔ tests/step-1/scheduler-observability.test.ts (670.891005ms)
+✔ tests/step-1/walking-skeleton.test.ts (651.989357ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 935.068863
+=== verify-through: step 1 ===
+verify-step 1: capabilities in spec/acceptance.yaml steps[1]
+✓ scan-punts: clean
+
+> keeper@0.1.0 verify:step1
+> node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts
+
+✔ tests/static/architecture.test.ts (478.280961ms)
+✔ tests/step-1/config-loader.test.ts (523.552373ms)
+✔ tests/step-1/engine-lifecycle.test.ts (442.627152ms)
+✔ tests/step-1/event-bus.test.ts (470.852978ms)
+✔ tests/step-1/inbound-crash.test.ts (392.578569ms)
+✔ tests/step-1/real-crash.test.ts (756.22598ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (509.403344ms)
+✔ tests/step-1/scheduler-observability.test.ts (502.307083ms)
+✔ tests/step-1/walking-skeleton.test.ts (431.344545ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 782.380812
+✓ verify-through 1: all steps 1..1 + architecture gates green
+```
+
+Final rerun after adding the v1→v2 scheduler tick ledger migration test:
+
+Command: `just check`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ spec wiring remains internally consistent (225.370119ms)
+✔ static architecture gates reject direct module coupling and unsafe privileged paths (1.54467ms)
+✔ SQLite schema is applied from the authoritative data model with WAL enabled (21.109718ms)
+✔ SQLite schema migrates v1 databases with the scheduler tick ledger (5.708655ms)
+✔ real crash evidence uses child process kill, not in-process restart simulation only (1.416935ms)
+✔ every table mutation in src comes from its declared owner (table_ownership) (11.214407ms)
+✔ config loads, validates hard floor, uniqueness, embedding dimension, and launch profile (22.617951ms)
+✔ config rejects dangerous or ambiguous inputs and preserves prior config on bad reload (14.539988ms)
+✔ config can be loaded from YAML files (47.019874ms)
+✔ the committed sanitized config/ directory validates against the loader (21.363284ms)
+✔ config runtime watches config files, swaps a good edit live, and keeps prior config on a bad edit (95.364322ms)
+✔ engine registers modules, starts, stops, and calls module health checks (36.138647ms)
+✔ bus delivers only declared events and rejects undeclared module emissions (38.960986ms)
+✔ every catalog event has a schema and envelope scope rules are enforced (16.403781ms)
+✔ unsupported event envelope versions are journaled and ignored by consumers (11.449027ms)
+✔ raw empty-workspace events are journaled as skeleton-only with subject stamping (12.305236ms)
+✔ payload schemas reject malformed catalog payloads (10.573679ms)
+✔ inbound_updates re-drive after routing and commit after pipeline abort (61.697435ms)
+✔ pending without a persisted message waits for platform replay and stale pending commits (22.729662ms)
+✔ real process kill after outbox sending restarts as ambiguous from disk (290.651641ms)
+✔ real process kill after persisted inbound message redrives from disk (146.910521ms)
+✔ real process kill after pipeline abort stays committed after restart (125.54539ms)
+✔ RuntimeStateService is idempotent and emits one deduped owner alert (48.319906ms)
+✔ RuntimeStateService expires timed holds and reactivates through the same deduped incident row (14.129716ms)
+✔ LLMGateway reserves atomically and releases failed reservations (49.825991ms)
+✔ LLMGateway keeps ingest source budgets and media holds separate (18.502276ms)
+✔ Outbox handles dedupe, ambiguous sending rows, staleness, and bot-turn reservation (12.655841ms)
+✔ reply.generated is written to the same outbox with a reply namespaced key (14.827872ms)
+✔ DataLifecycleService is the bounded cross-owner delete/redaction plane (8.611434ms)
+✔ owner outbound notices use suppressIfKillSwitch=false and are still journaled (7.53655ms)
+✔ scheduler fires workspace-local ticks and catches up once (62.002915ms)
+✔ trace, tail, inspect, structured logs, and secret redaction work (25.188245ms)
+✔ event journal writes are buffered off the hot path and flushed explicitly (24.593033ms)
+✔ test/development Echo harness wires inbound bus to unified outbox (41.931049ms)
+✔ Echo harness is rejected in production (16.279313ms)
+✔ engine.start() runs crash recovery: reconciles the outbox and re-drives inbound (21.754403ms)
+ℹ tests 36
+ℹ suites 0
+ℹ pass 36
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 930.195274
+```
+
+Command: `just verify-through 1`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ tests/static/architecture.test.ts (542.344591ms)
+✔ tests/step-1/config-loader.test.ts (486.129193ms)
+✔ tests/step-1/engine-lifecycle.test.ts (470.220039ms)
+✔ tests/step-1/event-bus.test.ts (509.675865ms)
+✔ tests/step-1/inbound-crash.test.ts (343.771417ms)
+✔ tests/step-1/real-crash.test.ts (795.369251ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (545.581446ms)
+✔ tests/step-1/scheduler-observability.test.ts (472.201122ms)
+✔ tests/step-1/walking-skeleton.test.ts (502.106501ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 823.378537
+=== verify-through: step 1 ===
+verify-step 1: capabilities in spec/acceptance.yaml steps[1]
+✓ scan-punts: clean
+
+> keeper@0.1.0 verify:step1
+> node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts
+
+✔ tests/static/architecture.test.ts (482.971712ms)
+✔ tests/step-1/config-loader.test.ts (527.677354ms)
+✔ tests/step-1/engine-lifecycle.test.ts (397.795822ms)
+✔ tests/step-1/event-bus.test.ts (510.541511ms)
+✔ tests/step-1/inbound-crash.test.ts (401.679269ms)
+✔ tests/step-1/real-crash.test.ts (730.356788ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (546.524623ms)
+✔ tests/step-1/scheduler-observability.test.ts (503.145397ms)
+✔ tests/step-1/walking-skeleton.test.ts (490.601577ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 756.005317
+✓ verify-through 1: all steps 1..1 + architecture gates green
+```
+
+Command: `just scan-punts`
+
+Output:
+
+```text
+✓ scan-punts: clean
+```
+
+Command: `just build`
+
+Output:
+
+```text
+npm run build
+
+> keeper@0.1.0 build
+> node --experimental-strip-types src/index.ts --healthcheck
+
+keeper engine core ok
+```

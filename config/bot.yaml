@@ -1,0 +1,80 @@
+# Sanitized example bot config (the human decision surface — see spec/config.yaml).
+# Secrets are referenced by ENV VAR NAME only (resolved via dev-secret / .env), never inlined.
+# Copy to config/bot.local.yaml for machine-specific overrides (git-ignored).
+owner:
+  approval_channel:
+    platform: "telegram"
+    via: "control_bot"          # the owner DMs the CONTROL BOT (you cannot DM your own userbot account)
+    user_id: 123456789          # the owner's Telegram user_id — the ONLY accepted control-plane sender
+llm:
+  providers:
+    default:
+      base_url: "https://openrouter.ai/api/v1"
+      api_key_env: "LLM_API_KEY"
+  models:
+    chat: "google/gemini-2.5-flash"
+    classifier: "google/gemini-2.0-flash-lite"
+    embedding: "openai/text-embedding-3-small"
+    embedding_dimension: 1536     # templates sqlite-vec float[${embedding_dim}]; loader rejects a mismatch with the model registry
+    reflection: "google/gemini-2.5-flash"
+    moderation_vision: "google/gemini-2.5-flash"   # multimodal; best-effort black-tier media (SAFETY, not gated by the breaker)
+  budget:                       # cost circuit breaker (operations.cost_circuit_breaker)
+    daily_usd_per_workspace: 2.0
+    on_exceed: "read_only"      # GENERATIVE output only; moderation/receive/safety stay on; DM owner
+    ingest_daily_usd: 1.0       # PER-SOURCE/day bound for embedding/sync (metered in ingest_budget_state)
+    safety_daily_usd: 0.5       # separate safety lane (per workspace/day) for classifiers/vision; never borrowed by chat
+    media_scan_daily_cap: 200   # max vision moderation calls/day/workspace; over cap -> hold ALL unscanned media (fail-safe)
+    media_hold_mode: "silent_delete_unscanned" # disposition while runtime mode=media_hold; owner-visible status only
+    safety_hold_ttl_hours: 24   # unresolved holds expire to safe default, never to clean
+delivery:                       # send_queue + idempotency (operations) — covers replies AND outbound.requested
+  per_channel_rate_per_min: 8   # CONSERVATIVE: this is a USERBOT on a real account, not a Bot API bot
+  backoff: "exponential"        # honor MTProto FLOOD_WAIT in full (never retry early)
+  reply_max_staleness_seconds: 600   # drop replies to messages older than this (pipeline-wide)
+  pipeline_stage_timeout_seconds: 30 # a stage exceeding this aborts the reply
+  pipeline_inflight_deadline_seconds: 150 # whole-journey watchdog: >= stages*timeout + margin, < max_staleness (loader asserts)
+  outbox_prune_after_days: 3    # prune terminal outbox rows older than max_staleness + margin
+approvals:                      # owner-decision queue timeouts
+  proposal_ttl_hours: 24
+  per_type_ttl_hours:
+    moderation_mute: 12
+    moderation_ban: 12
+    lead_dm: 24
+account_survival:               # anti-ban floor (operations.account_survival) — posture: MOST CONSERVATIVE
+  account_global_per_min: 12
+  account_global_per_day: 800
+  dm_per_day: 15
+  warmup_days: 7
+  warmup_start_fraction: 0.2
+  flood_wait_retreat_threshold: 3
+  flood_wait_window_minutes: 30
+  retreat_cooldown_minutes: 120
+  session_string_env: "TELEGRAM_SESSION_STRING"  # full-account credential — top-tier secret, dev-secret only
+scheduler:                      # node-cron; per-WORKSPACE crons fire in each workspace's persona.timezone
+  reflection_cron: "0 4 * * *"
+  sync_cron: "*/30 * * * *"
+  digest_cron: "0 9 * * *"
+  retention_sweep_cron: "0 3 * * *"
+  activity_cron: "0 12 * * *"
+  marketing_share_cron: "0 13 * * *"
+  lead_followup_cron: "0 * * * *"
+platforms:
+  telegram:
+    userbot:                                     # COMMUNITY face — owner's user account (MTProto/GramJS)
+      api_id_env: "TELEGRAM_API_ID"
+      api_hash_env: "TELEGRAM_API_HASH"
+      session_string_env: "TELEGRAM_SESSION_STRING"
+    control_bot:                                 # CONTROL plane + MOD executor — Bot API bot (group admin)
+      token_env: "TELEGRAM_CONTROL_BOT_TOKEN"
+observability:                  # full-flow visibility (operations.observability) — built from step 1
+  journal_enabled: true
+  journal_retention_days: 14
+  journal_sampling: {}
+  log_dir: "./data/logs"
+  log_level: "info"
+  redact: true                  # MUST stay true: never journal/log secrets or flagged-media bytes
+  payload_digest_max_chars: 2000
+database:
+  path: "./data/bot.db"
+vector_store:
+  provider: "sqlite-vec"        # shares bot.db; no extra process
+  path: "./data/bot.db"

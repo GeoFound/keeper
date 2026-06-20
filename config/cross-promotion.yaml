@@ -1,0 +1,10 @@
+# future — cross-promotion permissions/tones (feature flag cross_promotion controls the module).
+# Not loaded by the step-1 config loader; committed as a sanitized example only.
+cross_promotion:
+  require_approval: true
+  permissions:
+    - { from_workspace: "ws-ai-community", to_workspace: "ws-tool-site", allowed: true, tone: "nonchalant", max_per_week: 2 }
+    - { from_workspace: "ws-tool-site", to_workspace: "ws-ai-community", allowed: true, tone: "curious", max_per_week: 1 }
+  trigger_rules:
+    min_topic_relevance: 0.8
+    require_organic_context: true

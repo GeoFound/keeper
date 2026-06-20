@@ -1,0 +1,23 @@
+# Sanitized example content sources (see spec/config.yaml). Endpoints/paths are placeholders;
+# auth is referenced by ENV VAR NAME only. workspace_priority is a per-SOURCE ranking prior
+# applied uniformly to every workspace that binds the source (knowledge.yaml priority_scope).
+sources:
+  - id: "ai-site-main"
+    name: "AI 主站"
+    adapter: "api"
+    endpoint: "https://example.com/api/content-feed"
+    trust: "owned"                 # owned|partner|rss|crawl|user_file
+    freshness_max_days: 30
+    workspace_priority: 1.0
+    content_type: "site"
+    auth: { type: "bearer", token_env: "SITE_MAIN_TOKEN" }
+    sync: { interval_minutes: 30 }
+  - id: "local-docs"
+    name: "本地文档"
+    adapter: "file"
+    path: "./data/knowledge/general"
+    trust: "owned"
+    freshness_max_days: 180
+    workspace_priority: 0.8
+    content_type: "docs"
+    sync: { interval_minutes: 5, watch: true }

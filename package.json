@@ -1,0 +1,22 @@
+{
+  "name": "keeper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts",
+    "check": "node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts",
+    "verify:step1": "node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts",
+    "build": "node --experimental-strip-types src/index.ts --healthcheck"
+  },
+  "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.11.1",
+    "sqlite-vec": "^0.1.9",
+    "yaml": "^2.8.1",
+    "zod": "^4.1.13"
+  },
+  "engines": {
+    "node": ">=26"
+  }
+}

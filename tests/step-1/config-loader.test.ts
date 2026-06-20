@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfigFromDir, loadConfigObject } from '../../src/config/loader.ts';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import YAML from 'yaml';
+import { ConfigRuntime, loadConfigFromDir, loadConfigObject } from '../../src/config/loader.ts';
 import { createConfigFixture } from '../support/fixtures.ts';
 
 test('config loads, validates hard floor, uniqueness, embedding dimension, and launch profile', () => {
@@ -88,3 +92,53 @@ test('the committed sanitized config/ directory validates against the loader', (
   const sourceIds = new Set(config.sources.map((source) => source.id));
   for (const ref of ws.content_sources) assert.equal(sourceIds.has(ref), true, `unresolved source ${ref}`);
 });
+
+test('config runtime watches config files, swaps a good edit live, and keeps prior config on a bad edit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), `keeper-config-watch-${process.pid}-`));
+  const fixture = createConfigFixture();
+  writeConfigDir(dir, fixture);
+
+  const runtime = ConfigRuntime.fromDir(dir);
+  const observed: Array<{ ok: boolean; error?: unknown }> = [];
+  const stop = runtime.watchDir(dir, {
+    intervalMs: 20,
+    debounceMs: 5,
+    onReload(result) {
+      observed.push({ ok: result.ok, error: result.error });
+    },
+  });
+
+  try {
+    const edited = createConfigFixture();
+    edited.workspaces[0].name = 'Reloaded';
+    writeConfigDir(dir, edited);
+    await waitFor(() => runtime.get().workspaces[0].name === 'Reloaded');
+    assert.equal(runtime.lastReloadError(), undefined);
+
+    const bad = createConfigFixture();
+    bad.workspaces[0].name = 'Broken';
+    bad.workspaces[0].moderation.hard_block.enabled = false;
+    writeConfigDir(dir, bad);
+    await waitFor(() => runtime.lastReloadError() !== undefined);
+    assert.equal(runtime.get().workspaces[0].name, 'Reloaded');
+    assert.equal(observed.some((event) => event.ok === true), true);
+    assert.equal(observed.some((event) => event.ok === false && event.error), true);
+  } finally {
+    stop();
+  }
+});
+
+function writeConfigDir(dir: string, fixture: ReturnType<typeof createConfigFixture>): void {
+  writeFileSync(join(dir, 'bot.yaml'), YAML.stringify(fixture.bot));
+  writeFileSync(join(dir, 'workspaces.yaml'), YAML.stringify({ workspaces: fixture.workspaces }));
+  writeFileSync(join(dir, 'sources.yaml'), YAML.stringify({ sources: fixture.sources }));
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1500;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(predicate(), true, 'timed out waiting for config watcher');
+}

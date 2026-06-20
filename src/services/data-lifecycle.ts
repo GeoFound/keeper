@@ -25,7 +25,9 @@ export class DataLifecycleService {
 
       const redacted = this.store.prepare(`
         UPDATE event_journal
-        SET payload_digest = '[redacted]', redacted_at = CURRENT_TIMESTAMP
+        SET payload_digest = CASE WHEN payload_digest IS NULL THEN NULL ELSE '[redacted]' END,
+            reason = CASE WHEN reason IS NULL THEN NULL ELSE '[redacted]' END,
+            redacted_at = CURRENT_TIMESTAMP
         WHERE workspace_id = @workspace_id AND subject_user_id = @user_id
       `).run({ workspace_id: input.workspaceId, user_id: input.userId }).changes;
       return { deleted, redacted };

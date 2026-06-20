@@ -17,6 +17,9 @@ type ReservationInput = {
   estimateUsd: number;
   model?: string;
   purpose?: string;
+  dayTimezone?: string;
+  resetAt?: Date;
+  mediaHoldMode?: string;
 };
 
 export class LLMGateway {
@@ -71,6 +74,19 @@ export class LLMGateway {
           scopeId: input.scopeId,
           mode: 'read_only',
           reason: 'budget_exhausted',
+          until: runtimeHoldUntil(input),
+          details: { lane: input.lane, day: input.day },
+        });
+      }
+      if (input.scopeType === 'workspace' && input.lane === 'safety') {
+        await this.runtime.enter({
+          workspaceId: input.scopeId,
+          scopeType: 'workspace',
+          scopeId: input.scopeId,
+          mode: 'safety_hold',
+          reason: 'safety_budget_exhausted',
+          until: runtimeHoldUntil(input),
+          details: { lane: input.lane, day: input.day },
         });
       }
       if (input.scopeType === 'workspace' && input.lane.includes('media')) {
@@ -80,6 +96,12 @@ export class LLMGateway {
           scopeId: input.scopeId,
           mode: 'media_hold',
           reason: 'media_budget_exhausted',
+          until: runtimeHoldUntil(input),
+          details: {
+            lane: input.lane,
+            day: input.day,
+            disposition: input.mediaHoldMode ?? 'silent_delete_unscanned',
+          },
         });
       }
       throw new Error(`budget exhausted for ${input.scopeType}:${input.scopeId}:${input.lane}`);
@@ -205,4 +227,73 @@ export class LLMGateway {
       cost: input.estimateUsd,
     });
   }
+}
+
+function runtimeHoldUntil(input: ReservationInput): Date | undefined {
+  if (input.resetAt) return input.resetAt;
+  if (input.scopeType !== 'workspace') return undefined;
+  return endOfLocalDay(input.day, input.dayTimezone ?? 'UTC');
+}
+
+function endOfLocalDay(day: string, timeZone: string): Date {
+  const [year, month, date] = day.split('-').map(Number);
+  if (!year || !month || !date) throw new Error(`invalid budget day ${day}`);
+  const next = new Date(Date.UTC(year, month - 1, date + 1, 0, 0, 0));
+  return zonedLocalTimeToUtc({
+    year: next.getUTCFullYear(),
+    month: next.getUTCMonth() + 1,
+    date: next.getUTCDate(),
+    hour: 0,
+    minute: 0,
+    second: 0,
+    timeZone,
+  });
+}
+
+function zonedLocalTimeToUtc(input: {
+  year: number;
+  month: number;
+  date: number;
+  hour: number;
+  minute: number;
+  second: number;
+  timeZone: string;
+}): Date {
+  const desiredAsUtc = Date.UTC(input.year, input.month - 1, input.date, input.hour, input.minute, input.second);
+  let guess = desiredAsUtc;
+  for (let i = 0; i < 3; i += 1) {
+    const parts = zonedParts(new Date(guess), input.timeZone);
+    const localAsUtc = Date.UTC(parts.year, parts.month - 1, parts.date, parts.hour, parts.minute, parts.second);
+    guess = desiredAsUtc - (localAsUtc - guess);
+  }
+  return new Date(guess);
+}
+
+function zonedParts(date: Date, timeZone: string): {
+  year: number;
+  month: number;
+  date: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  return {
+    year: value('year'),
+    month: value('month'),
+    date: value('day'),
+    hour: value('hour'),
+    minute: value('minute'),
+    second: value('second'),
+  };
 }

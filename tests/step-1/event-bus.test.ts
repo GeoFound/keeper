@@ -53,6 +53,16 @@ test('bus delivers only declared events and rejects undeclared module emissions'
       ),
     /not declared/,
   );
+  assert.throws(
+    () =>
+      bus.registerModule({
+        name: 'BadSubscriber',
+        subscribes: ['missing.event'],
+        publishes: [],
+        handle() {},
+      }),
+    /unknown event/,
+  );
 });
 
 test('every catalog event has a schema and envelope scope rules are enforced', async () => {
@@ -87,6 +97,50 @@ test('every catalog event has a schema and envelope scope rules are enforced', a
     createEnvelope({ name: 'knowledge.sync_due', workspaceId: '', correlationId: 'corr:source' }),
     { sourceId: 'src-docs', at: new Date().toISOString() },
     'system',
+  );
+
+  await assert.rejects(
+    () =>
+      bus.emit(
+        'knowledge.updated',
+        createEnvelope({ name: 'knowledge.updated', workspaceId: '', correlationId: 'corr:bad-source' }),
+        { sourceId: '', added: 0, updated: 0, removed: 0 },
+        'system',
+      ),
+    /sourceId|Invalid/,
+  );
+
+  await assert.rejects(
+    () =>
+      bus.emit(
+        'knowledge.updated',
+        createEnvelope({ name: 'knowledge.updated', workspaceId: 'ws-main', correlationId: 'corr:source-scope' }),
+        { sourceId: 'src-docs', added: 0, updated: 0, removed: 0 },
+        'system',
+      ),
+    /workspaceId must be empty/,
+  );
+
+  await assert.rejects(
+    () =>
+      bus.emit(
+        'message.routed',
+        createEnvelope({ name: 'message.routed', workspaceId: 'ws-main', correlationId: 'corr:routed' }),
+        routedMessage(),
+        'system',
+      ),
+    /subjectUserId/,
+  );
+
+  await assert.rejects(
+    () =>
+      bus.emit(
+        'control.owner_action',
+        createEnvelope({ name: 'control.owner_action', workspaceId: '', correlationId: 'corr:owner' }),
+        { senderId: 'telegram:owner', kind: 'command' },
+        'system',
+      ),
+    /subjectUserId/,
   );
 
   assert.equal(isRawScopeDeferredEvent('inbound.reaction'), true);
@@ -125,7 +179,12 @@ test('payload schemas reject malformed catalog payloads', async () => {
     () =>
       bus.emit(
         'reply.generated',
-        createEnvelope({ name: 'reply.generated', workspaceId: 'ws-main', correlationId: 'corr:bad-payload' }),
+        createEnvelope({
+          name: 'reply.generated',
+          workspaceId: 'ws-main',
+          correlationId: 'corr:bad-payload',
+          subjectUserId: 'telegram:u1',
+        }),
         { trigger: unifiedMessage(), directives: [] },
         'system',
       ),

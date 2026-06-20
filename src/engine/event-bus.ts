@@ -241,8 +241,22 @@ export function createEnvelope(input: {
   };
 }
 
-function knownSubject(payload: any): string | undefined {
-  return payload?.sender?.id ?? payload?.actor?.id ?? payload?.userId ?? payload?.subjectUserId;
+function addSubject(candidates: Set<string>, value: unknown): void {
+  if (typeof value === 'string' && value.length > 0) candidates.add(value);
+}
+
+function knownSubjects(payload: any): string[] {
+  const candidates = new Set<string>();
+  addSubject(candidates, payload?.sender?.id);
+  addSubject(candidates, payload?.actor?.id);
+  addSubject(candidates, payload?.userId);
+  addSubject(candidates, payload?.targetUserId);
+  addSubject(candidates, payload?.senderId);
+  addSubject(candidates, payload?.subjectUserId);
+  addSubject(candidates, payload?.message?.sender?.id);
+  addSubject(candidates, payload?.trigger?.sender?.id);
+  addSubject(candidates, payload?.content?.userId);
+  return [...candidates];
 }
 
 function validateEnvelope(name: string, envelope: EventEnvelope, payload: unknown): void {
@@ -251,6 +265,9 @@ function validateEnvelope(name: string, envelope: EventEnvelope, payload: unknow
   if (!envelope.correlationId) throw new Error('correlationId is required');
 
   const hasWorkspace = envelope.workspaceId.length > 0;
+  if (isSourceScopedEvent(name) && hasWorkspace) {
+    throw new Error(`workspaceId must be empty for source-scoped ${name}`);
+  }
   if (!hasWorkspace) {
     if (!isRawScopeDeferredEvent(name) && !isSourceScopedEvent(name)) {
       throw new Error(`workspaceId is required for ${name}`);
@@ -258,9 +275,15 @@ function validateEnvelope(name: string, envelope: EventEnvelope, payload: unknow
     if (isSourceScopedEvent(name) && !(payload as any)?.sourceId) {
       throw new Error(`sourceId is required for ${name}`);
     }
-    const subject = knownSubject(payload);
-    if (isRawScopeDeferredEvent(name) && subject && !envelope.subjectUserId) {
+  }
+
+  const subjectCandidates = knownSubjects(payload);
+  if (subjectCandidates.length > 0) {
+    if (!envelope.subjectUserId) {
       throw new Error(`subjectUserId is required for ${name}`);
+    }
+    if (!subjectCandidates.includes(envelope.subjectUserId)) {
+      throw new Error(`subjectUserId ${envelope.subjectUserId} does not match payload subject for ${name}`);
     }
   }
 }
@@ -274,6 +297,11 @@ export class EventBus {
   }
 
   registerModule(module: ModuleRegistration): void {
+    for (const event of [...module.subscribes, ...module.publishes]) {
+      if (!EVENT_SCHEMAS[event as keyof typeof EVENT_SCHEMAS]) {
+        throw new Error(`${module.name} declares unknown event ${event}`);
+      }
+    }
     this.modules.set(module.name, module);
   }
 

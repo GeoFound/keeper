@@ -44,6 +44,25 @@ export class OutboxService {
             postSendActions: payload.postSendActions,
           });
         }
+        if (event.envelope.name === 'reply.generated') {
+          const payload = event.payload as any;
+          this.request({
+            dedupeKey: `reply:${event.envelope.correlationId}`,
+            workspaceId: event.envelope.workspaceId,
+            correlationId: event.envelope.correlationId,
+            audience: 'community',
+            channelId: payload.trigger?.channelId,
+            kind: 'reply',
+            content: { text: payload.text ?? payload.reply?.text ?? payload.output?.text ?? '' },
+            // A reply is REACTIVE: /pause is enforced upstream (Intent Router observes
+            // posture==stay_silent and never emits the reply), and /quiet must NEVER silence a
+            // reactive reply. The outbox kill-switch gate keys on proactiveAllowed (false under
+            // BOTH /pause and /quiet), so a reply must opt OUT of it — suppressIfKillSwitch=false.
+            // (Replies are already exempt from the consecutive-bot cap by kind !== 'reply'.)
+            suppressIfKillSwitch: false,
+            triggerAt: new Date(),
+          });
+        }
       },
     });
   }

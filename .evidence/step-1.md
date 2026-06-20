@@ -410,3 +410,307 @@ keeper engine core ok
 ✓ verify-through 1: all steps 1..1 + architecture gates green
 ```
 
+## Round 3 — strict Step 1 completion fixes
+
+Date: 2026-06-20
+
+Fixes: (1) `RuntimeStateService` now treats `until` as an actual active-hold expiry and
+can reactivate an expired/resolved hold through the single accessor; (2) `LLMGateway`
+writes budget exhaustion holds with end-of-day `until`, separates `safety_hold` from
+`media_hold`, and records the media hold disposition; (3) workspace-scoped user events
+must carry matching `subjectUserId`, source-scoped events must keep empty `workspaceId`,
+and module registration rejects unknown events; (4) `ConfigRuntime` watches the YAML
+config files and hot-swaps good edits while preserving the prior config on bad reloads;
+(5) the scheduler catches up one missed local daily tick once per workspace/job/day; (6)
+`DataLifecycleService.forget` redacts both `event_journal.payload_digest` and
+`event_journal.reason`; (7) `reply.generated` is written to the unified outbox with the
+`reply:<correlationId>` key.
+
+Command: `ai-cap check config.reload`
+
+Output:
+
+```text
+能力: config.reload
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `ai-cap check scheduler.tick`
+
+Output:
+
+```text
+能力: scheduler.tick
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `ai-cap check privacy.erase`
+
+Output:
+
+```text
+能力: privacy.erase
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `ai-cap check observability.trace`
+
+Output:
+
+```text
+能力: observability.trace
+  ○ 暂无服务提供 —— 本项目可自行实现（重复是允许的，保持独立）
+  联邦现状: 0 个项目提供 · 0 个项目消费 · 0 个项目各自实现
+```
+
+Command: `just check`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ spec wiring remains internally consistent (381.81865ms)
+✔ static architecture gates reject direct module coupling and unsafe privileged paths (1.882705ms)
+✔ SQLite schema is applied from the authoritative data model with WAL enabled (35.458847ms)
+✔ real crash evidence uses child process kill, not in-process restart simulation only (0.919218ms)
+✔ every table mutation in src comes from its declared owner (table_ownership) (9.147927ms)
+✔ config loads, validates hard floor, uniqueness, embedding dimension, and launch profile (22.948473ms)
+✔ config rejects dangerous or ambiguous inputs and preserves prior config on bad reload (21.01387ms)
+✔ config can be loaded from YAML files (86.486509ms)
+✔ the committed sanitized config/ directory validates against the loader (68.677616ms)
+✔ config runtime watches config files, swaps a good edit live, and keeps prior config on a bad edit (222.033718ms)
+✔ engine registers modules, starts, stops, and calls module health checks (88.798571ms)
+✔ bus delivers only declared events and rejects undeclared module emissions (106.651372ms)
+✔ every catalog event has a schema and envelope scope rules are enforced (30.798441ms)
+✔ raw empty-workspace events are journaled as skeleton-only with subject stamping (49.905465ms)
+✔ payload schemas reject malformed catalog payloads (17.052579ms)
+✔ inbound_updates re-drive after routing and commit after pipeline abort (67.211614ms)
+✔ pending without a persisted message waits for platform replay and stale pending commits (25.659759ms)
+✔ real process kill after outbox sending restarts as ambiguous from disk (469.041013ms)
+✔ real process kill after persisted inbound message redrives from disk (161.883686ms)
+✔ real process kill after pipeline abort stays committed after restart (125.68734ms)
+✔ RuntimeStateService is idempotent and emits one deduped owner alert (75.181918ms)
+✔ RuntimeStateService expires timed holds and re-alerts only on a new active transition (30.931139ms)
+✔ LLMGateway reserves atomically and releases failed reservations (59.606357ms)
+✔ LLMGateway keeps ingest source budgets and media holds separate (19.204663ms)
+✔ Outbox handles dedupe, ambiguous sending rows, staleness, and bot-turn reservation (21.670184ms)
+✔ reply.generated is written to the same outbox with a reply namespaced key (25.880395ms)
+✔ DataLifecycleService is the bounded cross-owner delete/redaction plane (18.789138ms)
+✔ owner outbound notices use suppressIfKillSwitch=false and are still journaled (16.350336ms)
+✔ scheduler fires workspace-local ticks and catches up once (109.437613ms)
+✔ trace, tail, inspect, structured logs, and secret redaction work (109.667521ms)
+✔ event journal writes are buffered off the hot path and flushed explicitly (47.847454ms)
+✔ test/development Echo harness wires inbound bus to unified outbox (82.384839ms)
+✔ Echo harness is rejected in production (28.599317ms)
+✔ engine.start() runs crash recovery: reconciles the outbox and re-drives inbound (72.242281ms)
+ℹ tests 34
+ℹ suites 0
+ℹ pass 34
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1093.452492
+```
+
+Command: `just verify-through 1`
+
+Output:
+
+```text
+npm run check
+
+> keeper@0.1.0 check
+> node --test --experimental-strip-types tests/static/*.test.ts tests/step-1/*.test.ts
+
+✔ tests/static/architecture.test.ts (515.353376ms)
+✔ tests/step-1/config-loader.test.ts (588.666549ms)
+✔ tests/step-1/engine-lifecycle.test.ts (474.19664ms)
+✔ tests/step-1/event-bus.test.ts (581.285721ms)
+✔ tests/step-1/inbound-crash.test.ts (423.076552ms)
+✔ tests/step-1/real-crash.test.ts (774.499796ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (582.690957ms)
+✔ tests/step-1/scheduler-observability.test.ts (476.615881ms)
+✔ tests/step-1/walking-skeleton.test.ts (489.28762ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 836.646509
+=== verify-through: step 1 ===
+verify-step 1: capabilities in spec/acceptance.yaml steps[1]
+✓ scan-punts: clean
+
+> keeper@0.1.0 verify:step1
+> node --test --experimental-strip-types tests/step-1/*.test.ts tests/static/*.test.ts
+
+✔ tests/static/architecture.test.ts (531.48424ms)
+✔ tests/step-1/config-loader.test.ts (633.374825ms)
+✔ tests/step-1/engine-lifecycle.test.ts (411.370989ms)
+✔ tests/step-1/event-bus.test.ts (555.152909ms)
+✔ tests/step-1/inbound-crash.test.ts (395.795337ms)
+✔ tests/step-1/real-crash.test.ts (798.117566ms)
+✔ tests/step-1/runtime-budget-outbox.test.ts (602.191732ms)
+✔ tests/step-1/scheduler-observability.test.ts (470.251496ms)
+✔ tests/step-1/walking-skeleton.test.ts (532.830735ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 822.731887
+✓ verify-through 1: all steps 1..1 + architecture gates green
+```
+
+Command: `just scan-punts`
+
+Output:
+
+```text
+✓ scan-punts: clean
+```
+
+Command: `just build`
+
+Output:
+
+```text
+npm run build
+
+> keeper@0.1.0 build
+> node --experimental-strip-types src/index.ts --healthcheck
+
+keeper engine core ok
+```
+
+Targeted probes:
+
+Command: `emit message.routed without subjectUserId`
+
+Output:
+
+```text
+subjectUserId is required for message.routed
+```
+
+Command: `scheduler missed 09:00 Tokyo tick checked at 09:05 and 09:06 local`
+
+Output:
+
+```text
+[{"workspaceId":"tokyo","timezone":"Asia/Tokyo","localTime":"09:00","jobId":"digest","dueAt":"2026-06-19T00:05:00.000Z"}]
+[]
+```
+
+Command: `budget exhausted runtime hold before and after reset`
+
+Output:
+
+```text
+[{"mode":"read_only","reason":"budget_exhausted","until":"2026-06-20T00:00:00.000Z"}]
+[]
+```
+
+Command: `/forget event_journal reason + payload redaction probe`
+
+Output:
+
+```text
+{"reason":"[redacted]","payloadDigest":"[redacted]"}
+```
+
+Final rerun after test-name cleanup:
+
+Command: `just check`
+
+Output (tail):
+
+```text
+✔ RuntimeStateService expires timed holds and reactivates through the same deduped incident row (31.816072ms)
+✔ LLMGateway reserves atomically and releases failed reservations (76.569511ms)
+✔ LLMGateway keeps ingest source budgets and media holds separate (18.430266ms)
+✔ reply.generated is written to the same outbox with a reply namespaced key (16.138486ms)
+✔ scheduler fires workspace-local ticks and catches up once (29.838233ms)
+✔ engine.start() runs crash recovery: reconciles the outbox and re-drives inbound (31.178216ms)
+ℹ tests 34
+ℹ pass 34
+ℹ fail 0
+```
+
+Command: `just verify-through 1`
+
+Output (tail):
+
+```text
+✓ scan-punts: clean
+✔ tests/step-1/runtime-budget-outbox.test.ts (465.912022ms)
+✔ tests/step-1/scheduler-observability.test.ts (439.05949ms)
+✔ tests/step-1/walking-skeleton.test.ts (389.313552ms)
+ℹ tests 9
+ℹ pass 9
+ℹ fail 0
+✓ verify-through 1: all steps 1..1 + architecture gates green
+```
+
+Command: `just scan-punts`
+
+Output:
+
+```text
+✓ scan-punts: clean
+```
+
+Command: `just build`
+
+Output:
+
+```text
+npm run build
+
+> keeper@0.1.0 build
+> node --experimental-strip-types src/index.ts --healthcheck
+
+keeper engine core ok
+```
+
+## Round 3 — review addendum (reactive-reply kill-switch correctness)
+
+Reviewer fix on top of the Round 3 batch: the new `reply.generated` → outbox path was
+enqueued with `suppressIfKillSwitch=true`. A reply is REACTIVE — `/pause` is enforced upstream
+(Intent Router observes `posture==stay_silent` and never emits the reply) and `/quiet` must NEVER
+silence a reactive reply. Since the outbox kill-switch gate keys on `proactiveAllowed` (false under
+BOTH `/pause` and `/quiet`), a reply must opt OUT of it. Corrected to `suppressIfKillSwitch=false`
+(replies are already exempt from the consecutive-bot cap by `kind !== 'reply'`), and the
+`reply.generated` outbox test now asserts `suppressIfKillSwitch === 0`.
+
+Command: `npm test`
+
+Output (tail):
+
+```text
+✔ reply.generated is written to the same outbox with a reply namespaced key
+ℹ tests 34
+ℹ pass 34
+ℹ fail 0
+```
+
+Command: `just scan-punts && just verify-through 1`
+
+Output (tail):
+
+```text
+✓ scan-punts: clean
+✓ verify-through 1: all steps 1..1 + architecture gates green
+```

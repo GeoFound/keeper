@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, watchFile, unwatchFile } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import YAML from 'yaml';
@@ -205,17 +205,79 @@ export function loadConfigFromDir(dir: URL | string, prior?: KeeperConfig): Keep
 
 export class ConfigRuntime {
   private current: KeeperConfig;
+  private reloadError: unknown;
 
   constructor(initial: KeeperConfig) {
     this.current = initial;
+  }
+
+  static fromDir(dir: URL | string): ConfigRuntime {
+    return new ConfigRuntime(loadConfigFromDir(dir));
   }
 
   get(): KeeperConfig {
     return this.current;
   }
 
+  lastReloadError(): unknown {
+    return this.reloadError;
+  }
+
   reload(raw: { bot: unknown; workspaces: unknown; sources: unknown }): KeeperConfig {
-    this.current = loadConfigObject(raw, this.current);
+    try {
+      this.current = validateConfig(raw);
+      this.reloadError = undefined;
+    } catch (error) {
+      this.reloadError = error;
+    }
     return this.current;
+  }
+
+  reloadFromDir(dir: URL | string): KeeperConfig {
+    const base = directoryPath(dir);
+    try {
+      return this.reload({
+        bot: parseYamlFile(join(base, 'bot.yaml')),
+        workspaces: parseYamlFile(join(base, 'workspaces.yaml')),
+        sources: parseYamlFile(join(base, 'sources.yaml')),
+      });
+    } catch (error) {
+      this.reloadError = error;
+      return this.current;
+    }
+  }
+
+  watchDir(
+    dir: URL | string,
+    input: {
+      intervalMs?: number;
+      debounceMs?: number;
+      onReload?: (result: { ok: boolean; config: KeeperConfig; error?: unknown }) => void;
+    } = {},
+  ): () => void {
+    const base = directoryPath(dir);
+    const files = ['bot.yaml', 'workspaces.yaml', 'sources.yaml'].map((file) => join(base, file));
+    const interval = input.intervalMs ?? 500;
+    const debounce = input.debounceMs ?? 50;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const before = this.current;
+        const config = this.reloadFromDir(base);
+        const ok = this.reloadError === undefined && config !== before;
+        input.onReload?.({ ok, config, error: this.reloadError });
+      }, debounce);
+    };
+
+    for (const file of files) {
+      watchFile(file, { interval }, schedule);
+    }
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      for (const file of files) unwatchFile(file, schedule);
+    };
   }
 }

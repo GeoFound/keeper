@@ -19,6 +19,27 @@ test('scheduler fires workspace-local ticks and catches up once', () => {
   );
   assert.equal(ticks.some((tick) => tick.workspaceId === 'tokyo'), true);
   assert.equal(ticks.some((tick) => tick.workspaceId === 'utc'), false);
+
+  const restarted = new SchedulerService();
+  assert.equal(
+    restarted.dueDailyTicks(
+      [{ workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00', jobId: 'digest' }],
+      new Date('2026-06-18T23:59:00.000Z'),
+    ).length,
+    0,
+  );
+  const caughtUp = restarted.dueDailyTicks(
+    [{ workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00', jobId: 'digest' }],
+    new Date('2026-06-19T00:05:00.000Z'),
+  );
+  assert.equal(caughtUp.length, 1);
+  assert.equal(
+    restarted.dueDailyTicks(
+      [{ workspaceId: 'tokyo', timezone: 'Asia/Tokyo', localTime: '09:00', jobId: 'digest' }],
+      new Date('2026-06-19T00:06:00.000Z'),
+    ).length,
+    0,
+  );
 });
 
 test('trace, tail, inspect, structured logs, and secret redaction work', async () => {
